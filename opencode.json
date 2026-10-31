@@ -5,15 +5,15 @@
       "type": "local",
       "enabled": true,
       "command": [
-        "python",
-        "C:\\Users\\abdul\\.local\\share\\mcp\\ida-bridge.py"
+        "C:\\Program Files\\Python314\\python.exe",
+        "C:\\Users\\abdullah\\.local\\share\\mcp\\ida-bridge.py"
       ]
     },
     "renderdoc": {
       "type": "local",
       "enabled": true,
       "command": [
-        "python",
+        "C:\\Program Files\\Python314\\python.exe",
         "-m",
         "renderdoc_mcp"
       ],
@@ -22,16 +22,36 @@
         "RENDERDOC_QRENDERDOC_PATH": "C:\\Program Files\\RenderDoc\\qrenderdoc.exe"
       }
     },
+    "firecrawl": {
+      "type": "local",
+      "enabled": true,
+      "command": [
+        "C:\\Users\\abdullah\\AppData\\Local\\Programs\\Node\\firecrawl-mcp.cmd"
+      ],
+      "environment": {
+        "FIRECRAWL_API_KEY": "{env:FIRECRAWL_API_KEY}"
+      }
+    },
     "x64dbg": {
       "type": "local",
       "enabled": true,
       "command": [
-        "python",
-        "E:\\mcla pc\\tools\\x64dbg_mcp.py"
+        "C:\\Program Files\\Python314\\python.exe",
+        "C:\\Users\\abdullah\\OneDrive\\Documents\\mcla pc\\tools\\x64dbg_mcp.py"
+      ]
+    },
+    "rea": {
+      "type": "local",
+      "enabled": true,
+      "command": [
+        "C:\\Users\\abdullah\\AppData\\Local\\Programs\\Node\\rea-mcp.cmd"
       ]
     }
   },
+  "skills": [
+    "./.qoder/skills"
+  ],
   "plugin": [
-    "opencode-autogoal"
+    "opencode-antigravity-auth@latest"
   ]
 }

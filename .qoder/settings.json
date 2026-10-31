@@ -1,14 +1,14 @@
 {
   "mcpServers": {
     "ida-pro": {
-      "command": "python",
+      "command": "C:\\Program Files\\Python314\\python.exe",
       "args": [
-        "C:\\Users\\abdul\\.local\\share\\mcp\\ida-bridge.py"
+        "C:\\Users\\abdullah\\.local\\share\\mcp\\ida-bridge.py"
       ],
       "timeout": 120000
     },
     "renderdoc": {
-      "command": "python",
+      "command": "C:\\Program Files\\Python314\\python.exe",
       "args": [
         "-m",
         "renderdoc_mcp"
@@ -19,10 +19,15 @@
       }
     },
     "x64dbg": {
-      "command": "python",
+      "command": "C:\\Program Files\\Python314\\python.exe",
       "args": [
-        "E:\\mcla pc\\tools\\x64dbg_mcp.py"
+        "C:\\Users\\abdullah\\OneDrive\\Documents\\mcla pc\\tools\\x64dbg_mcp.py"
       ],
+      "timeout": 120000
+    },
+    "rea": {
+      "command": "C:\\Users\\abdullah\\AppData\\Local\\Programs\\Node\\rea-mcp.cmd",
+      "args": [],
       "timeout": 120000
     }
   }
