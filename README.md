@@ -1,122 +1,32 @@
 # mcla-pc
 
-native d3d12 renderer rebuild for **midnight club: los angeles** (xbox 360 → pc).
+Native D3D12 port/rebuild of **Midnight Club: Los Angeles** for Xbox 360 (Xenon PPC) to PC. Recompiles the guest PPC code to native C++ via [XenonRecomp](https://github.com/hedge-dev/XenonRecomp) and implements Xbox 360 kernel/XAM/audio/input subsystems natively.
 
-the recompiled ppc game code keeps running untouched. we capture render intent at the high-level draw boundary and replay it as real d3d12 instead of letting the xenos command processor handle the gpu. legacy mode stays default until every gate passes.
+## Status
 
-**not rexglue based.** no emulation layer, no sdk wrapper. the game recompiles to native c++ and runs as native code on your pc. native performance, not the overhead of a translation layer.
+- **2D/UI rendering**: Working end-to-end. Render thread owns D3D12, UI quads/menus reach the window. Present path verified.
+- **Boot**: Boots into loading/garage with real retail assets from `game_data/`. TLS allocator, VEH recovery, GFx loader wired.
+- **3D/Gameplay**: In progress. UI containers decompressing (~95% garage), GFx init (`kernel handle 0x40001905`) is the current frontier.
+- **Goal**: Run the graphics natively via D3D12 intent replay (capturing render intent at the high-level boundary), bypassing full Xenos GPU emulation.
 
-## what makes this different from other repos
+**This is not a Rexglue-based project.** No Rexglue SDK. The game code is recompiled to native C++ and runs with native host implementations of Xbox 360 APIs.
 
-most xbox 360 → pc projects (xenia, rexglue, etc.) emulate the gpu. they translate xenos commands into vulkan/d3d11 at runtime, paying a heavy overhead and inheriting every emulation bug. **mcla-pc does not emulate the gpu.** it recompiles the game's ppc to native c++, captures what the game *intends* to draw at the high-level boundary, and replays that intent directly through d3d12. the xenos command processor is bypassed entirely for rendering.
+## How it works
 
-| | mcla-pc | typical emulation (xenia/rexglue) |
-|---|---|---|
-| game code | native c++ (recompiled) | emulated ppc |
-| gpu | native d3d12 (intent replay) | xenos → vulkan/d3d11 translation |
-| overhead | native | emulation tax |
-| graphics goal | run the graphics part **natively** | emulate the gpu |
+1. **PPC Recompilation**: 176 translation units of XenonRecomp-generated C++ (`generated/ppc_xenon/ppc_recomp.*.cpp`) plus `ppc_func_mapping.cpp`
+2. **Native D3D12 backend**: `src/d3d12_backend.*`, render thread (`src/render_thread.*`), GPU command processor capture (`src/gpu_cp.*`, `src/gpu_device.*`)
+3. **Xenos shader translation**: `src/renderer/` - microcode decode → IR → HLSL → DXIL via DXC at runtime, with PSO/pipeline cache
+4. **Native Xbox 360 subsystems**: Kernel objects, XAM (input/UI), APU/XMA audio, filesystem (RPF3 VFS), memory management
 
-we are aiming to run the graphics part natively — not emulate it. that is the whole point of this project.
+## Requirements
 
-## 2d: done
+- Windows 10/11
+- Visual Studio 2022 Build Tools with Clang/clang-cl
+- CMake 3.25+, Ninja
+- DirectX 12 SDK components
+- **Legally dumped** Midnight Club: LA files in `game_data/` (`default.xex`, `xarchive_cache.rpf`, etc.)
 
-the 2d rendering path is **working end-to-end**. the boot host links the full recompiled image (46k+ function mappings), the render thread owns all d3d12, and 2d ui (menus, text, quads) reaches the window. the guest's pixels do reach the screen — present path verified end-to-end with window readbacks reproducing guest-rt rows (F-907). blend is now derived from guest registers (RB_BLENDCONTROL0 + RB_COLOR_MASK), not faked.
-
-## full nativity — what makes it special
-
-everything that can be native, is native. no emulation layer anywhere in the pipeline:
-
-- **graphics** — d3d12 backend with pso cache, root signature, grcFvf input layout, async DXC shader worker (xenos microcode → IR → DXIL), texture/vertex decode, pipeline cache, mipgen, render graph, dynamic samplers
-- **audio** — native apu/xma decode (xma_decoder with split-frame reassembly and ring buffer, 320-context pool, audlo extraction via RPF3, XAudio render-driver callback worker thread)
-- **input** — native xam input (SDL3 gamepads/keyboard, hot-plug, 4-bay port map, keystroke enqueue/dequeue, keyboard sampling, force-feedback routing)
-- **memory** — native guest memory (o1heap arenas, 4 GB window at 0x100000000, guest-virtual region tracking, endian-checked accessors, memory_mapped_file)
-- **filesystem** — rpf3 packfile VFS (virtual path index, nested archives, LZX inflate, raw DEFLATE, synthesized archive builder)
-- **kernel** — native reimplementation of xbox kernel (xam, xdm, objects, mutexes, ports, net, voice input, user config, heap, guest threads)
-- **cpu** — recompiled ppc as native c++ (vmx128 host hooks, guest threads), zero rexglue sdk
-- **shader translation** — xenos microcode → normalized IR → HLSL → DXIL at runtime (1612 shaders validated)
-- **rage asset pipeline** — CSR/TXD/DFF parsers, grcFvf vertex declaration decoding, texture decode (xenos formats → DXGI)
-
-## commit history highlights
-
-471 commits spanning 2026-08-06 → 2026-10-31. 290 unique F-### finding IDs. key milestones:
-
-- **phase 0-3** (aug 6) — initial native gpu rebuild tree; guest memory, kernel, vfs, renderer scaffolding
-- **phase 4/5** (aug 8-9) — oracle-validated texture decode, guest shader translation + dxc runtime, async pipeline cache; d1-d5 gates closed
-- **phase 6-8** (aug 10) — dynamic samplers, render graph, native frame loop integration
-- **phase 3 gate** (aug 22) — boot survives main loop; vsync present chain firing at 60fps for thousands of frames
-- **phase 4 groundwork** (aug 22) — cp doorbell seam, xgpu device-create capture, rs-table redirect proof; g0 phase-gate runner + raw-ucode corpus (806/806 clean, 1612 shaders)
-- **session 73-78** (aug-sep) — inflate spin closed, swap-table handshake, native present loop, jump-table regen (broken stubs 1719 → 0), boot crash fixed at star_glow shader preload
-- **kernel s64** (sep) — vsync-isr deadlock fix (spinlock seeds), durable kernel-wrapper identity map, guest park closed (worker wakes, cp doorbells == drains)
-- **f-820…f-844** (oct) — all host avs and guest fatals eliminated; boot no longer dies
-- **f-845…f-859** (oct) — xnet spin, ui container sizing, dead instruments fixed, pixels reach window, present-path flip-timestamp bug fixed, vblank thread saved
-- **f-860…f-880** (oct 20-27) — uiload target proven dead data, gfx loader single occurrence behind kernel handle, kernel-handle wall fully measured, **three boot barriers broken** (legals.xsf served, gfx gate armed+opened, clearrefused=0); organized guest address map added
-- **f-897…f-907** (oct 27-28) — constant bank read from wrong source fixed, interpolator seeding, atomic descriptor-heap binding, hlsl gen maxa/max4/dst fix, program hash covers alu body, blend derived from guest registers, prim-8 constant uvs verified, present path verified end-to-end
-- **oct 31** — repo trimmed to build requirements only; rea skill + mcp added; icon.rc build icon
-
-## what exists (detailed inventory)
-
-### graphics pipeline
-- xenos shader decode → IR → DXIL translation pipeline (1612 shaders validated)
-- d3d12 backend with pso cache + async DXC worker
-- texture decode (xenos formats → DXGI, tiling/untile, mipgen pipeline)
-- vertex decode (xenos vertex-fetch → component layout/DXGI format)
-- grcFvf vertex declaration decoding
-- resource cache (keyed by kind/addr/size/format/version)
-- offline validators for every phase gate
-- device-method capture hooks live + render thread owns all d3d12
-- shader → PSO pipeline wired: PipelineCache, root signature, grcFvf input layout
-- render graph, dynamic samplers, frame trace, capture hooks
-- blend derived from guest registers (RB_BLENDCONTROL0 + RB_COLOR_MASK)
-- present path verified end-to-end (window readbacks reproduce guest-rt rows)
-
-### kernel / runtime
-- xam: content registry/roots, notify listeners, content enumeration, input, message box ui
-- xdm: dispatcher primitives, kernel thread ids, main-park publishing
-- kernel objects: Event, Semaphore, FileObject, SectionObject, close/identity
-- memory: guest heap (o1heap), 4 GB window, virtual region tracking, endian helpers
-- ports: kobj, net, xam_user, voice input
-- heap: physical allocator with allocation census, phys-range tracking
-- guest threads: creation/scheduling, PPCContext ABI
-- vsync: interrupt type fix, vblank thread rescue, flip processor verified firing
-
-### filesystem
-- rpf3 packfile VFS with virtual path index
-- nested archive registration and member resolution
-- LZX inflate (xmem/MS-LZX) for RSC5 containers
-- raw DEFLATE for *.list members
-- synthesized RPF3 archive builder for virtual files
-
-### audio
-- xma decoder (framing, split-frame reassembly, ring buffer, 320-context pool)
-- audlo extraction (RPF3 audlo archive → XMA2 members, LZX bridge)
-- XAudio render-driver callback worker thread
-- frame-decoder seam (pluggable backend)
-
-### input
-- SDL3 gamepad/keyboard with hot-plug (SDL_EVENT_GAMEPAD_ADDED/REMOVED)
-- 4-bay controller port map (XamInputPortCount/PortDevice)
-- keystroke enqueue/dequeue, keyboard sampling
-- force-feedback routing (XInputd exports)
-- voice input port (VoiPortXamInputGetKeystrokeEx)
-
-### cpu
-- recompiled ppc as native c++ (vmx128 host hooks for missing modes)
-- guest thread context (thread-local PPCContext)
-- vmx128 pack (UINT_2101010, SHORT_4, SHORT_2, etc.)
-
-### rage asset pipeline
-- CSR/TXD/DFF parsers
-- RageAssetManager
-- grcFvf vertex declaration decoding
-
-## current status (2026-10-31)
-
-boot gate complete. TLS allocator stable, VEH recovery, GFx loader wired. last soak opens real retail packfiles and runs minutes on the loading path. graphics 2d path working end-to-end; 3d/ui containers being decompressed into guest memory (XSF inflate delivered to ~95% garage, 3/4 byte-exact). GFx init path (kernel handle 0x40001905) is the open frontier. blend is now derived from guest registers. prim-8 constant UVs verified as guest data. present path verified end-to-end.
-
-## building
-
-needs vs 2022 buildtools (vcvars64), cmake 3.25+, ninja, clang-cl for both c and c++. delete the build folder when switching compilers
+## Building
 
 ```bat
 configure.bat
@@ -124,39 +34,36 @@ ninja_build.bat
 build\mcla.exe
 ```
 
-## repo layout
+Delete `build/` if switching compilers/toolchains.
 
-- `src/` root - boot host, device-boundary hooks (gpu_device, gpu_cp), d3d12 backend, render thread/queue
-- `src/kernel`, `src/apu`, `src/user` - kernel framework and guest runtime (xam.cpp = input)
-- `src/cpu` - vmx128 host hooks, guest thread, ppc context
-- `src/fs` - rpf3 packfile vfs
-- `src/rage` - rage asset pipeline
-- `src/hooks` - ppc_func hook bodies (split from patches.cpp)
-- `src/common` - shared logging/cvar headers
-- `src/renderer` - xenos decode, shader translation, texture/vertex decoding, caches
-- `tools/validators` - phase-gate validator exes
-- `generated/` - recompiler output, input only, never edited by hand
-- `third_party/` - sdl3, fmt, spdlog, toml++, dxc, o1heap, xxhash
-- `config/` - cmake/xenonrecomp/manifest tomls
+## Dependencies (vendored)
 
-## legal
+- [SDL3](https://www.libsdl.org/) - windowing, input (gamepads/keyboard)
+- [fmt](https://github.com/fmtlib/fmt), [spdlog](https://github.com/gabime/spdlog) - logging
+- [toml++](https://github.com/marzer/tomlplusplus) - config
+- [DXC](https://github.com/microsoft/DirectXShaderCompiler) - HLSL to DXIL
+- [o1heap](https://github.com/pavel-kirienko/o1heap) - allocator
+- [xxHash](https://github.com/Cyan4973/xxHash), [tiny-AES-c](https://github.com/kokke/tiny-AES-c), [libmspack](https://www.cabextract.org.uk/libmspack/) - various utilities
+- Research references in `.research/` (XenonRecomp, XenosRecomp, Xenia, etc.)
 
-bring your own legally dumped copy of midnight club: la. this project does not ship any game data.
+## Project structure
 
-## credits
+- `src/` - Host code, kernel/XAM ports, D3D12 backend, renderer, filesystem, audio
+- `src/kernel/` - Xbox kernel reimplementation (XAM, objects, memory, threads)
+- `src/apu/` - Audio processing unit / XMA decoder
+- `src/renderer/` - Xenos shader translation, texture/vertex decode
+- `src/fs/` - RPF3 packfile VFS
+- `generated/ppc_xenon/` - XenonRecomp output (176 TUs) - do not edit
+- `third_party/` - Vendored dependencies
+- `tools/` - Validators, analysis tools
+- `config/` - Build/config files
 
-- **XenonRecomp** - ppc → c++ recompiler
-- **XenosRecomp** - xenos shader → hlsl/dxil
-- **Xenia** - reference for command processor / gpu behavior
-- **LARecomp / BadassBaboon** - guest facts (addresses, timings, quirks)
-- **UnleashedRecomp** - reference architecture
+## Legal
 
-## contributing
+You must provide your own legally obtained copy of Midnight Club: Los Angeles. This project does not include any game assets, executables, or copyrighted content.
 
-this project needs help. if you have experience with:
-- xbox 360 / xenos gpu emulation
-- d3d12 rendering
-- ppc recompilation
-- kernel/hook frameworks
+## Credits
 
-open a pr or open an issue. dont be shy.
+- [XenonRecomp](https://github.com/hedge-dev/XenonRecomp) - PPC to C++ recompilation
+- [Xenia](https://github.com/xenia-project/xenia) - Xbox 360 emulation reference
+- [LARecomp](https://github.com/sonicdcer/LARecomp) / BadassBaboon - Guest research
