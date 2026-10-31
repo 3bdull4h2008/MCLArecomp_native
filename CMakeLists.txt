@@ -245,6 +245,7 @@ add_compile_definitions("$<$<CXX_COMPILER_ID:MSVC>:__builtin_isnan=_isnan>")
 # Main executable
 add_executable(mcla
     src/main.cpp
+    mcla.rc
     src/early_init.cpp
     src/app.cpp
     src/app.h
@@ -321,6 +322,8 @@ add_executable(mcla
     src/renderer/xenos_shader_ir.h
     src/renderer/shader_translator.cpp
     src/renderer/shader_translator.h
+    src/renderer/precompiled_shaders.cpp
+    src/renderer/precompiled_shaders.h
     src/renderer/dxc_runtime.cpp
     src/renderer/dxc_runtime.h
     src/renderer/pipeline_cache.cpp
@@ -577,11 +580,33 @@ target_compile_options(mcla PRIVATE /GS- /EHa)
 target_link_options(mcla PRIVATE /OPT:NOREF /MAP)
 target_compile_definitions(mcla PRIVATE $<$<NOT:$<CONFIG:Debug>>:NDEBUG>)
 
+# ---------------------------------------------------------------------------
+# Pre-compiled guest shader cache (docs/SHADER_TRANSLATION_PLAN.md).
+#
+# tools/xenosrecomp writes build/mcla_shader_cache.h (entry table) and
+# build/mcla_shader_cache.bin (DXIL payload). The header is only consumed when
+# it exists, so a fresh checkout still configures and builds -- the runtime then
+# reports "PRECOMP-SHADER-CACHE absent" instead of failing.
+#
+# Regenerate with:
+#   tools\regen_shader_cache.bat
+# (builds tools/xenosrecomp if needed, then recompiles every guest container).
+# ---------------------------------------------------------------------------
+set(MCLA_SHADER_CACHE_HEADER "${CMAKE_CURRENT_BINARY_DIR}/mcla_shader_cache.h")
+if(EXISTS "${MCLA_SHADER_CACHE_HEADER}")
+    message(STATUS "pre-compiled shader cache: found ${MCLA_SHADER_CACHE_HEADER}")
+    target_include_directories(mcla PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
+    target_compile_definitions(mcla PRIVATE MCLA_HAVE_PRECOMPILED_SHADERS)
+else()
+    message(STATUS "pre-compiled shader cache: absent (runtime will report PRECOMP-SHADER-CACHE absent)")
+endif()
+
 # Offline validators
 set(RENDERER_IR_TUS
     src/renderer/xenos_microcode.cpp
     src/renderer/xenos_shader_ir.cpp
     src/renderer/shader_translator.cpp
+    src/renderer/precompiled_shaders.cpp
     tools/validators/shader_dxc_compile.cpp
     src/renderer/dxc_runtime.cpp
     src/renderer/pipeline_cache.cpp
