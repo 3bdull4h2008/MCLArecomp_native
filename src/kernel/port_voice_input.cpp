@@ -82,6 +82,7 @@
 
 #include "function.h"
 #include "logging.h"
+#include "memory.h"
 #include "xam.h"
 
 #include <atomic>
@@ -513,6 +514,33 @@ uint32_t VoiPortXamInputGetKeystrokeEx(uint32_t userIndexPtrVa, uint32_t flags,
         }
     }
 
+    // b-3 (no-progression.md Fix b-3): host keystroke queue. First drain any
+    // real key edge enqueued by the main thread (XamInputPoll -> SampleKeyboard).
+    if (pointersOk)
+    {
+        XAMINPUT_KEYSTROKE_HOST ks{};
+        if (XamInputKeystrokeDequeue(&ks))
+        {
+            uint8_t ub[4] = { 0, 0, 0, ks.user_index };
+            if (userIndexPtrVa != 0)
+                (void)mcla::kernel::GuestMemoryHeap::Instance().WriteBytes(userIndexPtrVa, ub, 4);
+            uint8_t kb[8] = {
+                static_cast<uint8_t>(ks.vk >> 8), static_cast<uint8_t>(ks.vk & 0xFF),
+                static_cast<uint8_t>(ks.unicode >> 8), static_cast<uint8_t>(ks.unicode & 0xFF),
+                static_cast<uint8_t>(ks.flags >> 8), static_cast<uint8_t>(ks.flags & 0xFF),
+                ks.user_index, ks.hid_code
+            };
+            (void)mcla::kernel::GuestMemoryHeap::Instance().WriteBytes(keystrokePtrVa, kb, 8);
+            static std::atomic<uint32_t> s_ksOk{0};
+            const uint32_t okn = s_ksOk.fetch_add(1, std::memory_order_relaxed) + 1;
+            if (okn <= kLogFirst || (okn % kLogEvery) == 0)
+                MCLA_LOG_INFO("VOIPORT-KEYSTROKE #{} delivered vk=0x{:04X} flags=0x{:04X}",
+                              okn, ks.vk, ks.flags);
+            return 0; // X_ERROR_SUCCESS
+        }
+    }
+
+    // Original refusal path (unchanged below)
     const uint32_t r = Bump(g_keystrokeRef);
     if (Throttle(r))
     {
@@ -530,11 +558,9 @@ uint32_t VoiPortXamInputGetKeystrokeEx(uint32_t userIndexPtrVa, uint32_t flags,
                 ++realPads;
         }
 
-        MCLA_LOG_WARN("VOIPORT-REFUSE #{} fn=XamInputGetKeystrokeEx code=0x{:08X} - NO "
-                      "KEYSTROKE QUEUE in this host (measured: the only 'keystroke' hits "
-                      "under src/ were the two stub lines being replaced); existing input "
-                      "path: {}/{} ports with a real device; keystroke struct + user-index "
-                      "left untouched; ptrs_ok={}",
+        MCLA_LOG_WARN("VOIPORT-REFUSE #{} fn=XamInputGetKeystrokeEx code=0x{:08X} - keystroke "
+                      "queue empty; existing input path: {}/{} ports with a real device; "
+                      "keystroke struct + user-index left untouched; ptrs_ok={}",
                       r, kXErrorEmpty, realPads, ports, pointersOk ? 1 : 0);
     }
     if (n <= kLogFirst)

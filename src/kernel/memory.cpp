@@ -2,6 +2,10 @@
 #include "memory.h"
 #include "heap.h"
 #include <atomic>
+#include <mutex>
+#include <vector>
+#include <algorithm>
+#include <unordered_map>
 #include "logging.h"
 
 // --- GUEST-LOAD-REFUSED / GUEST-REFUSED-SUM ----------------------------------
@@ -538,10 +542,143 @@ uint32_t mcla::kernel::GuestMemoryHeap::Alloc(size_t size, size_t alignment)
     return MapVirtual(ptr);
 }
 
+// Decompressed file bodies are the host's own copies, but they used to come from the
+// guest's physical pool: they exhausted it ~38s into boot, and the guest's own allocations
+// then failed (F-920). The range is reserved in the guest-virtual tracker on first use, so
+// NtAllocateVirtualMemory (including its top-down arm) can never hand it to the guest.
+// Starts above the RSC pseudo-virtual base 0x60000000's measured extent (0x60150000).
+// shortcut: bump-only, never reclaimed (433 MiB; a boot stages >383 MiB); stage lazily if it fills.
+namespace {
+struct HostBodyChunk {
+    uint32_t addr;
+    uint32_t size;
+};
+static std::mutex s_hostBodyMutex;
+static std::vector<HostBodyChunk> s_hostBodyFreeList;
+static std::unordered_map<uint32_t, uint32_t> s_hostBodyAllocated;
+static constexpr uint32_t kHostArenaVa = 0x62000000u;
+static constexpr uint32_t kHostArenaEnd = 0x7D000000u;
+static uint32_t s_hostBodyBump = kHostArenaVa;
+} // namespace
+
+uint32_t mcla::kernel::GuestMemoryHeap::AllocHostBody(size_t size)
+{
+    if (!m_initialized || size == 0 || size > kHostArenaEnd - kHostArenaVa)
+        return 0;
+    static const bool s_reserved = [this] {
+        bool wasCommitted = false;
+        return AllocVirtualFixed(kHostArenaVa, kHostArenaEnd - kHostArenaVa, true, false, &wasCommitted);
+    }();
+    if (!s_reserved)
+        return 0;
+
+    const uint32_t need = static_cast<uint32_t>((size + 15u) & ~size_t{15});
+    std::lock_guard<std::mutex> lock(s_hostBodyMutex);
+
+    // 1. Search free list for best fit / first fit
+    for (size_t i = 0; i < s_hostBodyFreeList.size(); ++i) {
+        if (s_hostBodyFreeList[i].size >= need) {
+            uint32_t allocAddr = s_hostBodyFreeList[i].addr;
+            uint32_t remSize = s_hostBodyFreeList[i].size - need;
+            uint32_t allocSize = need;
+            if (remSize >= 64u) {
+                s_hostBodyFreeList[i].addr += need;
+                s_hostBodyFreeList[i].size = remSize;
+            } else {
+                allocSize = s_hostBodyFreeList[i].size;
+                s_hostBodyFreeList.erase(s_hostBodyFreeList.begin() + i);
+            }
+            s_hostBodyAllocated[allocAddr] = allocSize;
+            return allocAddr;
+        }
+    }
+
+    // 2. Bump pointer within arena
+    if (need <= kHostArenaEnd - s_hostBodyBump) {
+        uint32_t allocAddr = s_hostBodyBump;
+        s_hostBodyBump += need;
+        s_hostBodyAllocated[allocAddr] = need;
+        return allocAddr;
+    }
+
+    MCLA_LOG_WARN("AllocHostBody: arena exhausted (need={}, bump=0x{:08X}, freeChunks={})",
+                  need, s_hostBodyBump, s_hostBodyFreeList.size());
+    return 0;
+}
+
+void mcla::kernel::GuestMemoryHeap::FreeHostBody(uint32_t guestAddr, size_t size)
+{
+    if (guestAddr < kHostArenaVa || guestAddr >= kHostArenaEnd)
+        return;
+
+    std::lock_guard<std::mutex> lock(s_hostBodyMutex);
+    uint32_t freedSize = static_cast<uint32_t>(size);
+    auto itAlloc = s_hostBodyAllocated.find(guestAddr);
+    if (itAlloc != s_hostBodyAllocated.end()) {
+        freedSize = itAlloc->second;
+        s_hostBodyAllocated.erase(itAlloc);
+    } else if (freedSize == 0) {
+        freedSize = 4096u;
+    }
+
+    const uint64_t chunkEnd = static_cast<uint64_t>(guestAddr) + freedSize;
+    if (freedSize == 0 || chunkEnd > kHostArenaEnd) {
+        MCLA_LOG_WARN("FreeHostBody: invalid chunk [0x{:08X}, 0x{:016X}) exceeds arena end 0x{:08X}",
+                      guestAddr, chunkEnd, kHostArenaEnd);
+        return;
+    }
+
+    // Binary search for insertion point in address-sorted free list
+    auto it = std::lower_bound(s_hostBodyFreeList.begin(), s_hostBodyFreeList.end(), guestAddr,
+        [](const HostBodyChunk& chunk, uint32_t val) {
+            return chunk.addr < val;
+        });
+
+    // Guard against double-free or overlapping entries in free list
+    if (it != s_hostBodyFreeList.end() && chunkEnd > it->addr) {
+        MCLA_LOG_WARN("FreeHostBody: double-free or overlap at 0x{:08X} (overlaps next free chunk 0x{:08X})",
+                      guestAddr, it->addr);
+        return;
+    }
+    if (it != s_hostBodyFreeList.begin()) {
+        auto prev = std::prev(it);
+        if (static_cast<uint64_t>(prev->addr) + prev->size > guestAddr) {
+            MCLA_LOG_WARN("FreeHostBody: double-free or overlap at 0x{:08X} (overlaps prev free chunk 0x{:08X})",
+                          guestAddr, prev->addr);
+            return;
+        }
+    }
+
+    const bool mergeLeft = (it != s_hostBodyFreeList.begin() &&
+                            (std::prev(it)->addr + std::prev(it)->size == guestAddr));
+    const bool mergeRight = (it != s_hostBodyFreeList.end() &&
+                             (chunkEnd == it->addr));
+
+    if (mergeLeft && mergeRight) {
+        // Complete 3-way coalescing: bridge predecessor and successor into one unified block
+        auto prev = std::prev(it);
+        prev->size += freedSize + it->size;
+        s_hostBodyFreeList.erase(it);
+    } else if (mergeLeft) {
+        auto prev = std::prev(it);
+        prev->size += freedSize;
+    } else if (mergeRight) {
+        it->addr = guestAddr;
+        it->size += freedSize;
+    } else {
+        s_hostBodyFreeList.insert(it, {guestAddr, freedSize});
+    }
+}
+
 void mcla::kernel::GuestMemoryHeap::Free(uint32_t guestAddr, size_t size)
 {
     if (!m_initialized || guestAddr == 0)
         return;
+
+    if (guestAddr >= kHostArenaVa && guestAddr < kHostArenaEnd) {
+        FreeHostBody(guestAddr, size);
+        return;
+    }
 
     void* ptr = Translate(guestAddr);
     if (!ptr)

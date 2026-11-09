@@ -540,15 +540,21 @@ void StopWorker() {
 } // namespace
 
 uint32_t RegisterClient(uint32_t callback, uint32_t userData) {
-    MCLA_LOG_INFO("apu::RegisterClient: callback=0x{:x}, userData=0x{:x}",
+    MCLA_LOG_INFO("[AUDIO-TRACE] apu::RegisterClient ENTER: callback=0x{:08X}, userData=0x{:08X}",
                   callback, userData);
     g_clientCallback.store(callback, std::memory_order_relaxed);
     g_clientUserData.store(userData, std::memory_order_relaxed);
 
     if (callback != 0 && !g_workerRunning.exchange(true)) {
+        MCLA_LOG_INFO("[AUDIO-TRACE] apu::RegisterClient spawning worker thread");
         g_workerThread = std::thread(WorkerMain);
-        MCLA_LOG_INFO("AUDIO-WORKER spawned");
+        MCLA_LOG_INFO("[AUDIO-TRACE] AUDIO-WORKER spawned");
+    } else if (callback == 0) {
+        MCLA_LOG_INFO("[AUDIO-TRACE] apu::RegisterClient: callback is null, not spawning worker");
+    } else {
+        MCLA_LOG_INFO("[AUDIO-TRACE] apu::RegisterClient: worker already running");
     }
+    MCLA_LOG_INFO("[AUDIO-TRACE] apu::RegisterClient EXIT, returning 0x41550001");
     return 0x41550001; // 'AU' magic | index 1, xenia-style driver id
 }
 
@@ -664,6 +670,8 @@ uint32_t XmaFramesDecoded() { return g_xmaDecoder.frames_decoded(); }
 
 void SubmitFrames(void* samples) {
     const uint32_t n = g_frameCount.fetch_add(1, std::memory_order_relaxed) + 1;
+    MCLA_LOG_INFO("[AUDIO-TRACE] apu::SubmitFrames ENTER #{} samples={}", n,
+                  samples ? static_cast<void*>(samples) : nullptr);
     // Cap log to ~1 line per 200 submits: a real-time render driver submits
     // ~187 frames/s (48 kHz / 256 samples), which would otherwise flood the
     // soak log.
@@ -672,6 +680,7 @@ void SubmitFrames(void* samples) {
                       samples ? "yes" : "null");
     }
     if (!samples) {
+        MCLA_LOG_INFO("[AUDIO-TRACE] apu::SubmitFrames: null samples, returning");
         // Logged and dropped: there is no PCM to convert and inventing some
         // would be a fake. The frame counter above is the honest record that
         // the guest called with null.

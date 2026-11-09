@@ -178,6 +178,14 @@ struct DrawPacket {
     // the two apart.
     uint32_t textureCount;
     uint32_t textureDescriptors[16];
+    // 24-byte big-endian fetch-constant snapshot per texture slot (carried from
+    // capture_hooks.cpp's ReadGuestFetchWindow). textureDescriptorBytes[i] holds
+    // the 24-byte xe_gpu_texture_fetch_t for slot i; texturePoolVa[i] holds the
+    // guest pool VA of the tiled payload. Both are populated by OnDrawBuild when
+    // the fetch window carries kTexture slots; the render thread decodes them
+    // via DecodeGuestTextureDescriptor and imports via BindGuestTextures.
+    uint8_t textureDescriptorBytes[16][24];
+    uint32_t texturePoolVa[16];
 
     // ── Integrity & Validation ──────────────────────────────────────────────
     uint64_t stateHash;        // Deterministic hash of draw state

@@ -1,4 +1,5 @@
 #include "d3d12_backend.h"
+#include "renderer/precompiled_shaders.h"
 #include "renderer/test_shaders.h"
 #include "renderer/vertex_decode.h"
 #include "renderer/pipeline_cache.h"
@@ -31,10 +32,22 @@
 // the printed histogram differ between two runs of the same surface, which is
 // the exact defect F-729 records for the draw-path census.
 #include <algorithm>
+#include <set>
+#include <cstdlib> // F-918: getenv for MCLA_ATLAS_TESTPAT toggle
 #include <cstring>
 
 #pragma comment(lib, "d3d12.lib")
 #pragma comment(lib, "dxgi.lib")
+
+// F-XXX: the project's VEH opt-out (src/kernel/xdm.h:297, defined there as a
+// global-scope inline thread_local; src/boot_host.cpp:42 declares it the same
+// way). Without this flag the process-wide VEH at boot_host.cpp:3130 logs
+// "VEH W0: parking thread" and Sleep(1000)s forever BEFORE any __except can
+// run -- measured on build/w11.log:2733, where the guard below was on the
+// stack (crash_dump frame [08] = TryOMSetRenderTargets) and still never
+// returned. Setting the flag is the VEH's own sanctioned bypass: its
+// boot_host.cpp:3111 branch then logs "VEH SEHPASS" and continues the search.
+extern thread_local bool t_inSafeExcept;
 
 namespace mcla::native {
 
@@ -194,6 +207,22 @@ constexpr HostFormatFootprint kHostFormatTable[] = {
     { DXGI_FORMAT_R8_UNORM,           1, 1,  1 },
     { DXGI_FORMAT_R8G8_UNORM,         1, 1,  2 },
     { DXGI_FORMAT_R16G16B16A16_FLOAT, 1, 1,  8 },
+    // F-900: R11G11B10_FLOAT (26). Xenos formats 16/55 (k_10_11_11) plan to this
+    // DXGI format (texture_decode.cpp:105/144) and PlanTextureImport passes them
+    // as ScalarCopy/4 B-per-texel -- they died ONLY here, at FindHostFormat:
+    // measured 52,000 attempts in build/g962.log, every one refused
+    // "NoHostFormat: plan wants dxgiFormat 26" (the ONLY refusal reason in that
+    // soak). D3D12 feature-level 11 hardware is required to and does support
+    // this format for Texture2D + Shader sample + Mip (Microsoft format-support
+    // matrix), and the project already hands DXGI 26 to D3D12 for VERTEX buffers
+    // (vertex_decode.cpp:54). OPEN QUESTION, measured by the next soak: Xenia
+    // models k_10_11_11 as packed UNORM (pixel_formats.xesli:472-486, integer
+    // field extraction v<<5|v>>6) and never uses DXGI 26 (0 hits in .research),
+    // so if the payload bits are unorm-coded the import will be COLOR-WRONG
+    // (float-decoded noise), not crash -- (b) import fires + (d) colors sane are
+    // BOTH required before this is called fixed. If unorm is confirmed, replace
+    // this row with a CpuExpand path and the Gate 2 import-vs-native fix.
+    { DXGI_FORMAT_R11G11B10_FLOAT,    1, 1,  4 },
     { DXGI_FORMAT_R32G32B32A32_FLOAT, 1, 1, 16 },
     { DXGI_FORMAT_BC1_UNORM,          4, 4,  8 },
     { DXGI_FORMAT_BC1_UNORM_SRGB,     4, 4,  8 },
@@ -379,7 +408,47 @@ static void PublishClipDisableExtent(const char* site, uint32_t extentX,
 // Neither is measured, so it stays. What must not happen is it drifting back
 // into being an inline literal at a second call site.
 // ---------------------------------------------------------------------------
-constexpr float kPlaceholderBackBufferClear[4] = { 0.02f, 0.03f, 0.05f, 1.0f };
+constexpr float kPlaceholderBackBufferClear[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
+
+// F-XXX: THE GUARDED RENDER-TARGET BIND.
+//
+// MEASURED, build/w10.log:4910-4937 -- the render thread died at 20:29:07.992
+// with C0000005 reading address 0x28 inside d3d12.dll. The faulting thread's
+// return address is 0x1402F4909, which llvm-symbolizer resolves against
+// build/mcla.pdb to d3d12_backend.cpp:5118 -- the OMSetRenderTargets call.
+// The VEH handler then PARKED the render thread ("VEH W0: parking thread
+// 19288"), so all rendering stopped at t=41s while the guest kept running.
+//
+// SEH IS THE PROBE, NOT A SWALLOW. A wrapper that only returned false would
+// turn "the render thread crashed" into "draws silently went missing", which
+// is the exact class rule 19 forbids. The call site prints the command list,
+// both descriptor handles, both heaps, the frame index and -- the two values
+// that separate a bad-handle fault from an already-dead device --
+// m_lastPresentHr and GetDeviceRemovedReason().
+//
+// __try/__except cannot live in DrawDynamicMeshWithPipeline: MSVC rejects it in
+// any function that needs C++ unwinding (C2712), and that function owns
+// ComPtrs, vectors and a lock_guard. So the guarded call is its own POD-only
+// free function. noinline guarantees the SEH frame stays here.
+static __declspec(noinline) bool TryOMSetRenderTargets(
+    ID3D12GraphicsCommandList* list, UINT numRtvs,
+    const D3D12_CPU_DESCRIPTOR_HANDLE* rtvs, BOOL single,
+    const D3D12_CPU_DESCRIPTOR_HANDLE* dsv, unsigned long* codeOut) {
+    // t_inSafeExcept is the VEH's documented opt-out, not a global switch: it
+    // is thread_local, and the previous value is restored on BOTH paths so a
+    // nested guarded block keeps its own state.
+    const bool prevSafeExcept = t_inSafeExcept;
+    t_inSafeExcept = true;
+    __try {
+        list->OMSetRenderTargets(numRtvs, rtvs, single, dsv);
+        t_inSafeExcept = prevSafeExcept;
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        t_inSafeExcept = prevSafeExcept;
+        *codeOut = static_cast<unsigned long>(GetExceptionCode());
+        return false;
+    }
+}
 }  // namespace
 
 D3D12Backend* GetD3D12Backend() {
@@ -591,6 +660,7 @@ bool D3D12Backend::Initialize(HWND hwnd, uint32_t width, uint32_t height) {
     m_hwnd = hwnd;
     m_width = (width > 0) ? width : 1280;
     m_height = (height > 0) ? height : 720;
+    m_isMinimized = false;
 
     // The extent is FIRST KNOWN right here, so this is where the clip_disable
     // rescale is published. It is deliberately ahead of CreateSwapChain and
@@ -623,6 +693,24 @@ bool D3D12Backend::Initialize(HWND hwnd, uint32_t width, uint32_t height) {
     if (!CreateSyncObjects()) return false;
     if (!CreateUploadHeap()) return false;
     if (!CreateTestRootSignature()) return false;
+    // Pre-compiled shader root signature (Step 6). Non-fatal: the live path
+    // still uses m_rootSignature; this only enables pre-compiled PSOs.
+    if (!CreatePrecompiledRootSignature()) {
+        MCLA_LOG_WARN("D3D12Backend: precompiled root signature unavailable; "
+                      "pre-compiled shaders will not be substitutable yet");
+    }
+    if (!CreatePrecompiledDescriptorHeaps()) {
+        MCLA_LOG_WARN("D3D12Backend: precompiled descriptor heaps unavailable; "
+                      "pre-compiled shaders will not be substitutable yet");
+    }
+    if (!CreatePrecompiledSharedConstantsBuffer()) {
+        MCLA_LOG_WARN("D3D12Backend: precompiled SharedConstants buffer unavailable; "
+                      "pre-compiled shaders will not be substitutable yet");
+    }
+    if (!CreatePrecompiledTestPipeline()) {
+        MCLA_LOG_WARN("D3D12Backend: precompiled test PSO unavailable; "
+                      "pre-compiled shaders will not be substitutable yet");
+    }
     if (!CreateTestPipeline()) return false;
     if (!CreateStaticIndexBuffer()) return false;
     if (!CreateSrvHeap()) return false;
@@ -663,17 +751,48 @@ bool D3D12Backend::Initialize(HWND hwnd, uint32_t width, uint32_t height) {
 
 bool D3D12Backend::CreateDevice() {
     UINT dxgiFactoryFlags = 0;
+    bool debugLayerRequested = false;
+    bool infoQueueRequested = false;
 
-#if !defined(NDEBUG)
     {
-        Microsoft::WRL::ComPtr<ID3D12Debug> debugController;
-        if (SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&debugController)))) {
-            debugController->EnableDebugLayer();
-            dxgiFactoryFlags |= DXGI_CREATE_FACTORY_DEBUG;
-            MCLA_LOG_INFO("D3D12Backend: Direct3D 12 Debug Layer enabled");
+        char debugLayerSetting[2] = {};
+        const DWORD debugLayerSettingSize = GetEnvironmentVariableA(
+            "MCLA_D3D12_DEBUG_LAYER", debugLayerSetting,
+            static_cast<DWORD>(sizeof(debugLayerSetting)));
+#if !defined(NDEBUG)
+        constexpr bool kDebugLayerEnabledByDefault = true;
+#else
+        constexpr bool kDebugLayerEnabledByDefault = false;
+#endif
+        // F-XXX: MCLA_D3D12_INFOQUEUE=1 also requests the debug layer, so
+        // the validation messages below have something to print. The driver
+        // faults silently in release (OMSET C0000005, device alive), so the
+        // info queue is the only way to learn the exact misuse it trips on.
+        char infoQueueSetting[2] = {};
+        const DWORD infoQueueSettingSize = GetEnvironmentVariableA(
+            "MCLA_D3D12_INFOQUEUE", infoQueueSetting,
+            static_cast<DWORD>(sizeof(infoQueueSetting)));
+        infoQueueRequested =
+            (infoQueueSettingSize == 1 && infoQueueSetting[0] == '1');
+        debugLayerRequested =
+            kDebugLayerEnabledByDefault || infoQueueRequested ||
+            (debugLayerSettingSize == 1 && debugLayerSetting[0] == '1');
+        if (debugLayerRequested) {
+            Microsoft::WRL::ComPtr<ID3D12Debug> debugController;
+            const HRESULT debugHr =
+                D3D12GetDebugInterface(IID_PPV_ARGS(&debugController));
+            if (SUCCEEDED(debugHr)) {
+                debugController->EnableDebugLayer();
+                dxgiFactoryFlags |= DXGI_CREATE_FACTORY_DEBUG;
+                MCLA_LOG_INFO("D3D12Backend: Direct3D 12 Debug Layer enabled");
+            } else {
+                MCLA_LOG_WARN(
+                    "D3D12Backend: debug layer requested but "
+                    "D3D12GetDebugInterface failed with hr=0x{:08X}",
+                    static_cast<uint32_t>(debugHr));
+            }
         }
     }
-#endif
 
     HRESULT hr = CreateDXGIFactory2(dxgiFactoryFlags, IID_PPV_ARGS(&m_factory));
     if (FAILED(hr)) {
@@ -726,6 +845,54 @@ bool D3D12Backend::CreateDevice() {
     if (FAILED(hr)) {
         MCLA_LOG_ERROR("D3D12Backend: D3D12CreateDevice failed with hr=0x{:08X}", static_cast<uint32_t>(hr));
         return false;
+    }
+
+    // F-XXX: D3D12 INFO QUEUE (pull model) -- the driver does not explain
+    // itself by default, and our fault (C0000005 inside the vendor driver
+    // during OMSetRenderTargets, device alive, presents all S_OK) is silent
+    // without it. The stored messages are dumped into the OMSET-FAULT row,
+    // so the driver's own validation complaint is next to the fault it
+    // precedes. Opt-in with MCLA_D3D12_INFOQUEUE=1 (which also requests the
+    // debug layer above); OFF in normal runs.
+    if (debugLayerRequested) {
+        const HRESULT iqHr = m_device.As(&m_infoQueue);
+        if (SUCCEEDED(iqHr) && m_infoQueue) {
+            m_infoQueue->SetBreakOnSeverity(D3D12_MESSAGE_SEVERITY_CORRUPTION, FALSE);
+            m_infoQueue->SetBreakOnSeverity(D3D12_MESSAGE_SEVERITY_ERROR, FALSE);
+            m_infoQueue->SetBreakOnSeverity(D3D12_MESSAGE_SEVERITY_WARNING, FALSE);
+            m_infoQueue->ClearStoredMessages();
+            m_infoQueue->AddApplicationMessage(
+                D3D12_MESSAGE_SEVERITY_INFO, "MCLA info-queue self-test");
+            const uint64_t selfN = m_infoQueue->GetNumStoredMessages();
+            alignas(8) uint8_t selfBuf[1024];
+            SIZE_T selfLen = 0;
+            const HRESULT selfHr = m_infoQueue->GetMessage(
+                0u, reinterpret_cast<D3D12_MESSAGE*>(selfBuf), &selfLen);
+            m_infoQueue->ClearStoredMessages();
+            MCLA_LOG_ERROR("D3D12-INFOQUEUE-SELFTEST stored={} getHr=0x{:08X} "
+                           "len={} -- 1 means the queue really arms and "
+                           "0 means the debug layer is a no-op on this machine",
+                           selfN, static_cast<uint32_t>(selfHr),
+                           static_cast<unsigned long long>(selfLen));
+        } else {
+            MCLA_LOG_WARN("D3D12Backend: debug layer on but ID3D12InfoQueue "
+                          "unavailable hr=0x{:08X}", static_cast<uint32_t>(iqHr));
+        }
+    }
+
+    D3D12_FEATURE_DATA_SHADER_MODEL shaderModel = {};
+    shaderModel.HighestShaderModel = D3D_SHADER_MODEL_6_0;
+    const HRESULT shaderModelHr = m_device->CheckFeatureSupport(
+        D3D12_FEATURE_SHADER_MODEL, &shaderModel, sizeof(shaderModel));
+    if (SUCCEEDED(shaderModelHr)) {
+        MCLA_LOG_INFO("D3D12Backend: shader model capability query requested=0x{:X} "
+                      "highestSupported=0x{:X}",
+                      static_cast<uint32_t>(D3D_SHADER_MODEL_6_0),
+                      static_cast<uint32_t>(shaderModel.HighestShaderModel));
+    } else {
+        MCLA_LOG_WARN("D3D12Backend: shader model capability query failed "
+                      "hr=0x{:08X}",
+                      static_cast<uint32_t>(shaderModelHr));
     }
 
     // F-653: MEASURE the feature level instead of assuming the one requested.
@@ -956,6 +1123,19 @@ void D3D12Backend::GuestRenderTargetRefused(const char* why, uint32_t hr) {
     }
 }
 
+void D3D12Backend::RetireTarget(Microsoft::WRL::ComPtr<ID3D12Pageable> res) {
+    if (!res) return;
+    // The open list may reference it, so its fence value is unknown until the
+    // present path executes that list and Signals (it stamps UINT64_MAX entries).
+    m_retiredTargets.emplace_back(UINT64_MAX, std::move(res));
+}
+
+void D3D12Backend::PruneRetiredTargets() {
+    if (!m_fence || m_retiredTargets.empty()) return;
+    const uint64_t done = m_fence->GetCompletedValue();
+    std::erase_if(m_retiredTargets, [done](const auto& r) { return r.first <= done; });
+}
+
 bool D3D12Backend::EnsureGuestRenderTarget(uint32_t width, uint32_t height,
                                            DXGI_FORMAT format) {
     if (!m_device || width == 0 || height == 0 ||
@@ -1056,15 +1236,31 @@ bool D3D12Backend::EnsureGuestRenderTarget(uint32_t width, uint32_t height,
 
     // A texture the GPU may still be reading must not be released under it,
     // so the one being replaced is kept until the fence says the GPU is done.
-    if (m_guestRt) {
-        m_guestRtRetired.push_back(m_guestRt);
-        if (m_fence && m_fence->GetCompletedValue() >= m_currentFenceValue) {
-            m_guestRtRetired.clear();
-        }
-    }
+    RetireTarget(m_guestRt);
     m_device->CreateRenderTargetView(rt.Get(), nullptr,
                                      m_guestRtvHeap->GetCPUDescriptorHandleForHeapStart());
     m_guestRtv = m_guestRtvHeap->GetCPUDescriptorHandleForHeapStart();
+    // F-XXX: the descriptor SLOT did not change but the resource behind it did,
+    // so the bind cache's handle comparison cannot see this. Force the next
+    // draw to re-bind rather than let a recorded bind name the retired
+    // resource (see m_boundTargetsValid in the header).
+    m_boundTargetsValid = false;
+
+    // Write guest RT SRV into dedicated slot in the primary SRV heap
+    if (m_srvHeap) {
+        D3D12_CPU_DESCRIPTOR_HANDLE srvCpu = m_srvHeap->GetCPUDescriptorHandleForHeapStart();
+        srvCpu.ptr += static_cast<size_t>(kGuestRtSrvSlot) * m_srvDescriptorSize;
+        D3D12_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
+        srvDesc.Format = format;
+        srvDesc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        srvDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        srvDesc.Texture2D.MipLevels = 1;
+        m_device->CreateShaderResourceView(rt.Get(), &srvDesc, srvCpu);
+
+        m_guestRtSrvGpu = m_srvHeap->GetGPUDescriptorHandleForHeapStart();
+        m_guestRtSrvGpu.ptr += static_cast<size_t>(kGuestRtSrvSlot) * m_srvDescriptorSize;
+        m_guestRtSrvValid = true;
+    }
     m_guestRt = rt;
     m_guestRtW = width;
     m_guestRtH = height;
@@ -1094,6 +1290,81 @@ bool D3D12Backend::EnsureGuestRenderTarget(uint32_t width, uint32_t height,
     return true;
 }
 
+bool D3D12Backend::EnsureGuestDepthStencil(uint32_t width, uint32_t height,
+                                           DXGI_FORMAT format) {
+    if (!m_device || width == 0 || height == 0 || format == DXGI_FORMAT_UNKNOWN) {
+        return false;
+    }
+    if (m_guestDepthValid && m_guestDepthW == width && m_guestDepthH == height &&
+        m_guestDepthFormat == format) {
+        return true;
+    }
+
+    D3D12_HEAP_PROPERTIES props = {};
+    props.Type = D3D12_HEAP_TYPE_DEFAULT;
+    props.CPUPageProperty = D3D12_CPU_PAGE_PROPERTY_UNKNOWN;
+    props.MemoryPoolPreference = D3D12_MEMORY_POOL_UNKNOWN;
+
+    D3D12_RESOURCE_DESC desc = {};
+    desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    desc.Width = width;
+    desc.Height = height;
+    desc.DepthOrArraySize = 1;
+    desc.MipLevels = 1;
+    desc.Format = format;
+    desc.SampleDesc.Count = 1;
+    desc.SampleDesc.Quality = 0;
+    desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+    desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
+
+    D3D12_CLEAR_VALUE clearVal = {};
+    clearVal.Format = format;
+    clearVal.DepthStencil.Depth = 1.0f;
+    clearVal.DepthStencil.Stencil = 0;
+
+    Microsoft::WRL::ComPtr<ID3D12Resource> ds;
+    HRESULT hr = m_device->CreateCommittedResource(
+        &props, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_DEPTH_WRITE,
+        &clearVal, IID_PPV_ARGS(&ds));
+    if (FAILED(hr) || !ds) {
+        MCLA_LOG_WARN("D3D12Backend: EnsureGuestDepthStencil create failed hr=0x{:08X}", static_cast<uint32_t>(hr));
+        return false;
+    }
+
+    if (!m_guestDsvHeap) {
+        D3D12_DESCRIPTOR_HEAP_DESC heapDesc = {};
+        heapDesc.NumDescriptors = 1;
+        heapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_DSV;
+        heapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_NONE;
+        HRESULT hhr = m_device->CreateDescriptorHeap(&heapDesc, IID_PPV_ARGS(&m_guestDsvHeap));
+        if (FAILED(hhr) || !m_guestDsvHeap) {
+            return false;
+        }
+    }
+
+    D3D12_DEPTH_STENCIL_VIEW_DESC dsvDesc = {};
+    dsvDesc.Format = format;
+    dsvDesc.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2D;
+    dsvDesc.Flags = D3D12_DSV_FLAG_NONE;
+    dsvDesc.Texture2D.MipSlice = 0;
+
+    m_guestDsv = m_guestDsvHeap->GetCPUDescriptorHandleForHeapStart();
+    m_device->CreateDepthStencilView(ds.Get(), &dsvDesc, m_guestDsv);
+    // F-XXX: same descriptor slot, new resource -> the bind cache must not
+    // skip. See m_boundTargetsValid in the header.
+    m_boundTargetsValid = false;
+
+    RetireTarget(m_guestDepth);
+    m_guestDepth = ds;
+    m_guestDepthW = width;
+    m_guestDepthH = height;
+    m_guestDepthFormat = format;
+    m_guestDepthValid = true;
+    SetTrackedState(ds.Get(), D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, D3D12_RESOURCE_STATE_DEPTH_WRITE);
+    MCLA_LOG_INFO("D3D12Backend: created guest depth-stencil buffer {}x{} dxgi={}", width, height, static_cast<uint32_t>(format));
+    return true;
+}
+
 // ---------------------------------------------------------------------------
 // F-XXX: THE RESOLVE -- the console's EDRAM -> scan-out copy.
 //
@@ -1109,16 +1380,130 @@ bool D3D12Backend::EnsureGuestRenderTarget(uint32_t width, uint32_t height,
 // buffer, so the two are different objects and the row says so rather than
 // pretending they are the same.
 // ---------------------------------------------------------------------------
-bool D3D12Backend::ResolveGuestRenderTarget() {
-    if (!m_guestRtValid || !m_guestRtDrawn || !m_commandList) return false;
-    ID3D12Resource* back = m_renderTargets[m_frameIndex].Get();
-    if (!back) {
-        GuestRenderTargetRefused("no-scanout-surface");
+bool D3D12Backend::EnsureBlitPipeline() {
+    if (m_blitPipeline && m_blitRootSignature) return true;
+    if (!m_device) return false;
+
+    if (!m_blitRootSignature) {
+        D3D12_DESCRIPTOR_RANGE srvRange = {};
+        srvRange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+        srvRange.NumDescriptors = 1;
+        srvRange.BaseShaderRegister = 0;  // t0
+        srvRange.RegisterSpace = 0;
+        srvRange.OffsetInDescriptorsFromTableStart = 0;
+
+        D3D12_ROOT_PARAMETER rootParam = {};
+        rootParam.ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        rootParam.DescriptorTable.NumDescriptorRanges = 1;
+        rootParam.DescriptorTable.pDescriptorRanges = &srvRange;
+        rootParam.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+
+        D3D12_STATIC_SAMPLER_DESC samplerDesc = {};
+        samplerDesc.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+        samplerDesc.AddressU = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+        samplerDesc.AddressV = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+        samplerDesc.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+        samplerDesc.MipLODBias = 0.0f;
+        samplerDesc.MaxAnisotropy = 1;
+        samplerDesc.ComparisonFunc = D3D12_COMPARISON_FUNC_ALWAYS;
+        samplerDesc.BorderColor = D3D12_STATIC_BORDER_COLOR_TRANSPARENT_BLACK;
+        samplerDesc.MinLOD = 0.0f;
+        samplerDesc.MaxLOD = D3D12_FLOAT32_MAX;
+        samplerDesc.ShaderRegister = 0; // s0
+        samplerDesc.RegisterSpace = 0;
+        samplerDesc.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+
+        D3D12_ROOT_SIGNATURE_DESC rootDesc = {};
+        rootDesc.NumParameters = 1;
+        rootDesc.pParameters = &rootParam;
+        rootDesc.NumStaticSamplers = 1;
+        rootDesc.pStaticSamplers = &samplerDesc;
+        rootDesc.Flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
+
+        Microsoft::WRL::ComPtr<ID3DBlob> sigBlob, errBlob;
+        HRESULT hr = D3D12SerializeRootSignature(&rootDesc, D3D_ROOT_SIGNATURE_VERSION_1_0, &sigBlob, &errBlob);
+        if (FAILED(hr)) {
+            MCLA_LOG_ERROR("D3D12Backend: EnsureBlitPipeline SerializeRootSignature failed hr=0x{:08X}", static_cast<uint32_t>(hr));
+            return false;
+        }
+        hr = m_device->CreateRootSignature(0, sigBlob->GetBufferPointer(), sigBlob->GetBufferSize(), IID_PPV_ARGS(&m_blitRootSignature));
+        if (FAILED(hr)) {
+            MCLA_LOG_ERROR("D3D12Backend: EnsureBlitPipeline CreateRootSignature failed hr=0x{:08X}", static_cast<uint32_t>(hr));
+            return false;
+        }
+    }
+
+    const char* vsHlsl =
+        "struct VSOut { float4 pos : SV_Position; float2 uv : TEXCOORD0; };\n"
+        "VSOut main(uint id : SV_VertexID) {\n"
+        "    VSOut o;\n"
+        "    o.uv = float2((id << 1) & 2, id & 2);\n"
+        "    o.pos = float4(o.uv * float2(2.0, -2.0) + float2(-1.0, 1.0), 0.0, 1.0);\n"
+        "    return o;\n"
+        "}\n";
+
+    const char* psHlsl =
+        "Texture2D g_tex : register(t0);\n"
+        "SamplerState g_sampler : register(s0);\n"
+        "struct VSOut { float4 pos : SV_Position; float2 uv : TEXCOORD0; };\n"
+        "float4 main(VSOut i) : SV_Target {\n"
+        "    return g_tex.Sample(g_sampler, i.uv);\n"
+        "}\n";
+
+    renderer::DxcRuntime dxc;
+    std::string usedDir, error;
+    if (!dxc.Load("", usedDir, error)) {
+        MCLA_LOG_ERROR("D3D12Backend: EnsureBlitPipeline failed to load DXC runtime: {}", error);
         return false;
     }
-    if (m_guestRtW != m_width || m_guestRtH != m_height) {
-        // The resolve is a COPY, so the two surfaces must be the same size.
-        GuestRenderTargetRefused("guest-rt-not-1to1-with-scanout");
+
+    std::vector<uint8_t> vsBlob, psBlob;
+    if (!dxc.Compile(vsHlsl, "main", "vs_6_0", vsBlob, error)) {
+        MCLA_LOG_ERROR("D3D12Backend: EnsureBlitPipeline VS compilation failed: {}", error);
+        return false;
+    }
+    if (!dxc.Compile(psHlsl, "main", "ps_6_0", psBlob, error)) {
+        MCLA_LOG_ERROR("D3D12Backend: EnsureBlitPipeline PS compilation failed: {}", error);
+        return false;
+    }
+
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC psoDesc = {};
+    psoDesc.pRootSignature = m_blitRootSignature.Get();
+    psoDesc.VS = { vsBlob.data(), vsBlob.size() };
+    psoDesc.PS = { psBlob.data(), psBlob.size() };
+    psoDesc.InputLayout = { nullptr, 0 };
+    psoDesc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+    psoDesc.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+    psoDesc.NumRenderTargets = 1;
+    psoDesc.SampleDesc.Count = 1;
+    psoDesc.SampleMask = UINT_MAX;
+    psoDesc.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+    psoDesc.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+    psoDesc.RasterizerState.DepthClipEnable = FALSE;
+    psoDesc.BlendState.AlphaToCoverageEnable = FALSE;
+    psoDesc.BlendState.IndependentBlendEnable = FALSE;
+    psoDesc.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+    psoDesc.DepthStencilState.DepthEnable = FALSE;
+    psoDesc.DepthStencilState.StencilEnable = FALSE;
+
+    HRESULT hr = m_device->CreateGraphicsPipelineState(&psoDesc, IID_PPV_ARGS(&m_blitPipeline));
+    if (FAILED(hr)) {
+        MCLA_LOG_ERROR("D3D12Backend: EnsureBlitPipeline CreateGraphicsPipelineState failed hr=0x{:08X}", static_cast<uint32_t>(hr));
+        return false;
+    }
+
+    MCLA_LOG_INFO("D3D12Backend: blit pipeline created successfully");
+    return true;
+}
+
+bool D3D12Backend::BlitGuestRenderTargetToScanout() {
+    if (!m_guestRtValid || !m_guestRt || !m_commandList || !m_guestRtSrvValid) return false;
+    if (m_width == 0 || m_height == 0 || m_guestRtW == 0 || m_guestRtH == 0) return false;
+    ID3D12Resource* back = m_renderTargets[m_frameIndex].Get();
+    if (!back) return false;
+
+    if (!EnsureBlitPipeline()) {
+        GuestRenderTargetRefused("blit-pipeline-failed");
         return false;
     }
 
@@ -1126,30 +1511,138 @@ bool D3D12Backend::ResolveGuestRenderTarget() {
     barriers[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
     barriers[0].Transition.pResource = m_guestRt.Get();
     barriers[0].Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
-    barriers[0].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    barriers[0].Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
     barriers[0].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+
     barriers[1].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
     barriers[1].Transition.pResource = back;
     barriers[1].Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT;
-    barriers[1].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+    barriers[1].Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
     barriers[1].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
     m_commandList->ResourceBarrier(2, barriers);
 
-    D3D12_TEXTURE_COPY_LOCATION dst = {};
-    dst.pResource = back;
-    dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-    dst.SubresourceIndex = 0;
-    D3D12_TEXTURE_COPY_LOCATION src = {};
-    src.pResource = m_guestRt.Get();
-    src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-    src.SubresourceIndex = 0;
-    m_commandList->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+    D3D12_CPU_DESCRIPTOR_HANDLE backRtv = m_rtvHeap->GetCPUDescriptorHandleForHeapStart();
+    backRtv.ptr += static_cast<size_t>(m_frameIndex) * m_rtvDescriptorSize;
+    // F-XXX: guarded bind (auditor-measured in w13: the draw-path guard had
+    // latched after 32 faults, then the render thread parked at the NEXT
+    // present's blit bind -- this site was the only unguarded OMSet left in
+    // the present path). On fault, skip the blit instead of letting the VEH
+    // park the render thread.
+    unsigned long blitOmsetCode = 0;
+    if (!TryOMSetRenderTargets(m_commandList.Get(), 1, &backRtv, FALSE, nullptr,
+                               &blitOmsetCode)) {
+        static std::atomic<uint32_t> s_blitOmsetFaults{0};
+        const uint32_t fn =
+            s_blitOmsetFaults.fetch_add(1, std::memory_order_relaxed) + 1;
+        const HRESULT removed =
+            m_device ? m_device->GetDeviceRemovedReason() : E_FAIL;
+        if (fn <= 8 || (fn % 200) == 0) {
+            MCLA_LOG_ERROR(
+                "BLIT-OMSET-FAULT #{} code=0x{:08X} frameIndex={} presented={} "
+                "lastPresentHr={:08X} deviceRemoved=0x{:08X}",
+                fn, static_cast<unsigned>(blitOmsetCode), m_frameIndex,
+                m_presentedFrames, static_cast<uint32_t>(m_lastPresentHr),
+                static_cast<uint32_t>(removed));
+        }
+        return false;
+    }
+    m_boundTargetsValid = false;  // same slot, new resource; see cache decl
 
-    barriers[0].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    D3D12_VIEWPORT vp = m_graphicsSettings.aspectCorrection
+        ? GetAspectCorrectViewport(static_cast<float>(m_guestRtW) / static_cast<float>(m_guestRtH))
+        : D3D12_VIEWPORT{ 0.0f, 0.0f, static_cast<float>(m_width), static_cast<float>(m_height), 0.0f, 1.0f };
+    m_commandList->RSSetViewports(1, &vp);
+
+    D3D12_RECT rc = { 0, 0, static_cast<LONG>(m_width), static_cast<LONG>(m_height) };
+    m_commandList->RSSetScissorRects(1, &rc);
+
+    // Keep primary heaps bound
+    if (m_srvHeap && m_samplerHeap) {
+        ID3D12DescriptorHeap* heaps[] = { m_srvHeap.Get(), m_samplerHeap.Get() };
+        m_commandList->SetDescriptorHeaps(2, heaps);
+    } else if (m_srvHeap) {
+        ID3D12DescriptorHeap* heaps[] = { m_srvHeap.Get() };
+        m_commandList->SetDescriptorHeaps(1, heaps);
+    }
+
+    m_commandList->SetGraphicsRootSignature(m_blitRootSignature.Get());
+    m_commandList->SetGraphicsRootDescriptorTable(0, m_guestRtSrvGpu);
+    m_commandList->SetPipelineState(m_blitPipeline.Get());
+    m_commandList->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+
+    m_commandList->DrawInstanced(3, 1, 0, 0);
+
+    barriers[0].Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
     barriers[0].Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
-    barriers[1].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+    barriers[1].Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
     barriers[1].Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
     m_commandList->ResourceBarrier(2, barriers);
+
+    // Immediately restore primary graphics root signature and descriptor heaps
+    if (m_rootSignature) {
+        m_commandList->SetGraphicsRootSignature(m_rootSignature.Get());
+    }
+    if (m_srvHeap && m_samplerHeap) {
+        ID3D12DescriptorHeap* heaps[] = { m_srvHeap.Get(), m_samplerHeap.Get() };
+        m_commandList->SetDescriptorHeaps(2, heaps);
+    } else if (m_srvHeap) {
+        ID3D12DescriptorHeap* heaps[] = { m_srvHeap.Get() };
+        m_commandList->SetDescriptorHeaps(1, heaps);
+    }
+
+    static uint32_t s_blitCount = 0;
+    if (++s_blitCount <= 8 || (s_blitCount % 200) == 0) {
+        MCLA_LOG_ERROR("BLIT-GUEST-RT-SCANOUT #{} {}x{} -> {}x{}",
+                       s_blitCount, m_guestRtW, m_guestRtH, m_width, m_height);
+    }
+
+    return true;
+}
+
+bool D3D12Backend::ResolveGuestRenderTarget() {
+    if (!m_guestRtValid || !m_guestRtDrawn || !m_commandList) return false;
+    if (m_width == 0 || m_height == 0 || m_guestRtW == 0 || m_guestRtH == 0) return false;
+    ID3D12Resource* back = m_renderTargets[m_frameIndex].Get();
+    if (!back) {
+        GuestRenderTargetRefused("no-scanout-surface");
+        return false;
+    }
+
+    const DXGI_FORMAT scanoutFormat = DXGI_FORMAT_R8G8B8A8_UNORM;
+    if (m_guestRtW == m_width && m_guestRtH == m_height && m_guestRtFormat == scanoutFormat) {
+        D3D12_RESOURCE_BARRIER barriers[2] = {};
+        barriers[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        barriers[0].Transition.pResource = m_guestRt.Get();
+        barriers[0].Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+        barriers[0].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+        barriers[0].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        barriers[1].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        barriers[1].Transition.pResource = back;
+        barriers[1].Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT;
+        barriers[1].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+        barriers[1].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        m_commandList->ResourceBarrier(2, barriers);
+
+        D3D12_TEXTURE_COPY_LOCATION dst = {};
+        dst.pResource = back;
+        dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        dst.SubresourceIndex = 0;
+        D3D12_TEXTURE_COPY_LOCATION src = {};
+        src.pResource = m_guestRt.Get();
+        src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        src.SubresourceIndex = 0;
+        m_commandList->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+
+        barriers[0].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+        barriers[0].Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
+        barriers[1].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+        barriers[1].Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
+        m_commandList->ResourceBarrier(2, barriers);
+    } else {
+        if (!BlitGuestRenderTargetToScanout()) {
+            return false;
+        }
+    }
 
     // The back buffer has now been written -- by the resolve, which is the
     // only thing that writes it while the draws land in the guest's render
@@ -1161,9 +1654,10 @@ bool D3D12Backend::ResolveGuestRenderTarget() {
     const uint64_t n = ++m_guestRtResolves;
     const mcla::gpu::CpGuestRenderTarget gt = mcla::gpu::CpGuestRenderTargetInfo();
     if (n <= 8 || (n % 200) == 0) {
-        MCLA_LOG_WARN(
+        MCLA_LOG_ERROR(
             "GUEST-RT-RESOLVE #{} src=guest-rt {}x{} dxgiFormat={} -> "
-            "dst=scanout {}x{} changedPx={} -- the guest's render target reached "
+            "dst=scanout {}x{} changedPx={} modalRgba=({},{},{},{}) "
+            "modalCount={} -- the guest's render target reached "
             "the scan-out surface. changedPx is the number of NON-MODAL pixels "
             "the last post-draw readback measured IN THE GUEST RENDER TARGET "
             "(the same count the D3D12-DRAW-PIXEL row prints): it is the "
@@ -1186,6 +1680,11 @@ bool D3D12Backend::ResolveGuestRenderTarget() {
             static_cast<uint32_t>(n), m_guestRtW, m_guestRtH,
             static_cast<uint32_t>(m_guestRtFormat), m_width, m_height,
             m_guestRtChangedPx,
+            static_cast<unsigned>(m_guestRtModalRgba & 0xFFu),
+            static_cast<unsigned>((m_guestRtModalRgba >> 8) & 0xFFu),
+            static_cast<unsigned>((m_guestRtModalRgba >> 16) & 0xFFu),
+            static_cast<unsigned>((m_guestRtModalRgba >> 24) & 0xFFu),
+            m_guestRtModalCount,
             gt.copyControl, gt.copyDestBase, gt.copyDestPitch, gt.copyDestInfo,
             gt.edramMode, gt.edramMode, gt.surfacePitch,
             static_cast<uint32_t>(gt.copyDestPitch & 0x3FFFu),
@@ -1220,7 +1719,12 @@ bool D3D12Backend::CreateSyncObjects() {
 }
 
 bool D3D12Backend::CreateUploadHeap() {
-    constexpr size_t kUploadSize = 4 * 1024 * 1024;  // 4 MiB per-frame upload arena
+    // F-900: 256 MiB total upload arena (was 64 MiB). Measured: a guest burst
+    // carries ~4,000+ draws at ~4,352 B each (4096 B root CBV + 256 B VB) plus
+    // vertex/index buffers. In bursts exceeding 3,800 draws, 21 MB per region
+    // was exhausted, dropping draws and causing all-black frames.
+    // 256 MiB provides 85.3 MiB per frame region, preventing all upload arena drops.
+    constexpr size_t kUploadSize = 256 * 1024 * 1024;
 
     D3D12_HEAP_PROPERTIES props = {};
     props.Type = D3D12_HEAP_TYPE_UPLOAD;
@@ -1245,7 +1749,10 @@ bool D3D12Backend::CreateUploadHeap() {
     }
 
     m_uploadCapacity = kUploadSize;
-    m_uploadRegionSize = kUploadSize / kBufferCount;
+    // F-900: align region stride to 256 so CBV GPU VAs stay 256-aligned on all
+    // frames. Unaligned 1398101 gave frames 1/2 offsets 85/170 (measured).
+    // Align DOWN to 1398016 (total 4194048, 256 B slack in the 4 MiB heap).
+    m_uploadRegionSize = (kUploadSize / kBufferCount) & ~static_cast<size_t>(255);
     m_uploadOffset = 0;
     m_uploadMap = nullptr;
     hr = m_uploadHeap->Map(0, nullptr, reinterpret_cast<void**>(&m_uploadMap));
@@ -1454,11 +1961,19 @@ D3D12Backend::SamplerDescriptor D3D12Backend::GetOrCreateSamplerDescriptor(const
     return { cpuHandle, gpuHandle };
 }
 
-// Bind the shader-visible sampler descriptor heap to the command list
+// Bind the shader-visible sampler descriptor heap to the command list.
+// D3D12 unbinds previously bound heaps when a new SetDescriptorHeaps call names a
+// different set, so the SRV heap must be named here too or root param 0's SRV
+// table would reference an unbound heap.
 void D3D12Backend::BindSamplerHeap() {
     if (!m_samplerHeap) return;
-    ID3D12DescriptorHeap* heaps[] = { m_samplerHeap.Get() };
-    m_commandList->SetDescriptorHeaps(1, heaps);
+    if (m_srvHeap) {
+        ID3D12DescriptorHeap* heaps[] = { m_srvHeap.Get(), m_samplerHeap.Get() };
+        m_commandList->SetDescriptorHeaps(2, heaps);
+    } else {
+        ID3D12DescriptorHeap* heaps[] = { m_samplerHeap.Get() };
+        m_commandList->SetDescriptorHeaps(1, heaps);
+    }
 }
 
 // Phase 7: Render Graph implementation
@@ -1751,7 +2266,8 @@ bool D3D12Backend::CreateDecodedTexture(const TextureImportDesc& desc) {
     if (ShouldLogRefusal(planNo)) {
         MCLA_LOG_INFO("TEX-IMPORT #{} fmt={} {} dxgi={} mode={} {}x{} mips={} blockB={} ok={} "
                       "refusal={} slot={}",
-                      planNo, plan.xenosFormat, plan.formatName, plan.nativeDxgiFormat,
+                      planNo, plan.xenosFormat, plan.formatName,
+                      plan.importDxgiFormat ? plan.importDxgiFormat : plan.nativeDxgiFormat,
                       (uint32_t)plan.mode, desc.width, desc.height, desc.mipCount,
                       plan.blockBytes, plan.ok ? 1 : 0,
                       native::TextureRefusalName(plan.refusal), desc.srvSlot);
@@ -1772,11 +2288,22 @@ bool D3D12Backend::CreateDecodedTexture(const TextureImportDesc& desc) {
         return false;
     }
 
-    // --- Gate 2: can THIS backend carry plan->nativeDxgiFormat? FindHostFormat
-    // returning nullptr is the "no table row" refusal. It is deliberately not a
-    // fallback: sampling a payload under a format it was not produced in is a
-    // different image, not a blurrier one.
-    const DXGI_FORMAT format = static_cast<DXGI_FORMAT>(plan.nativeDxgiFormat);
+    // --- Gate 2: can THIS backend carry the payload's REAL post-expansion
+    // format? F-900 HIGH-3 HALF 2: for CpuExpand plans the payload that
+    // reaches the copy is in importDxgiFormat (RGBA8/R8 after
+    // ExpandTextureToImportBytes), NOT nativeDxgiFormat (the BC form) -- using
+    // native here built a BC3 resource, sized the footprint from BC3, and then
+    // copied RGBA8 bytes under a BC3 source pitch (first 1024 of 4096 B), while
+    // the cache-hit SRV was created with key.importDxgiFormat over that same BC3
+    // resource = an illegal RGBA8-over-BC3 view (undefined behaviour; debug layer
+    // was off, so nothing named it). For DirectBlockCopy/ScalarCopy plans
+    // importDxgiFormat == native, so those paths are byte-identical; behaviour
+    // changes only for CpuExpand (18/19/20/51/52/53 -> RGBA8, 58/59 -> R8).
+    // FindHostFormat returning nullptr is the "no table row" refusal. It is
+    // deliberately not a fallback: sampling a payload under a format it was not
+    // produced in is a different image, not a blurrier one.
+    const DXGI_FORMAT format = static_cast<DXGI_FORMAT>(
+        plan.importDxgiFormat ? plan.importDxgiFormat : plan.nativeDxgiFormat);
     const HostFormatFootprint* fp = FindHostFormat(format);
     if (static_cast<uint32_t>(format) == 0 || !fp) {
         const uint64_t n = ++g_textureImportRefusalOther;
@@ -1784,9 +2311,10 @@ bool D3D12Backend::CreateDecodedTexture(const TextureImportDesc& desc) {
             TextureBackendRefusal::NoHostFormat)];
         if (ShouldLogRefusal(n)) {
             MCLA_LOG_ERROR("D3D12Backend: texture import refused #{} reason=NoHostFormat: "
-                           "plan wants dxgiFormat {} (xenosFmt={} {}), which is not in the backend "
-                           "import table -- NULL SRV bound at slot {}",
-                           n, plan.nativeDxgiFormat, plan.xenosFormat, plan.formatName,
+                           "plan wants dxgiFormat {} (native={} xenosFmt={} {}), which is not "
+                           "in the backend import table -- NULL SRV bound at slot {}",
+                           n, static_cast<uint32_t>(format), plan.nativeDxgiFormat,
+                           plan.xenosFormat, plan.formatName,
                            desc.srvSlot);
         }
         return false;
@@ -1859,9 +2387,16 @@ bool D3D12Backend::CreateDecodedTexture(const TextureImportDesc& desc) {
     // and REFUSES a ragged payload rather than partially writing, so the check is
     // one call. The output lands in a member scratch buffer so the draw path
     // does not allocate per texture.
+    //
+    // F-914 tofu Fix 1: SKIPPED when the caller already handed post-expand
+    // bytes (desc.payloadAlreadyExpanded, set by BindGuestTextures' MISS path
+    // -- those bytes are the very buffer the content hash, halo fix and
+    // testpat ran on, so hash and upload finally agree). Re-expanding them
+    // would alias m_importScratch against itself (F-900, :2541-2548) and
+    // upload zeros under a cache key that claims real pixels.
     const uint8_t* level0 = desc.mipPayloads[0];
     uint32_t level0Bytes = desc.mipBytes[0];
-    if (plan.mode == native::TextureUploadMode::CpuExpand) {
+    if (plan.mode == native::TextureUploadMode::CpuExpand && !desc.payloadAlreadyExpanded) {
         native::TextureRefusal expandRefusal = native::TextureRefusal::None;
         if (!native::ExpandTextureToImportBytes(plan, level0, level0Bytes, m_importScratch,
                                                 &expandRefusal)) {
@@ -1924,12 +2459,43 @@ bool D3D12Backend::CreateDecodedTexture(const TextureImportDesc& desc) {
         nullptr, IID_PPV_ARGS(&texture));
     if (FAILED(hr)) {
         ++g_textureImportRefusalOther;
+        // F-900: ONE-SHOT DEVICE-REMOVED REASON PROBE. The first failure in
+        // build/g961.log was hr=0x887A0005 thrown from inside this call
+        // (CreateDecodedTexture+0x8D6 <- BindGuestTextures+0xF22), and NVIDIA
+        // drivers are known to report DXGI_ERROR_DEVICE_REMOVED from creation
+        // APIs as a generic creation-failure code -- GetDeviceRemovedReason
+        // distinguishes "the device really died" (S_OK would be impossible) from
+        // "a creation path failed while reporting 0x887A0005". S_OK here proves
+        // the device was never removed. Nothing in src/ called this before
+        // (grep: 0 hits), so no soak could tell the two apart.
+        static bool s_removedReasonLogged = false;
+        if (!s_removedReasonLogged) {
+            s_removedReasonLogged = true;
+            const HRESULT reason = m_device ? m_device->GetDeviceRemovedReason() : E_FAIL;
+            MCLA_LOG_ERROR("D3D12Backend: DEVICE-REMOVED-REASON #1 hr=0x{:08X} "
+                           "removedReason=0x{:08X} -- reason={} (S_OK: the device "
+                           "was NEVER removed; 0x887A0005 here is a creation-path "
+                           "failure reporting the device-removed code)",
+                           static_cast<uint32_t>(hr), static_cast<uint32_t>(reason),
+                           reason == S_OK ? "DEVICE_OK" : "DEVICE_REALLY_REMOVED");
+        }
         MCLA_LOG_ERROR("D3D12Backend: texture import refused: CreateCommittedResource "
                        "{}x{}x{} mips fmt={} failed hr=0x{:08X}",
                        desc.width, desc.height, mipCount, static_cast<uint32_t>(format),
                        static_cast<uint32_t>(hr));
         return false;
     }
+
+    // F-900: RECORD THE TRACKED STATE AT CREATION. The resource is created in
+    // COPY_DEST (the CreateCommittedResource initial state above), but the
+    // tracker had no entry for it, so TrackedState() returned COMMON for this
+    // "untracked" resource and the post-copy barrier emitted
+    // COMMON -> PIXEL_SHADER_RESOURCE on a resource the driver actually held in
+    // COPY_DEST -- a spec violation (the comment at the barrier site asserting
+    // "Common is what CreateCommittedResource left it in" is false for this
+    // path; the debug layer was off in g961/g962, so it never said so).
+    SetTrackedState(texture.Get(), D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                    D3D12_RESOURCE_STATE_COPY_DEST);
 
     if (!m_inFrame) {
         if (!BeginFrame()) return false;
@@ -2042,6 +2608,67 @@ bool D3D12Backend::CreateDecodedTexture(const TextureImportDesc& desc) {
             }
             uint8_t* dst = static_cast<uint8_t*>(mapped) + offset;
             const UINT64 dstPitch = footprints[i].Footprint.RowPitch;
+            // TEMP DIAGNOSTIC (F-900): is the payload actually non-zero? If the
+            // full-screen quad samples a texture of zeros, oC0 = 0*coord = 0 and
+            // the draws paint BLACK over the (navy) clear -- indistinguishable
+            // from "clear never executed" in the readback. Count nonzero dwords
+            // of the source bytes this upload is about to stage.
+            {
+                uint32_t nonzero = 0, dwords = srcBytes / 4;
+                const uint32_t* sp = reinterpret_cast<const uint32_t*>(src);
+                for (uint32_t w = 0; w < dwords; ++w) if (sp[w] != 0) ++nonzero;
+                static uint32_t s_payloadDiag = 0;
+                const uint32_t pd = ++s_payloadDiag;
+                if (pd <= 6 || (pd % 200) == 0) {
+                    MCLA_LOG_INFO("PAYLOAD-CONTENT #{} {}x{} fmt={} bytes={} "
+                                  "nonzeroDwords={}/{} first32={:08X} {:08X} "
+                                  "{:08X} {:08X}",
+                                  pd, desc.width, desc.height,
+                                  static_cast<uint32_t>(format), srcBytes,
+                                  nonzero, dwords,
+                                  dwords > 0 ? sp[0] : 0u,
+                                  dwords > 1 ? sp[1] : 0u,
+                                  dwords > 2 ? sp[2] : 0u,
+                                  dwords > 3 ? sp[3] : 0u);
+                    // F-900: row map of non-zero texels (which rows have content?).
+                    // Quad UVs cluster at v 0.03-0.16 (rows ~8-41 of 256); if the
+                    // content lives elsewhere the UVs are systematically wrong.
+                    if (desc.width == 256 && desc.height == 256 && dwords == 65536) {
+                        char bands[9] = {};
+                        for (int b = 0; b < 8; ++b) {
+                            uint32_t bnz = 0;
+                            for (uint32_t r = b * 32; r < (uint32_t)(b + 1) * 32; ++r) {
+                                for (uint32_t x = 0; x < 256; ++x) {
+                                    if (sp[r * 256 + x] != 0) { bnz = 1; break; }
+                                }
+                                if (bnz) break;
+                            }
+                            bands[b] = bnz ? 'X' : '.';
+                        }
+                        bands[8] = 0;
+                        MCLA_LOG_INFO("PAYLOAD-ROWMAP #{} 256x256 bands32={} "
+                                      "(each char = 32 rows, X=has-nonzero)",
+                                      pd, bands);
+                        // TEMP F-900 GRID16 (remove with ROWMAP after UV/content
+                        // overlap is settled): 16x16 cells, X=cell has nonzero.
+                        // Distinguishes "top rows filled" from "small rect filled".
+                        for (int gy = 0; gy < 16; ++gy) {
+                            char row[17] = {};
+                            for (int gx = 0; gx < 16; ++gx) {
+                                uint32_t hit = 0;
+                                for (uint32_t r = gy * 16; r < (uint32_t)(gy + 1) * 16 && !hit; ++r) {
+                                    for (uint32_t x = gx * 16; x < (uint32_t)(gx + 1) * 16; ++x) {
+                                        if (sp[r * 256 + x] != 0) { hit = 1; break; }
+                                    }
+                                }
+                                row[gx] = hit ? 'X' : '.';
+                            }
+                            row[16] = 0;
+                            MCLA_LOG_INFO("PAYLOAD-GRID #{} gy={} {}", pd, gy, row);
+                        }
+                    }
+                }
+            }
             for (uint32_t y = 0; y < blocksY; ++y) {
                 std::memcpy(dst + static_cast<size_t>(y) * dstPitch,
                             src + static_cast<size_t>(y) * srcPitch,
@@ -2118,10 +2745,10 @@ bool D3D12Backend::CreateDecodedTexture(const TextureImportDesc& desc) {
     // --- Commit. The copy is enqueued into the current frame's command list
     // above, so the staging buffer must outlive the draw; the previous staging is
     // replaced only now that everything succeeded.
-    Microsoft::WRL::ComPtr<ID3D12Resource> prevStaging = m_decodedTextureUpload;
+    RetireTarget(std::move(m_decodedTexture));
+    RetireTarget(std::move(m_decodedTextureUpload));
     m_decodedTexture = texture;
     m_decodedTextureUpload = staging;
-    prevStaging.Reset();
 
     if (desc.outTexture) *desc.outTexture = texture;
     if (desc.outSrvGpu) *desc.outSrvGpu = m_decodedTextureSrvGpu;
@@ -2148,7 +2775,7 @@ bool D3D12Backend::CreateDecodedTexture(const TextureImportDesc& desc) {
     const uint64_t n = ++g_textureImportOk;
     if (n <= kRefuseLogFirst || (n % kRefuseLogEvery) == 0) {
         MCLA_LOG_INFO("TEX-IMPORT #{} fmt={} {} dxgi={} mode={} {}x{} mips={} blockB={}",
-            n, plan.xenosFormat, plan.formatName, plan.nativeDxgiFormat,
+            n, plan.xenosFormat, plan.formatName, static_cast<uint32_t>(format),
             (uint32_t)plan.mode, desc.width, desc.height, plan.mipCount, plan.blockBytes);
     }
 
@@ -2175,6 +2802,21 @@ uint32_t D3D12Backend::AcquireTexturePoolSlot() {
     }
     m_texturePoolSlots.emplace_back();
     m_texturePoolByHandle.push_back(&m_texturePoolSlots.back());
+    // F-900 (2026-10-28): emplace_back may REALLOCATE m_texturePoolSlots,
+    // dangling every ResidentTexture* stored in m_texturePoolByHandle by
+    // earlier calls. MEASURED: BIND-S stage trace (build/g998.log) shows the
+    // last row before the AV is pass=3007 st=hit-srv-in -- the HIT path's
+    // CreateShaderResourceView dereferences
+    // m_texturePoolByHandle[hit.handle-1]->texture, i.e. a pointer written
+    // before a later pool growth moved the slots vector. g994 read 0x8F900,
+    // g996 read 0x7FF700000010, g997 executed heap: three signatures, one
+    // use-after-realloc. Rebuild the table after any growth (released slots
+    // stay null). handle-1 == slot index always (slots are never removed,
+    // only reset in place), so this is exact, not a heuristic.
+    for (uint32_t i = 0; i < static_cast<uint32_t>(m_texturePoolSlots.size()); ++i) {
+        if (m_texturePoolByHandle[i] != nullptr)
+            m_texturePoolByHandle[i] = &m_texturePoolSlots[i];
+    }
     return static_cast<uint32_t>(m_texturePoolSlots.size());
 }
 
@@ -2182,9 +2824,38 @@ void D3D12Backend::ReleaseTexturePoolSlot(uint64_t handle) {
     if (handle == 0 || handle > m_texturePoolByHandle.size()) return;
     const uint32_t idx = static_cast<uint32_t>(handle - 1);
     m_texturePoolByHandle[idx] = nullptr;
-    m_texturePoolSlots[idx].texture.Reset();
-    m_texturePoolSlots[idx].upload.Reset();
+    // Evicted mid-frame: the open list may already sample it, so defer the release.
+    RetireTarget(std::move(m_texturePoolSlots[idx].texture));
+    RetireTarget(std::move(m_texturePoolSlots[idx].upload));
     m_texturePoolFree.push_back(idx);
+}
+
+static uint64_t s_loggedTextureHashes[32] = {};
+static uint32_t s_loggedTextureHashCount = 0;
+
+// Render thread only. shortcut: a texture rewritten mid-frame under an unchanged descriptor
+// shows old content until the next frame; key on a write watch if render-to-texture needs it.
+struct FrameTextureMemo {
+    uint8_t descriptorBytes[24];
+    uint32_t handle;
+    uint32_t dxgiFormat;
+};
+static FrameTextureMemo s_frameTextures[16];
+static uint32_t s_frameTextureCount = 0;
+
+static const FrameTextureMemo* FindFrameTexture(const uint8_t* descriptorBytes) {
+    for (uint32_t i = 0; i < s_frameTextureCount; ++i)
+        if (std::memcmp(s_frameTextures[i].descriptorBytes, descriptorBytes, 24) == 0)
+            return &s_frameTextures[i];
+    return nullptr;
+}
+
+bool D3D12Backend::HasFrameTexture(const uint8_t* descriptorBytes) {
+    return FindFrameTexture(descriptorBytes) != nullptr;
+}
+
+void D3D12Backend::ClearFrameTextures() {
+    s_frameTextureCount = 0;
 }
 
 uint32_t D3D12Backend::BindGuestTextures(const GuestTextureEntry* entries, uint32_t count) {
@@ -2199,11 +2870,82 @@ uint32_t D3D12Backend::BindGuestTextures(const GuestTextureEntry* entries, uint3
 
     uint32_t bound = 0;
     ++m_textureBindPasses;
+    const uint32_t frameSlot = (m_frameIndex < kBufferCount) ? m_frameIndex : 0u;
+    const uint32_t ringIdx = (m_srvRingOffset < kSrvRingTablesPerFrame)
+                                 ? m_srvRingOffset++
+                                 : (kSrvRingTablesPerFrame - 1u);
+    const uint32_t tableBaseSlot =
+        kSrvHeapBaseCount +
+        (frameSlot * kSrvRingTablesPerFrame + ringIdx) * kShaderTextureSlotCount;
+    {
+        D3D12_SHADER_RESOURCE_VIEW_DESC nullSrv = {};
+        nullSrv.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        nullSrv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        nullSrv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        nullSrv.Texture2D.MipLevels = 1;
+        D3D12_CPU_DESCRIPTOR_HANDLE hBase(m_srvHeap->GetCPUDescriptorHandleForHeapStart());
+        hBase.ptr += static_cast<size_t>(tableBaseSlot) * m_srvDescriptorSize;
+        for (uint32_t s = 0; s < kShaderTextureSlotCount; ++s) {
+            D3D12_CPU_DESCRIPTOR_HANDLE h = hBase;
+            h.ptr += static_cast<size_t>(s) * m_srvDescriptorSize;
+            m_device->CreateShaderResourceView(nullptr, &nullSrv, h);
+        }
+        m_currentSrvTableGpu = m_srvHeap->GetGPUDescriptorHandleForHeapStart();
+        m_currentSrvTableGpu.ptr += static_cast<size_t>(tableBaseSlot) * m_srvDescriptorSize;
+    }
+    // F-900 CRASH-FORENSICS (2026-10-28): render thread AVs inside this
+    // function (g994: C0000005 reading 0x8F900, rsi=r8=0x8F900, rdi=0) after
+    // ~3258 binds. Log the entry pointer/count plus the first entry's raw
+    // fields so the next soak names the wild value instead of guessing.
+    if (m_textureBindPasses <= 4 || (m_textureBindPasses % 500) == 0) {
+        // NOTE: entries[0] is deliberately NOT read here: if the caller
+        // handed us a wild pointer, the read below must happen inside the
+        // loop's named refusal path, not inside a diagnostic.
+        MCLA_LOG_INFO("BIND-PHASE #{} entries={} count={}",
+                      m_textureBindPasses, static_cast<const void*>(entries), count);
+    }
 
     for (uint32_t e = 0; e < count; ++e) {
         const GuestTextureEntry& entry = entries[e];
         const uint32_t idx = entry.descriptorIndex;
-        const uint32_t slot = kTexture2DSlot + idx;
+        const uint32_t slot = idx;
+        // F-900 CRASH-FORENSICS: per-entry values at the same cadence as
+        // BIND-PHASE. entries[] is proven readable (BIND-PHASE fired 1000+
+        // times on a stable pointer in g996); this names a wild idx/slot or
+        // payload pointer BEFORE the D3D12 call that AVs on it.
+        //
+        // BIND-ODD fires EVERY pass whose entry is out of contract (no
+        // cadence gate): a wild idx/slot means CreateShaderResourceView gets
+        // a wild DestDescriptor; a wild payload means the hash/expand reads
+        // garbage. Silence here + a crash means the entry is sane and the
+        // fault is in the upload/SRV path, not the data.
+        {
+            const bool oddIdx = (idx >= kShaderTextureSlotCount);
+            const bool oddPtr = (entry.mipPayloads[0] != nullptr &&
+                                 (entry.mipPayloads[0] < reinterpret_cast<const uint8_t*>(0x100000u) ||
+                                  entry.mipBytes[0] == 0 || entry.mipBytes[0] > 16777216u));
+            // descriptorBytes are big-endian: dword_0 = bytes[0..3] with the
+            // type field (bits 1:0) in the LOW bits = bytes[3], not bytes[0].
+            const bool oddType = ((entry.descriptorBytes[3] & 3u) != 2u);
+            if (oddIdx || oddPtr || oddType) {
+                MCLA_LOG_ERROR("BIND-ODD pass={} e={} idx={} slot={} pay={} bytes={} mips={} "
+                               "d0={:02X}{:02X}{:02X}{:02X} oddIdx={} oddPtr={} oddType={}",
+                               m_textureBindPasses, e, idx, slot,
+                               static_cast<const void*>(entry.mipPayloads[0]),
+                               entry.mipBytes[0], entry.mipCount,
+                               entry.descriptorBytes[0], entry.descriptorBytes[1],
+                               entry.descriptorBytes[2], entry.descriptorBytes[3],
+                               oddIdx ? 1 : 0, oddPtr ? 1 : 0, oddType ? 1 : 0);
+            }
+        }
+        if (m_textureBindPasses <= 4 || (m_textureBindPasses % 500) == 0) {
+            MCLA_LOG_INFO("BIND-ENTRY pass={} e={} idx={} slot={} pay={} bytes={} mips={} d0={:02X}{:02X}{:02X}{:02X}",
+                          m_textureBindPasses, e, idx, slot,
+                          static_cast<const void*>(entry.mipPayloads[0]),
+                          entry.mipBytes[0], entry.mipCount,
+                          entry.descriptorBytes[0], entry.descriptorBytes[1],
+                          entry.descriptorBytes[2], entry.descriptorBytes[3]);
+        }
 
         // Every index that this pass does not end up giving a real texture gets
         // a null SRV, so a refused or out-of-range descriptor samples a defined
@@ -2217,6 +2959,11 @@ uint32_t D3D12Backend::BindGuestTextures(const GuestTextureEntry* entries, uint3
             D3D12_CPU_DESCRIPTOR_HANDLE h(m_srvHeap->GetCPUDescriptorHandleForHeapStart());
             h.ptr += static_cast<size_t>(slot) * m_srvDescriptorSize;
             m_device->CreateShaderResourceView(nullptr, &nullSrv, h);
+            if (idx < kShaderTextureSlotCount) {
+                D3D12_CPU_DESCRIPTOR_HANDLE hRing(m_srvHeap->GetCPUDescriptorHandleForHeapStart());
+                hRing.ptr += static_cast<size_t>(tableBaseSlot + idx) * m_srvDescriptorSize;
+                m_device->CreateShaderResourceView(nullptr, &nullSrv, hRing);
+            }
         };
 
         if (idx >= kShaderTextureSlotCount) {
@@ -2283,10 +3030,59 @@ uint32_t D3D12Backend::BindGuestTextures(const GuestTextureEntry* entries, uint3
             continue;
         }
 
+        const auto bindResident = [&](uint32_t handle, uint32_t dxgiFormat) {
+            ID3D12Resource* const res = m_texturePoolByHandle[handle - 1]->texture.Get();
+            D3D12_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
+            srvDesc.Format = static_cast<DXGI_FORMAT>(dxgiFormat);
+            srvDesc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+            srvDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+            srvDesc.Texture2D.MipLevels = 1;
+            D3D12_CPU_DESCRIPTOR_HANDLE h(m_srvHeap->GetCPUDescriptorHandleForHeapStart());
+            h.ptr += static_cast<size_t>(slot) * m_srvDescriptorSize;
+            m_device->CreateShaderResourceView(res, &srvDesc, h);
+            D3D12_CPU_DESCRIPTOR_HANDLE hRing(m_srvHeap->GetCPUDescriptorHandleForHeapStart());
+            hRing.ptr += static_cast<size_t>(tableBaseSlot + idx) * m_srvDescriptorSize;
+            m_device->CreateShaderResourceView(res, &srvDesc, hRing);
+            ++bound;
+        };
+        if (const FrameTextureMemo* memo = FindFrameTexture(entry.descriptorBytes)) {
+            if (memo->handle <= m_texturePoolByHandle.size() &&
+                m_texturePoolByHandle[memo->handle - 1] != nullptr &&
+                m_texturePoolByHandle[memo->handle - 1]->texture) {
+                bindResident(memo->handle, memo->dxgiFormat);
+                continue;
+            }
+        }
+
         // --- Hash the UPLOAD payload (post-expand, not pre-expand): a cache hit
         // must be provably the same bytes the GPU would receive.
         const uint8_t* payload = entry.mipPayloads[0];
         uint32_t payloadBytes = entry.mipBytes[0];
+        // F-900 CRASH-GUARD: refuse wild host pointers/sizes instead of
+        // hashing them. A valid payload is a heap vector (>>16 MiB on Win64);
+        // anything below 1 MiB is a truncated/garbage pointer, and >64 MiB
+        // is a corrupt size. Both previously went straight into FNV/Hash and
+        // ExpandTexture reads (the g994 AV read 0x8F900 = 587 KiB).
+        if (payload != nullptr &&
+            (payload < reinterpret_cast<const uint8_t*>(0x100000u) || payloadBytes > 67108864u)) {
+            const uint64_t n = ++g_textureBindRefusals;
+            if (ShouldLogRefusal(n)) {
+                MCLA_LOG_ERROR("D3D12Backend: t{} refused #{}: wild payload ptr={} bytes={} -- NULL SRV at slot {}",
+                               idx, n, static_cast<const void*>(payload), payloadBytes, slot);
+            }
+            writeNullSrv();
+            continue;
+        }
+        // F-900 HIGH-3: keep the ORIGINAL (un-expanded) payload for the upload
+        // path. The pre-expansion below is for the HASH ONLY -- CreateDecodedTexture
+        // expands CpuExpand plans itself (Gate 5), so passing it the already-
+        // expanded bytes made it expand a SECOND time with out==the same
+        // m_importScratch that owned the source: ExpandTextureToImportBytes
+        // out.assign() zero-filled the buffer in place, the second decode read
+        // all zeros, and a solid-black BC3 was uploaded while the cache key
+        // (hashed over the correct first expansion) claimed real pixels.
+        const uint8_t* rawPayload = entry.mipPayloads[0];
+        uint32_t rawPayloadBytes = entry.mipBytes[0];
         if (payload == nullptr || payloadBytes == 0) {
             const uint64_t n = ++g_textureBindRefusals;
             if (ShouldLogRefusal(n)) {
@@ -2315,6 +3111,167 @@ uint32_t D3D12Backend::BindGuestTextures(const GuestTextureEntry* entries, uint3
             payloadBytes = static_cast<uint32_t>(m_importScratch.size());
         }
 
+        // --- WHITE-TOFU CENSUS (F-911): what bytes actually go up for each
+        // distinct texture. The legals screen renders every glyph as a solid
+        // white box with correct positions (screenshot 2026-10-28): the
+        // translated PS is `t2D.Sample + oC0=r0*r1`, so white output means the
+        // SAMPLE returns white -- either uniform-white content or no sampling.
+        // One row per distinct content hash (cap 32; static array, no new
+        // Rule-1b global beyond it): min/max/mean + first 16 bytes identify
+        // zeros vs CDCD-fill vs real atlas data. Placed after CpuExpand so
+        // payload/payloadBytes are exactly the upload bytes hashed below.
+        {
+            const uint64_t ch = HashTextureContent(payload, payloadBytes);
+            bool seen = false;
+            for (uint32_t k = 0; k < s_loggedTextureHashCount; ++k)
+                if (s_loggedTextureHashes[k] == ch) { seen = true; break; }
+            if (!seen && s_loggedTextureHashCount < 32) {
+                s_loggedTextureHashes[s_loggedTextureHashCount++] = ch;
+                // One-shot raw dump so the bytes can be VIEWED, not just
+                // stat'd: texdump_<guestVA>_<WxH>.bin in the working dir
+                // (build/). Same 32-hash gate, so at most 32 files and only
+                // on first sight of each texture.
+                char dumpName[64];
+                std::snprintf(dumpName, sizeof(dumpName), "texdump_%08X_%ux%u.bin",
+                              gtd.baseAddress, gtd.width, gtd.height);
+                if (FILE* df = fopen(dumpName, "wb")) {
+                    fwrite(payload, 1, payloadBytes, df);
+                    fclose(df);
+                }
+                uint8_t mn = 0xFF, mx = 0x00;
+                uint64_t sum = 0;
+                const uint32_t scanN = payloadBytes < 4096u ? payloadBytes : 4096u;
+                for (uint32_t k = 0; k < scanN; ++k) {
+                    const uint8_t b = payload[k];
+                    if (b < mn) mn = b;
+                    if (b > mx) mx = b;
+                    sum += b;
+                }
+                MCLA_LOG_WARN("TEX-CONTENT guest={:08X} {}x{} xenosFmt={} bytes={} "
+                              "hash={:016X} min={:02X} max={:02X} mean={} "
+                              "head={:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}"
+                              "{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}",
+                              gtd.baseAddress, gtd.width, gtd.height,
+                              plan.xenosFormat, payloadBytes, ch, mn, mx,
+                              scanN ? (double)sum / (double)scanN : -1.0,
+                              payloadBytes > 0 ? payload[0] : 0,
+                              payloadBytes > 1 ? payload[1] : 0,
+                              payloadBytes > 2 ? payload[2] : 0,
+                              payloadBytes > 3 ? payload[3] : 0,
+                              payloadBytes > 4 ? payload[4] : 0,
+                              payloadBytes > 5 ? payload[5] : 0,
+                              payloadBytes > 6 ? payload[6] : 0,
+                              payloadBytes > 7 ? payload[7] : 0,
+                              payloadBytes > 8 ? payload[8] : 0,
+                              payloadBytes > 9 ? payload[9] : 0,
+                              payloadBytes > 10 ? payload[10] : 0,
+                              payloadBytes > 11 ? payload[11] : 0,
+                              payloadBytes > 12 ? payload[12] : 0,
+                              payloadBytes > 13 ? payload[13] : 0,
+                              payloadBytes > 14 ? payload[14] : 0,
+                              payloadBytes > 15 ? payload[15] : 0);
+            }
+        }
+
+            // F-914 (c): the legals font atlas has a white-transparent halo (RGB=255,
+            // alpha=0) around every glyph stroke. In ga058 (video), raw BC2 white
+            // was kept, rendering visible text. Rewriting white to black causes quads
+            // sampling the halo to render black (disappearing text). Default OFF (0);
+            // enable with MCLA_HALO_FIX=1.
+            if (payload != nullptr && payloadBytes > 0) {
+                static int s_enableHaloFix = -1;
+                if (s_enableHaloFix < 0) {
+                    const char* e = std::getenv("MCLA_HALO_FIX");
+                    s_enableHaloFix = (e && e[0] == '1') ? 1 : 0;
+                }
+                uint32_t haloFixed = 0;
+                uint8_t minA = 255, maxA = 0;
+                uint32_t whiteTransp = 0;
+                for (uint32_t k = 0; k + 3 < payloadBytes; k += 4) {
+                    if (payload[k+3] < minA) minA = payload[k+3];
+                    if (payload[k+3] > maxA) maxA = payload[k+3];
+                    if (payload[k] == 255 && payload[k+1] == 255 &&
+                        payload[k+2] == 255 && payload[k+3] == 0) {
+                        ++whiteTransp;
+                        if (s_enableHaloFix == 1) {
+                            const_cast<uint8_t*>(payload)[k] = 0;
+                            const_cast<uint8_t*>(payload)[k+1] = 0;
+                            const_cast<uint8_t*>(payload)[k+2] = 0;
+                            ++haloFixed;
+                        }
+                    }
+                }
+                // F-914: both rows are PER-BIND -- ga062 carries 166,456
+                // HALO-DIAG (#3 marker) and 91,322 HALO-FIX (#5) rows, ~13% of
+                // the log together. House cadence (kRefuseLogFirst=8 /
+                // kRefuseLogEvery=200, :266-269): first 8 then every 200th, so
+                // the census still fires (rule 19: a silent marker's zero is
+                // vacuous). HALO-DIAG's format is kept BYTE-IDENTICAL --
+                // `HALO-DIAG guest=` is cited verbatim in
+                // docs/analysis-20261028/random-glyphs.md. HALO-FIX previously
+                // printed a hardcoded `#1` on all 91,322 rows; it now prints its
+                // true counter.
+                static std::atomic<uint32_t> s_haloDiagRows{0};
+                const uint32_t hdN =
+                    s_haloDiagRows.fetch_add(1, std::memory_order_relaxed) + 1u;
+                if (hdN <= kRefuseLogFirst || (hdN % kRefuseLogEvery) == 0u) {
+                    MCLA_LOG_WARN("HALO-DIAG guest={:08X} {}x{} bytes={} minA={} maxA={} whiteTransp={} fixed={}",
+                                  gtd.baseAddress, gtd.width, gtd.height, payloadBytes, minA, maxA, whiteTransp, haloFixed);
+                }
+                if (haloFixed > 0) {
+                    static std::atomic<uint32_t> s_haloFixRows{0};
+                    const uint32_t hfN =
+                        s_haloFixRows.fetch_add(1, std::memory_order_relaxed) + 1u;
+                    if (hfN <= kRefuseLogFirst || (hfN % kRefuseLogEvery) == 0u) {
+                        MCLA_LOG_WARN("HALO-FIX #{} fixed {} white-transparent pixels", hfN, haloFixed);
+                    }
+                }
+            }
+
+            // F-918 ATLAS-TESTPAT: the font atlas decodes to real glyphs (viewed:
+            // read bleeding ABCDEF/0123 row bands), so the tofu must be in the
+            // quads. Paint a 2-texel-row rainbow over every alpha>0 texel of the
+            // atlas ONLY, keeping alpha. Then every glyph block on screen shows the
+            // row band its quad samples in colour -- the user's readout of v.
+            // Must run BEFORE the content hash so the cache key matches what is
+            // uploaded. Toggle off with env MCLA_ATLAS_TESTPAT=0.
+            {
+                static const bool s_testPat = [](){
+                    const char* e = std::getenv("MCLA_ATLAS_TESTPAT");
+                    return (e != nullptr && e[0] == '1');
+                }();
+                if (s_testPat && gtd.baseAddress == 0x13BCC000u &&
+                    gtd.width == 256u && gtd.height == 256u && payloadBytes == 262144u) {
+                    static const uint8_t kBands[7][3] = {
+                        {255, 64, 64},   // red
+                        {64, 255, 64},   // green
+                        {64, 64, 255},   // blue
+                        {255, 255, 64},  // yellow
+                        {255, 64, 255},  // magenta
+                        {64, 255, 255},  // cyan
+                        {255, 255, 255}, // white
+                    };
+                    for (uint32_t y = 0u; y < 256u; ++y) {
+                        const uint8_t* band = kBands[(y / 2u) % 7u];
+                        uint8_t* row = const_cast<uint8_t*>(payload) + static_cast<size_t>(y) * 1024u;
+                        for (uint32_t x = 0u; x < 256u; ++x) {
+                            uint8_t* t = row + static_cast<size_t>(x) * 4u;
+                            if (t[3] != 0) {
+                                t[0] = band[0];
+                                t[1] = band[1];
+                                t[2] = band[2];
+                            }
+                        }
+                    }
+                    static std::atomic<uint32_t> s_testPatCount{0};
+                    const uint32_t tn = s_testPatCount.fetch_add(1) + 1;
+                    if (tn <= 4 || (tn % 5000) == 0) {
+                        MCLA_LOG_WARN("ATLAS-TESTPAT #{} painted 256x256 atlas (2-row bands, "
+                                      "7 colours) -- alpha preserved",
+                                      tn);
+                    }
+                }
+            }
         // --- Cache key: content hash + the geometry that determines the host
         // resource (resource_cache.h:112-133). dataVersion is left 0: the
         // producer has no version counter today, and the content hash already
@@ -2342,16 +3299,13 @@ uint32_t D3D12Backend::BindGuestTextures(const GuestTextureEntry* entries, uint3
             // HIT: no upload. Rebuild the SRV only when it is not already the one
             // at this slot -- a texture bound twice in one frame must not cost a
             // CreateShaderResourceView per bind.
-            D3D12_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
-            srvDesc.Format = static_cast<DXGI_FORMAT>(key.importDxgiFormat);
-            srvDesc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
-            srvDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-            srvDesc.Texture2D.MipLevels = 1;
-            D3D12_CPU_DESCRIPTOR_HANDLE h(m_srvHeap->GetCPUDescriptorHandleForHeapStart());
-            h.ptr += static_cast<size_t>(slot) * m_srvDescriptorSize;
-            m_device->CreateShaderResourceView(
-                m_texturePoolByHandle[hit.handle - 1]->texture.Get(), &srvDesc, h);
-            ++bound;
+            bindResident(hit.handle, key.importDxgiFormat);
+            if (s_frameTextureCount < 16u && !FindFrameTexture(entry.descriptorBytes)) {
+                FrameTextureMemo& memo = s_frameTextures[s_frameTextureCount++];
+                std::memcpy(memo.descriptorBytes, entry.descriptorBytes, 24);
+                memo.handle = hit.handle;
+                memo.dxgiFormat = key.importDxgiFormat;
+            }
             continue;
         }
 
@@ -2360,10 +3314,28 @@ uint32_t D3D12Backend::BindGuestTextures(const GuestTextureEntry* entries, uint3
         // single bootstrap texture and commits it as m_decodedTexture, whereas a
         // cached texture must outlive the frame, so it goes into the resident
         // pool with its staging buffer attached and is freed only by eviction.
+        //
+        // F-900 HIGH-3 HALF 1 (superseded in part by F-914): the hand-over
+        // used to be always-raw, and that is exactly why the F-914(c) halo fix
+        // and the F-918 testpat reached the content hash but NEVER the GPU
+        // texture (tofu-regression.md §1): Gate 5 re-expanded rawPayload and
+        // uploaded the un-fixed bytes while the cache key claimed the fixed
+        // ones. For CpuExpand plans the post-expand bytes are handed instead,
+        // flagged payloadAlreadyExpanded so Gate 5 uploads them as-is (the
+        // F-900 aliasing bug stays dead: nothing expands m_importScratch into
+        // itself). Non-CpuExpand plans still hand rawPayload -- payload ==
+        // rawPayload there, so the halo fix (which const_casts payload in
+        // place) already reached those bytes anyway.
         TextureImportDesc imp = {};
         imp.plan = &plan;
-        imp.mipPayloads[0] = payload;
-        imp.mipBytes[0] = payloadBytes;
+        if (plan.mode == native::TextureUploadMode::CpuExpand) {
+            imp.mipPayloads[0] = payload;
+            imp.mipBytes[0] = payloadBytes;
+            imp.payloadAlreadyExpanded = true;
+        } else {
+            imp.mipPayloads[0] = rawPayload;
+            imp.mipBytes[0] = rawPayloadBytes;
+        }
         imp.mipCount = 1;
         imp.width = gtd.width;
         imp.height = gtd.height;
@@ -2377,6 +3349,16 @@ uint32_t D3D12Backend::BindGuestTextures(const GuestTextureEntry* entries, uint3
             // CreateDecodedTexture already named and counted the reason.
             writeNullSrv();
             continue;
+        }
+        {
+            D3D12_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
+            srvDesc.Format = static_cast<DXGI_FORMAT>(key.importDxgiFormat);
+            srvDesc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+            srvDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+            srvDesc.Texture2D.MipLevels = 1;
+            D3D12_CPU_DESCRIPTOR_HANDLE hRing(m_srvHeap->GetCPUDescriptorHandleForHeapStart());
+            hRing.ptr += static_cast<size_t>(tableBaseSlot + idx) * m_srvDescriptorSize;
+            m_device->CreateShaderResourceView(resident.Get(), &srvDesc, hRing);
         }
 
         const uint64_t handle = AcquireTexturePoolSlot();
@@ -2407,17 +3389,15 @@ uint32_t D3D12Backend::BindGuestTextures(const GuestTextureEntry* entries, uint3
         ent.residency = TextureResidency::Resident;
         ent.inFlight = false;  // released at EndFrame by the caller that owns it
 
-        // Insert may evict. The returned keys are already out of the map and are
-        // MINE to release: only this file knows which pool slot and which
-        // descriptor-heap home go with them.
-        std::vector<TextureCacheKey> evicted = m_textureCache.Insert(key, ent);
+        // Insert may evict. The returned entries are already out of the map and
+        // are MINE to release: only this file knows which pool slot and which
+        // descriptor-heap home go with them. F-900: Insert now returns the
+        // evicted key+entry pairs (the entry holds the only copy of the pool
+        // handle) -- the old Find-after-erase always missed and leaked slots.
+        std::vector<TextureCache::EvictedTexture> evicted = m_textureCache.Insert(key, ent);
         if (!evicted.empty()) {
-            for (const TextureCacheKey& k : evicted) {
-                TextureCacheEntry dead = {};
-                if (m_textureCache.Find(k, dead) && dead.handle) {
-                    m_textureCache.Erase(k);
-                }
-                ReleaseTexturePoolSlot(dead.handle);
+            for (const TextureCache::EvictedTexture& v : evicted) {
+                ReleaseTexturePoolSlot(v.entry.handle);
             }
         }
         ++bound;
@@ -2432,13 +3412,25 @@ void D3D12Backend::BindDecodedTexture() {
     // Always bind the SRV table (slots are null-initialized; unused slots are
     // valid null SRVs). A translated shader's descriptor table must never be
     // left unset on the command list.
-    m_commandList->SetDescriptorHeaps(1, m_srvHeap.GetAddressOf());
+    // Bind BOTH heaps simultaneously: D3D12 requires all descriptor heaps that
+    // are referenced by descriptor tables to be bound at draw time. Binding them
+    // in separate SetDescriptorHeaps calls unbinds the previous heap, so the SRV
+    // table (root param 0) would reference an unbound heap at draw time.
+    if (m_srvHeap && m_samplerHeap) {
+        ID3D12DescriptorHeap* heaps[] = { m_srvHeap.Get(), m_samplerHeap.Get() };
+        m_commandList->SetDescriptorHeaps(2, heaps);
+    } else if (m_srvHeap) {
+        m_commandList->SetDescriptorHeaps(1, m_srvHeap.GetAddressOf());
+    }
     // F-644: the table always starts at heap slot 0, because it covers t0..t3
     // (root parameter 0, NumDescriptors = kShaderTextureSlotCount). The
     // per-descriptor-index SRVs for a captured pass live at kTexture2DSlot + i,
     // i.e. INSIDE this same table, so this base is correct for both the
     // single-texture bootstrap path and BindGuestTextures.
-    m_commandList->SetGraphicsRootDescriptorTable(0, m_srvHeap->GetGPUDescriptorHandleForHeapStart());
+    const D3D12_GPU_DESCRIPTOR_HANDLE srvTableGpu =
+        (m_currentSrvTableGpu.ptr != 0) ? m_currentSrvTableGpu
+                                        : m_srvHeap->GetGPUDescriptorHandleForHeapStart();
+    m_commandList->SetGraphicsRootDescriptorTable(0, srvTableGpu);
 
     // F-644: root parameter 1 is the sampler table and it must be set too --
     // a descriptor-table root parameter left unset is a validation error and an
@@ -2446,7 +3438,6 @@ void D3D12Backend::BindDecodedTexture() {
     // CreateSamplerHeap, so a pass that never bound a guest sampler still
     // samples deterministically.
     if (m_samplerHeap) {
-        m_commandList->SetDescriptorHeaps(1, m_samplerHeap.GetAddressOf());
         m_commandList->SetGraphicsRootDescriptorTable(1, m_samplerTableGpu);
     }
 }
@@ -2496,6 +3487,8 @@ bool D3D12Backend::BindGuestSampler(const native::HostSamplerDesc& hostSampler) 
     auto it = m_guestSamplerIndex.find(hostSampler.hash);
     if (it != m_guestSamplerIndex.end()) {
         index = it->second;
+        m_samplerTableGpu = m_samplerHeap->GetGPUDescriptorHandleForHeapStart();
+        m_samplerTableGpu.ptr += static_cast<SIZE_T>(index) * m_samplerDescriptorSize;
     } else {
         if (m_samplerHeapOffset >= kSamplerHeapSize) {
             const uint64_t n = ++g_samplerRefusals;
@@ -2541,7 +3534,15 @@ bool D3D12Backend::BindGuestSampler(const native::HostSamplerDesc& hostSampler) 
         m_samplerTableGpu.ptr += static_cast<SIZE_T>(index) * m_samplerDescriptorSize;
     }
 
-    m_commandList->SetDescriptorHeaps(1, m_samplerHeap.GetAddressOf());
+    // Bind BOTH heaps: the SRV table (root param 0) must stay accessible while
+    // the sampler table is set, and D3D12 unbinds previously bound heaps when a
+    // new SetDescriptorHeaps call names a different set.
+    if (m_srvHeap) {
+        ID3D12DescriptorHeap* heaps[] = { m_srvHeap.Get(), m_samplerHeap.Get() };
+        m_commandList->SetDescriptorHeaps(2, heaps);
+    } else {
+        m_commandList->SetDescriptorHeaps(1, m_samplerHeap.GetAddressOf());
+    }
     m_commandList->SetGraphicsRootDescriptorTable(1, m_samplerTableGpu);
     return true;
 }
@@ -2583,7 +3584,7 @@ bool D3D12Backend::CreateTestRootSignature() {
     samplerRange.RegisterSpace = 0;
     samplerRange.OffsetInDescriptorsFromTableStart = 0;
 
-    D3D12_ROOT_PARAMETER rootParams[3] = {};
+    D3D12_ROOT_PARAMETER rootParams[4] = {};
     rootParams[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
     rootParams[0].DescriptorTable.NumDescriptorRanges = 1;
     rootParams[0].DescriptorTable.pDescriptorRanges = &srvRange;
@@ -2597,7 +3598,14 @@ bool D3D12Backend::CreateTestRootSignature() {
     rootParams[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
     rootParams[2].Descriptor.ShaderRegister = 0;  // b0
     rootParams[2].Descriptor.RegisterSpace = 0;
-    rootParams[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+    // F-932: both translated stages declare `cbuffer ShaderConstants :
+    // register(b0)` (shader_translator.cpp), so b0 is split by VISIBILITY:
+    // param 2 = the vertex bank, param 3 = the pixel bank.
+    rootParams[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_VERTEX;
+    rootParams[3].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
+    rootParams[3].Descriptor.ShaderRegister = 0;  // b0, pixel stage
+    rootParams[3].Descriptor.RegisterSpace = 0;
+    rootParams[3].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
 
     D3D12_ROOT_SIGNATURE_DESC rootDesc = {};
     rootDesc.NumParameters = _countof(rootParams);
@@ -2627,6 +3635,430 @@ bool D3D12Backend::CreateTestRootSignature() {
     if (FAILED(hr)) {
         MCLA_LOG_ERROR("D3D12Backend: CreateRootSignature failed with hr=0x{:08X}", static_cast<uint32_t>(hr));
         return false;
+    }
+    return true;
+}
+
+bool D3D12Backend::CreatePrecompiledRootSignature() {
+    // Root signature matching tools/xenosrecomp/XenosRecomp/shader_common.h's
+    // resource model, which every pre-compiled DXIL blob is built against:
+    //
+    //   Texture2D<float4>   g_Texture2DDescriptorHeap[] : register(t0, space0);  // unbounded
+    //   Texture3D<float4>   g_Texture3DDescriptorHeap[] : register(t0, space1);  // unbounded
+    //   TextureCube<float4> g_TextureCubeDescriptorHeap[] : register(t0, space2); // unbounded
+    //   SamplerState        g_SamplerDescriptorHeap[]   : register(s0, space3);  // unbounded
+    //   cbuffer VertexShaderConstants : register(b0, space4)
+    //   cbuffer PixelShaderConstants  : register(b1, space4)
+    //   cbuffer SharedConstants      : register(b2, space4)
+    //
+    // This is Step 6's first concrete piece. It does not replace the live
+    // CreateTestRootSignature (which the runtime-translated path still uses);
+    // it sits alongside it so pre-compiled PSOs can be built without touching
+    // the boot path. Unbounded ranges use D3D12_DESCRIPTOR_RANGE_FLAG_
+    // DESCRIPTORS_VOLATILE, which is what makes a UINT_MAX-sized range legal.
+    //
+    // IMPORTANT: the unbounded SRV/Sampler tables all bind at shader register 0
+    // of their space, so each range's BaseShaderRegister is 0 and the space
+    // distinguishes them. This mirrors the generated HLSL exactly.
+    constexpr uint32_t kUnbounded = 0xFFFFFFFFu;
+
+    D3D12_DESCRIPTOR_RANGE1 ranges[4] = {};
+    // t0, space0 (Texture2D)
+    ranges[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+    ranges[0].NumDescriptors = kUnbounded;
+    ranges[0].BaseShaderRegister = 0;
+    ranges[0].RegisterSpace = 0;
+    ranges[0].OffsetInDescriptorsFromTableStart = 0;
+    ranges[0].Flags = D3D12_DESCRIPTOR_RANGE_FLAG_DESCRIPTORS_VOLATILE;
+    // t0, space1 (Texture3D)
+    ranges[1].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+    ranges[1].NumDescriptors = kUnbounded;
+    ranges[1].BaseShaderRegister = 0;
+    ranges[1].RegisterSpace = 1;
+    ranges[1].OffsetInDescriptorsFromTableStart = 0;
+    ranges[1].Flags = D3D12_DESCRIPTOR_RANGE_FLAG_DESCRIPTORS_VOLATILE;
+    // t0, space2 (TextureCube)
+    ranges[2].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+    ranges[2].NumDescriptors = kUnbounded;
+    ranges[2].BaseShaderRegister = 0;
+    ranges[2].RegisterSpace = 2;
+    ranges[2].OffsetInDescriptorsFromTableStart = 0;
+    ranges[2].Flags = D3D12_DESCRIPTOR_RANGE_FLAG_DESCRIPTORS_VOLATILE;
+    // s0, space3 (Sampler)
+    ranges[3].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER;
+    ranges[3].NumDescriptors = kUnbounded;
+    ranges[3].BaseShaderRegister = 0;
+    ranges[3].RegisterSpace = 3;
+    ranges[3].OffsetInDescriptorsFromTableStart = 0;
+    ranges[3].Flags = D3D12_DESCRIPTOR_RANGE_FLAG_DESCRIPTORS_VOLATILE;
+
+    // Four descriptor tables: t0/space0, t0/space1, t0/space2, s0/space3.
+    // All visible to all stages (Xenos vertex shaders can tfetch).
+    D3D12_ROOT_PARAMETER1 rootParams[7] = {};
+    for (int i = 0; i < 4; i++) {
+        rootParams[i].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        rootParams[i].DescriptorTable.NumDescriptorRanges = 1;
+        rootParams[i].DescriptorTable.pDescriptorRanges = &ranges[i];
+        rootParams[i].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+    }
+    // b0, space4 (vertex constants) - root CBV
+    rootParams[4].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
+    rootParams[4].Descriptor.ShaderRegister = 0;
+    rootParams[4].Descriptor.RegisterSpace = 4;
+    rootParams[4].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+    // b1, space4 (pixel constants) - root CBV
+    rootParams[5].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
+    rootParams[5].Descriptor.ShaderRegister = 1;
+    rootParams[5].Descriptor.RegisterSpace = 4;
+    rootParams[5].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+    // b2, space4 (shared constants) - root CBV
+    rootParams[6].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
+    rootParams[6].Descriptor.ShaderRegister = 2;
+    rootParams[6].Descriptor.RegisterSpace = 4;
+    rootParams[6].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+
+    D3D12_ROOT_SIGNATURE_DESC1 rootDesc = {};
+    rootDesc.NumParameters = _countof(rootParams);
+    rootDesc.pParameters = rootParams;
+    rootDesc.NumStaticSamplers = 0;
+    rootDesc.pStaticSamplers = nullptr;
+    rootDesc.Flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
+
+    D3D12_VERSIONED_ROOT_SIGNATURE_DESC versionedDesc = {};
+    versionedDesc.Version = D3D_ROOT_SIGNATURE_VERSION_1_1;
+    versionedDesc.Desc_1_1 = rootDesc;
+
+    Microsoft::WRL::ComPtr<ID3DBlob> signatureBlob;
+    Microsoft::WRL::ComPtr<ID3DBlob> errorBlob;
+    HRESULT hr = D3D12SerializeVersionedRootSignature(&versionedDesc, &signatureBlob, &errorBlob);
+    if (FAILED(hr)) {
+        MCLA_LOG_ERROR("D3D12Backend: CreatePrecompiledRootSignature serialize failed "
+                       "hr=0x{:08X}", static_cast<uint32_t>(hr));
+        if (errorBlob) {
+            MCLA_LOG_ERROR("  {}", static_cast<const char*>(errorBlob->GetBufferPointer()));
+        }
+        return false;
+    }
+
+    hr = m_device->CreateRootSignature(0, signatureBlob->GetBufferPointer(),
+                                       signatureBlob->GetBufferSize(),
+                                       IID_PPV_ARGS(&m_precompiledRootSignature));
+    if (FAILED(hr)) {
+        MCLA_LOG_ERROR("D3D12Backend: CreatePrecompiledRootSignature create failed "
+                       "hr=0x{:08X}", static_cast<uint32_t>(hr));
+        return false;
+    }
+    MCLA_LOG_INFO("D3D12Backend: precompiled root signature created "
+                  "(t0/space0..2, s0/space3, b0..b2/space4)");
+    return true;
+}
+
+bool D3D12Backend::CreatePrecompiledDescriptorHeaps() {
+    // Shader-visible descriptor heaps backing the pre-compiled root signature's
+    // unbounded ranges:
+    //   t0/space0, t0/space1, t0/space2  -> one CBV_SRV_UAV heap (SRVs of any
+    //                                      dimension live in the same heap type)
+    //   s0/space3                        -> one SAMPLER heap
+    //
+    // The b0/b1/b2 space4 CBVs are ROOT CBVs (SetGraphicsRootConstantBufferView),
+    // so they are not heap entries -- only the texture SRVs and samplers live
+    // here. This is Step 6 piece 2: it gives pre-compiled PSOs a concrete,
+    // bindable shader-visible heap. It is sized for the guest's texture count and
+    // prefilled so every bound descriptor table entry is initialized, per the
+    // D3D12 rule that all bound descriptors must be valid.
+    //
+    // Sized generously (not "unbounded" in the D3D12 sense -- the shader can
+    // index any slot below NumDescriptors; a real unbounded range needs a heap
+    // large enough for the working set). Prefill matches CreateSrvHeap's
+    // pattern (null SRVs) so an unbound slot reads as a defined sample.
+
+    // --- CBV/SRV/UAV heap (textures) ---
+    {
+        D3D12_DESCRIPTOR_HEAP_DESC heapDesc = {};
+        heapDesc.NumDescriptors = kPrecompiledSrvHeapSize;
+        heapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+        heapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+
+        HRESULT hr = m_device->CreateDescriptorHeap(&heapDesc, IID_PPV_ARGS(&m_precompiledSrvHeap));
+        if (FAILED(hr)) {
+            MCLA_LOG_ERROR("D3D12Backend: CreateDescriptorHeap (precompiled CBV/SRV/UAV) "
+                           "failed hr=0x{:08X}", static_cast<uint32_t>(hr));
+            return false;
+        }
+        m_precompiledSrvDescriptorSize =
+            m_device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+
+        D3D12_SHADER_RESOURCE_VIEW_DESC nullSrv = {};
+        nullSrv.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        nullSrv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        nullSrv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        nullSrv.Texture2D.MipLevels = 1;
+        D3D12_CPU_DESCRIPTOR_HANDLE base = m_precompiledSrvHeap->GetCPUDescriptorHandleForHeapStart();
+        for (uint32_t i = 0; i < kPrecompiledSrvHeapSize; ++i) {
+            D3D12_CPU_DESCRIPTOR_HANDLE h = base;
+            h.ptr += static_cast<size_t>(i) * m_precompiledSrvDescriptorSize;
+            m_device->CreateShaderResourceView(nullptr, &nullSrv, h);
+        }
+    }
+
+    // --- Sampler heap ---
+    {
+        D3D12_DESCRIPTOR_HEAP_DESC heapDesc = {};
+        heapDesc.NumDescriptors = kPrecompiledSamplerHeapSize;
+        heapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER;
+        heapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+
+        HRESULT hr = m_device->CreateDescriptorHeap(&heapDesc, IID_PPV_ARGS(&m_precompiledSamplerHeap));
+        if (FAILED(hr)) {
+            MCLA_LOG_ERROR("D3D12Backend: CreateDescriptorHeap (precompiled Sampler) "
+                           "failed hr=0x{:08X}", static_cast<uint32_t>(hr));
+            return false;
+        }
+        m_precompiledSamplerDescriptorSize =
+            m_device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER);
+
+        // Slot 0 = neutral sampler (mirrors CreateSamplerHeap so an unbound
+        // sampler slot reads deterministically).
+        D3D12_SAMPLER_DESC neutral = {};
+        neutral.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+        neutral.AddressU = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+        neutral.AddressV = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+        neutral.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+        neutral.MipLODBias = 0.0f;
+        neutral.MaxAnisotropy = 1;
+        neutral.ComparisonFunc = D3D12_COMPARISON_FUNC_NEVER;
+        neutral.BorderColor[0] = 0.0f;
+        neutral.BorderColor[1] = 0.0f;
+        neutral.BorderColor[2] = 0.0f;
+        neutral.BorderColor[3] = 0.0f;
+        neutral.MinLOD = 0.0f;
+        neutral.MaxLOD = D3D12_FLOAT32_MAX;
+        D3D12_CPU_DESCRIPTOR_HANDLE slot0(m_precompiledSamplerHeap->GetCPUDescriptorHandleForHeapStart());
+        m_device->CreateSampler(&neutral, slot0);
+    }
+
+    MCLA_LOG_INFO("D3D12Backend: precompiled descriptor heaps created "
+                  "(SRV {} (null-filled), Sampler {} (slot0 neutral))",
+                  kPrecompiledSrvHeapSize, kPrecompiledSamplerHeapSize);
+    return true;
+}
+
+bool D3D12Backend::CreatePrecompiledSharedConstantsBuffer() {
+    // Upload-heap buffer backing the pre-compiled root signature's b2/space4
+    // (SharedConstants) root CBV. Persistently mapped so per-draw index writes
+    // are a memcpy, not a re-map. Sized to the SharedConstants layout from
+    // shader_common.h (DXIL arm):
+    //   16 samplers * 4 uint (Tex2D/Tex3D/TexCube/Sampler) = 64 uint = 256 bytes
+    //   g_Booleans, g_SwappedTexcoords, g_HalfPixelOffset, g_AlphaThreshold
+    //   = 4 uint = 16 bytes (at +256)
+    //   total 272 bytes, rounded up to the 256-byte CBV alignment = 512.
+    //
+    // Initialized to all zeros: every descriptor index = 0 (null SRV slot) and
+    // every SharedConstant default = 0. A per-draw writer (piece 3's consumer)
+    // overwrites the indices from the bound texture set; until that is wired
+    // into the draw path the buffer stays neutral, which is safe (null SRV
+    // samples a defined value).
+    constexpr size_t kSharedConstantsSize = 512;
+
+    D3D12_HEAP_PROPERTIES heapProps = {};
+    heapProps.Type = D3D12_HEAP_TYPE_UPLOAD;
+    heapProps.CPUPageProperty = D3D12_CPU_PAGE_PROPERTY_UNKNOWN;
+    heapProps.MemoryPoolPreference = D3D12_MEMORY_POOL_UNKNOWN;
+    heapProps.CreationNodeMask = 1;
+    heapProps.VisibleNodeMask = 1;
+
+    D3D12_RESOURCE_DESC desc = {};
+    desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    desc.Alignment = 0;
+    desc.Width = kSharedConstantsSize;
+    desc.Height = 1;
+    desc.DepthOrArraySize = 1;
+    desc.MipLevels = 1;
+    desc.Format = DXGI_FORMAT_UNKNOWN;
+    desc.SampleDesc.Count = 1;
+    desc.SampleDesc.Quality = 0;
+    desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    desc.Flags = D3D12_RESOURCE_FLAG_NONE;
+
+    HRESULT hr = m_device->CreateCommittedResource(&heapProps, D3D12_HEAP_FLAG_NONE,
+                                                  &desc, D3D12_RESOURCE_STATE_GENERIC_READ,
+                                                  nullptr, IID_PPV_ARGS(&m_precompiledSharedConstantsBuffer));
+    if (FAILED(hr)) {
+        MCLA_LOG_ERROR("D3D12Backend: CreateCommittedResource (precompiled SharedConstants) "
+                       "failed hr=0x{:08X}", static_cast<uint32_t>(hr));
+        return false;
+    }
+
+    D3D12_RANGE readRange = { 0, 0 };  // CPU will not read back
+    hr = m_precompiledSharedConstantsBuffer->Map(0, &readRange,
+                                                reinterpret_cast<void**>(&m_precompiledSharedConstantsMap));
+    if (FAILED(hr) || m_precompiledSharedConstantsMap == nullptr) {
+        MCLA_LOG_ERROR("D3D12Backend: Map (precompiled SharedConstants) failed "
+                       "hr=0x{:08X}", static_cast<uint32_t>(hr));
+        return false;
+    }
+    // Neutral initial contents.
+    memset(m_precompiledSharedConstantsMap, 0, kSharedConstantsSize);
+    m_precompiledSharedConstantsGpu = m_precompiledSharedConstantsBuffer->GetGPUVirtualAddress();
+
+    MCLA_LOG_INFO("D3D12Backend: precompiled SharedConstants buffer created "
+                  "({} bytes, GPU VA 0x{:X})", kSharedConstantsSize,
+                  static_cast<unsigned long long>(m_precompiledSharedConstantsGpu));
+    return true;
+}
+
+bool D3D12Backend::CreatePrecompiledTestPipeline() {
+    // Proof-of-concept substitution: load two cached DXIL blobs (one VS, one PS)
+    // from the pre-compiled cache and build a PSO against the pre-compiled root
+    // signature. This is the first end-to-end exercise of
+    //   cache hash -> DXIL bytes -> CreateGraphicsPipelineState
+    // with the shader_common.h-shaped root signature. It does not yet route
+    // draws through the PSO; it proves the substitution path is viable.
+    using namespace mcla::renderer;
+
+    PrecompiledShaderView vsView{}, psView{};
+    const uint64_t vsHash = 0x54D610C6CFDFA7D1ull;  // guest VS (derived inputs)
+    const uint64_t psHash = 0x7F80F81B7D9D6C81ull;  // guest PS (tfetch2D * r1)
+
+    if (!FindPrecompiledShader(vsHash, vsView) || !vsView.dxil || vsView.dxilSize == 0) {
+        MCLA_LOG_WARN("D3D12Backend: precompiled test PSO: VS hash 0x{:016X} not in cache",
+                      vsHash);
+        return false;
+    }
+    if (!FindPrecompiledShader(psHash, psView) || !psView.dxil || psView.dxilSize == 0) {
+        MCLA_LOG_WARN("D3D12Backend: precompiled test PSO: PS hash 0x{:016X} not in cache",
+                      psHash);
+        return false;
+    }
+
+    // Input layout matching the derived VS inputs (Position0 + TexCoord0).
+    // Derived inputs use DeclUsage::Position -> "POSITION" and
+    // DeclUsage::TexCoord -> "TEXCOORD" (see ExportRegisterToSemantic in
+    // xenos_shader_ir.cpp). Formats are the Xenos vertex-element defaults.
+    D3D12_INPUT_ELEMENT_DESC inputElements[] = {
+        { "POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT,    0, 0,  D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
+        { "TEXCOORD", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 12, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
+    };
+
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC psoDesc = {};
+    psoDesc.pRootSignature = m_precompiledRootSignature.Get();
+    psoDesc.VS = { vsView.dxil, vsView.dxilSize };
+    psoDesc.PS = { psView.dxil, psView.dxilSize };
+    psoDesc.InputLayout = { inputElements, _countof(inputElements) };
+    psoDesc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+
+    psoDesc.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+    psoDesc.NumRenderTargets = 1;
+    psoDesc.SampleDesc.Count = 1;
+    psoDesc.SampleMask = UINT_MAX;
+
+    psoDesc.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+    psoDesc.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+    psoDesc.RasterizerState.DepthClipEnable = TRUE;
+
+    psoDesc.BlendState.AlphaToCoverageEnable = FALSE;
+    psoDesc.BlendState.IndependentBlendEnable = FALSE;
+    for (UINT i = 0; i < 8; ++i) {
+        psoDesc.BlendState.RenderTarget[i].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+    }
+
+    psoDesc.DepthStencilState.DepthEnable = FALSE;
+    psoDesc.DepthStencilState.StencilEnable = FALSE;
+
+    HRESULT hr = m_device->CreateGraphicsPipelineState(&psoDesc, IID_PPV_ARGS(&m_precompiledTestPipeline));
+    if (FAILED(hr)) {
+        MCLA_LOG_ERROR("D3D12Backend: CreateGraphicsPipelineState(precompiled) failed "
+                       "hr=0x{:08X}", static_cast<uint32_t>(hr));
+        return false;
+    }
+    MCLA_LOG_INFO("D3D12Backend: precompiled test PSO created (VS 0x{:016X}, PS 0x{:016X})",
+                  vsHash, psHash);
+
+    // Create the active draw PSO: 0x015E705A375C3C99 (36-byte stride VS) + 0x7F80F81B7D9D6C81 (PS)
+    // with input layout matching DRAW-CP-LAYOUT #2:
+    //   elem 0: POSITION0 off=0  dxgi=6 (R32G32B32_FLOAT)
+    //   elem 1: TEXCOORD1 off=24 dxgi=28 (R8G8B8A8_UNORM)
+    //   elem 2: TEXCOORD0 off=28 dxgi=16 (R32G32_FLOAT)
+    const uint64_t drawVsHash = 0x015E705A375C3C99ull;
+    PrecompiledShaderView drawVsView{};
+    if (FindPrecompiledShader(drawVsHash, drawVsView) && drawVsView.dxil && drawVsView.dxilSize > 0) {
+        D3D12_INPUT_ELEMENT_DESC drawInputElements[] = {
+            { "POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT,    0, 0,  D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
+            { "TEXCOORD", 1, DXGI_FORMAT_R8G8B8A8_UNORM,     0, 24, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
+            { "TEXCOORD", 0, DXGI_FORMAT_R32G32_FLOAT,       0, 28, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0 },
+        };
+        D3D12_GRAPHICS_PIPELINE_STATE_DESC drawPsoDesc = psoDesc;
+        drawPsoDesc.VS = { drawVsView.dxil, drawVsView.dxilSize };
+        drawPsoDesc.InputLayout = { drawInputElements, _countof(drawInputElements) };
+        // Enable alpha blending for UI draws (SrcAlpha / InvSrcAlpha)
+        drawPsoDesc.BlendState.RenderTarget[0].BlendEnable = TRUE;
+        drawPsoDesc.BlendState.RenderTarget[0].SrcBlend = D3D12_BLEND_SRC_ALPHA;
+        drawPsoDesc.BlendState.RenderTarget[0].DestBlend = D3D12_BLEND_INV_SRC_ALPHA;
+        drawPsoDesc.BlendState.RenderTarget[0].BlendOp = D3D12_BLEND_OP_ADD;
+        drawPsoDesc.BlendState.RenderTarget[0].SrcBlendAlpha = D3D12_BLEND_ONE;
+        drawPsoDesc.BlendState.RenderTarget[0].DestBlendAlpha = D3D12_BLEND_INV_SRC_ALPHA;
+        drawPsoDesc.BlendState.RenderTarget[0].BlendOpAlpha = D3D12_BLEND_OP_ADD;
+
+        HRESULT dhr = m_device->CreateGraphicsPipelineState(&drawPsoDesc, IID_PPV_ARGS(&m_precompiledDrawPipeline));
+        if (SUCCEEDED(dhr)) {
+            MCLA_LOG_INFO("D3D12Backend: precompiled draw PSO created (VS 0x{:016X}, PS 0x{:016X}, alpha-blend enabled)",
+                          drawVsHash, psHash);
+        } else {
+            MCLA_LOG_WARN("D3D12Backend: CreateGraphicsPipelineState(precompiled draw) failed hr=0x{:08X}",
+                          static_cast<uint32_t>(dhr));
+        }
+    }
+    return true;
+}
+
+void D3D12Backend::UpdatePrecompiledSharedConstants(const uint32_t* indices, size_t count) {
+    if (!m_precompiledSharedConstantsMap || !indices || count == 0) return;
+    // Layout: up to 16 samplers * 4 uints = 64 uints = 256 bytes.
+    // Each sampler slot has 4 indices: Texture2D, Texture3D, TextureCube, Sampler.
+    // The indices array provides Texture2D descriptor indices per sampler slot.
+    size_t copyCount = (count > 64) ? 64 : count;
+    memcpy(m_precompiledSharedConstantsMap, indices, copyCount * sizeof(uint32_t));
+}
+
+bool D3D12Backend::BindPrecompiledDrawResources(ID3D12GraphicsCommandList* cmdList) {
+    if (!cmdList || !m_precompiledRootSignature || !m_precompiledSrvHeap ||
+        !m_precompiledSamplerHeap || m_precompiledSharedConstantsGpu == 0) {
+        return false;
+    }
+
+    // Bind heaps
+    ID3D12DescriptorHeap* heaps[] = {
+        m_precompiledSrvHeap.Get(),
+        m_precompiledSamplerHeap.Get()
+    };
+    cmdList->SetDescriptorHeaps(_countof(heaps), heaps);
+
+    // Set precompiled root signature
+    cmdList->SetGraphicsRootSignature(m_precompiledRootSignature.Get());
+
+    // Root parameters:
+    // param 0: t0, space0 (Texture2D descriptor table)
+    // param 1: t0, space1 (Texture3D descriptor table)
+    // param 2: t0, space2 (TextureCube descriptor table)
+    // param 3: s0, space3 (Sampler descriptor table)
+    // param 4: b0, space4 (VertexShaderConstants CBV)
+    // param 5: b1, space4 (PixelShaderConstants CBV)
+    // param 6: b2, space4 (SharedConstants CBV)
+    D3D12_GPU_DESCRIPTOR_HANDLE srvStart = m_precompiledSrvHeap->GetGPUDescriptorHandleForHeapStart();
+    cmdList->SetGraphicsRootDescriptorTable(0, srvStart);
+    cmdList->SetGraphicsRootDescriptorTable(1, srvStart);
+    cmdList->SetGraphicsRootDescriptorTable(2, srvStart);
+
+    D3D12_GPU_DESCRIPTOR_HANDLE samplerStart = m_precompiledSamplerHeap->GetGPUDescriptorHandleForHeapStart();
+    cmdList->SetGraphicsRootDescriptorTable(3, samplerStart);
+
+    // Bind SharedConstants CBV at param 6
+    cmdList->SetGraphicsRootConstantBufferView(6, m_precompiledSharedConstantsGpu);
+
+    static bool s_loggedBindOnce = false;
+    if (!s_loggedBindOnce) {
+        s_loggedBindOnce = true;
+        MCLA_LOG_INFO("D3D12Backend: BindPrecompiledDrawResources successfully set root signature, descriptor tables (params 0..3), and SharedConstants CBV (param 6)");
     }
     return true;
 }
@@ -2906,6 +4338,13 @@ bool D3D12Backend::GenerateMipmaps(ID3D12Resource* texture, uint32_t mipLevels) 
         m_commandList->SetPipelineState(m_mipGenPipeline.Get());
         m_commandList->SetComputeRootSignature(m_mipGenRootSignature.Get());
 
+        // The compute descriptor tables below reference srvUavHeap, so that heap
+        // must be the active descriptor heap when they are set (and at dispatch
+        // time). Without this bind the tables reference an unbound heap -- a
+        // D3D12 validation error and an undefined read.
+        ID3D12DescriptorHeap* mipGenHeaps[] = { srvUavHeap.Get() };
+        m_commandList->SetDescriptorHeaps(1, mipGenHeaps);
+
         // Bind SRV table (src mip)
         D3D12_GPU_DESCRIPTOR_HANDLE srvGpuHandle = srvUavHeap->GetGPUDescriptorHandleForHeapStart();
         srvGpuHandle.ptr += static_cast<SIZE_T>(srcMip) * descriptorSize;
@@ -2958,6 +4397,15 @@ bool D3D12Backend::GenerateMipmaps(ID3D12Resource* texture, uint32_t mipLevels) 
                            i);
     }
 
+    if (m_srvHeap && m_samplerHeap) {
+        ID3D12DescriptorHeap* heaps[] = { m_srvHeap.Get(), m_samplerHeap.Get() };
+        m_commandList->SetDescriptorHeaps(2, heaps);
+    } else if (m_srvHeap) {
+        ID3D12DescriptorHeap* heaps[] = { m_srvHeap.Get() };
+        m_commandList->SetDescriptorHeaps(1, heaps);
+    }
+
+    RetireTarget(std::move(srvUavHeap));  // the recorded dispatches reference it until execution
     MCLA_LOG_INFO("D3D12Backend: Generated {} mip levels for texture", mipLevels);
     return true;
 }
@@ -3079,7 +4527,7 @@ bool D3D12Backend::DrawTestMeshedTriangle(uint32_t frame) {
 // issues one indexed/non-indexed draw. The caller is responsible for producing
 // host data from validated captures; the backend never interprets guest
 // layouts. The vertex stride must match the test PSO's input layout
-// (Position:float3 + Color:float4 = 28 bytes) â€” anything else is refused so we
+// (Position:float3 + Color:float4 = 28 bytes) â€�? anything else is refused so we
 // never draw with a mismatched layout.
 // F-653: THIS IS NO LONGER A PASS-THROUGH TO THE TEST PSO.
 //
@@ -3366,11 +4814,15 @@ bool D3D12Backend::DrawDynamicMeshWithPipeline(const DynamicMeshDesc& desc,
         // kVsInputPrintVerts covers every rectangle draw this project has
         // measured (3 guest vertices, both draws in build/w709.log) with one to
         // spare, and kVsInputPrintLanes covers the widest measured stride's lane
-        // count (7 lanes at stride 28) with one to spare. A draw that exceeds
-        // either is not silently truncated: vertsOmitted / dwordsOmitted say so
-        // on the same line, which is the falsifier for both constants.
-        constexpr uint32_t kVsInputPrintVerts = 4u;
-        constexpr uint32_t kVsInputPrintLanes = 8u;
+        // count (9 lanes at stride 36; was 8, which silently dropped lane 8 of
+        // every stride-36 draw WITHOUT incrementing dwordsOmitted -- the
+        // row's own falsifier was blind past 32 bytes. F-914: lane 8 is the
+        // second half of TEXCOORD0 for the legals text draws). A draw that
+        // exceeds either is not silently truncated: vertsOmitted /
+        // dwordsOmitted say so on the same line, which is the falsifier for
+        // both constants.
+        constexpr uint32_t kVsInputPrintVerts = 6u;
+        constexpr uint32_t kVsInputPrintLanes = 9u;
         const uint64_t n = ++m_vsInputStreamRows;
         if (ShouldLogRefusal(n)) {
             const uint32_t stride = desc.vertexStride;
@@ -3423,7 +4875,7 @@ bool D3D12Backend::DrawDynamicMeshWithPipeline(const DynamicMeshDesc& desc,
             MCLA_LOG_WARN(
                 "VS-INPUT-STREAM #{} prevCacheDraws={} haveBytes={} vertices={} stride={} "
                 "floatLanes={} bytes={} vertsPrinted={} vertsOmitted={} "
-                "dwordsPrinted={} dwordsOmitted={} v0=[{}] v1=[{}] v2=[{}] v3=[{}] "
+                "dwordsPrinted={} dwordsOmitted={} v0=[{}] v1=[{}] v2=[{}] v3=[{}] v4=[{}] v5=[{}] "
                 "-- the byte image of the vertex buffer this draw binds at slot 0, "
                 "every vertex and every dword, host little-endian words after the "
                 "guest's own fetch-constant byte-order swap; a float lane is "
@@ -3434,7 +4886,7 @@ bool D3D12Backend::DrawDynamicMeshWithPipeline(const DynamicMeshDesc& desc,
                 "lands after the vertex stage, and none here computes one",
                 n, m_cachePipelineDraws, haveBytes ? 1u : 0u, desc.vertexCount,
                 stride, lanes, desc.vertexBytesSize, scanVerts, vertsOmitted,
-                dwordsPrinted, dwordsOmitted, vhex[0], vhex[1], vhex[2], vhex[3]);
+                dwordsPrinted, dwordsOmitted, vhex[0], vhex[1], vhex[2], vhex[3], vhex[4], vhex[5]);
         }
     }
     if (!desc.vertexBytes || desc.vertexBytesSize == 0 || desc.vertexCount == 0) {
@@ -3471,7 +4923,7 @@ bool D3D12Backend::DrawDynamicMeshWithPipeline(const DynamicMeshDesc& desc,
     }
 
     // When using the test PSO, enforce the test layout stride (28 bytes).
-    // When a real PSO is provided, accept any stride â€” the PSO's input layout
+    // When a real PSO is provided, accept any stride â€�? the PSO's input layout
     // defines the correct vertex format.
     // F-653: the stride gate now applies ONLY when the caller passed the test
     // PSO on purpose. The `|| !pipeline` arm is gone: a null pipeline is refused
@@ -3645,6 +5097,7 @@ bool D3D12Backend::DrawDynamicMeshWithPipeline(const DynamicMeshDesc& desc,
     // refusal is counted and named by GuestRenderTargetRefused.
     // ---------------------------------------------------------------------
     m_drawsIntoGuestRt = false;
+    m_hadBackBufferDraw = false;
     ID3D12Resource* drawTarget = m_renderTargets[m_frameIndex].Get();
     D3D12_CPU_DESCRIPTOR_HANDLE rtvHandle(m_rtvHeap->GetCPUDescriptorHandleForHeapStart());
     rtvHandle.ptr += static_cast<size_t>(m_frameIndex) * m_rtvDescriptorSize;
@@ -3653,7 +5106,11 @@ bool D3D12Backend::DrawDynamicMeshWithPipeline(const DynamicMeshDesc& desc,
         const uint32_t guestW = gt.surfacePitch;
         uint32_t guestH = 0;
         if (gt.scissorBrY > 0 && gt.scissorBrY <= 4096u) guestH = gt.scissorBrY;
-        if (guestH == 0) guestH = m_height;
+        // No stated height: keep the guest surface we already have. The window height
+        // is not a guest fact (maximized 2560x1518 made the RT 1280x1518 and recreated
+        // it 720<->1518 per pass: vp2.log BLIT-GUEST-RT-SCANOUT).
+        // Else the display height the guest was told: VdQueryVideoMode, kernel/imports.cpp:6535.
+        if (guestH == 0) guestH = (m_guestRtValid && m_guestRtH) ? m_guestRtH : 720u;
         const DXGI_FORMAT scanoutFormat =
             drawTarget ? drawTarget->GetDesc().Format : DXGI_FORMAT_UNKNOWN;
 
@@ -3685,24 +5142,36 @@ bool D3D12Backend::DrawDynamicMeshWithPipeline(const DynamicMeshDesc& desc,
         const uint32_t guestDxgiRaw = MapXenosColorFormatToDxgi(guestColorFormat);
         const DXGI_FORMAT guestDxgi = static_cast<DXGI_FORMAT>(guestDxgiRaw);
 
-        if (guestW == 0) {
+        // Subagent 1 fix (matching ga058 golden path):
+        // Default OFF (0) so draws target the guest render target (EDRAM),
+        // which is then resolved to the back buffer at present time.
+        // Enable with MCLA_DIRECT_BACKBUFFER=1 for direct scanout.
+        static int s_directScanout = -1;
+        if (s_directScanout < 0) {
+            const char* e = std::getenv("MCLA_DIRECT_BACKBUFFER");
+            s_directScanout = (e && e[0] == '1') ? 1 : 0;
+        }
+        if (s_directScanout == 1) {
+            GuestRenderTargetRefused("draws-target-scanout-directly");
+            m_hadBackBufferDraw = true;
+        } else if (guestW == 0) {
             GuestRenderTargetRefused("guest-stated-no-pitch");
-        } else if (guestW != m_width || guestH != m_height) {
-            GuestRenderTargetRefused("guest-rt-not-1to1-with-scanout");
         } else if (!colorStated) {
             GuestRenderTargetRefused("guest-stated-no-color-info");
         } else if (guestDxgi == DXGI_FORMAT_UNKNOWN) {
             // Codes 8/9/11/13 are unassigned in xenos::ColorRenderTargetFormat
             // (xenos.h:299-319). NOT defaulted to some other format.
             GuestRenderTargetRefused("guest-color-format-unmapped");
-        } else if (guestDxgi != scanoutFormat) {
-            // The resolve is a COPY, so the two surfaces must agree in FORMAT
-            // as well as in size. A copy between different formats is not a
-            // 1:1 copy, and the row below would be a lie.
-            GuestRenderTargetRefused("guest-rt-format-differs-from-scanout");
         } else if (!EnsureGuestRenderTarget(guestW, guestH, guestDxgi)) {
             // EnsureGuestRenderTarget already named the refusal.
         } else {
+            if (guestW != m_width || guestH != m_height) {
+                static uint32_t s_logNot1to1 = 0;
+                if (++s_logNot1to1 <= 4) {
+                    MCLA_LOG_INFO("GUEST-RT-SCALING: guest {}x{} scaling to scanout {}x{} dxgi={}",
+                                  guestW, guestH, m_width, m_height, static_cast<uint32_t>(guestDxgi));
+                }
+            }
             drawTarget = m_guestRt.Get();
             rtvHandle = m_guestRtv;
             m_drawsIntoGuestRt = true;
@@ -3725,6 +5194,20 @@ bool D3D12Backend::DrawDynamicMeshWithPipeline(const DynamicMeshDesc& desc,
         m_commandList->ResourceBarrier(1, &barrier);
         if (m_drawsIntoGuestRt) m_guestRtState = D3D12_RESOURCE_STATE_RENDER_TARGET;
     }
+    // TEMP DIAGNOSTIC (F-900): was the guest-RT transition RECORDED or SKIPPED,
+    // and from which state? Every RECORD is printed (the rare, load-bearing
+    // event); skips are throttled.
+    {
+        static uint32_t s_barDiag = 0;
+        const uint32_t bd = ++s_barDiag;
+        const bool recorded =
+            barrier.Transition.StateBefore != D3D12_RESOURCE_STATE_RENDER_TARGET;
+        if (m_drawsIntoGuestRt && (recorded || bd <= 6 || (bd % 500) == 0)) {
+            MCLA_LOG_INFO("GUEST-RT-BARRIER #{} state={} recorded={}",
+                          bd, static_cast<unsigned>(barrier.Transition.StateBefore),
+                          recorded ? 1 : 0);
+        }
+    }
 
     // F-650: the draw path OWNS the back buffer -- it is the writer whose pixels
     // the console's scanout is supposed to be showing. It therefore never asks
@@ -3732,10 +5215,45 @@ bool D3D12Backend::DrawDynamicMeshWithPipeline(const DynamicMeshDesc& desc,
     // this frame's writer so a second writer is caught if one is ever added.
     MayWriteBackBuffer(FrameOwner::Draw);
 
-    // F-650: the placeholder clear, as the one named constant it now is. Nothing
-    // in the guest or any reference establishes this colour; see
-    // kPlaceholderBackBufferClear for what would replace it.
-    m_commandList->ClearRenderTargetView(rtvHandle, kPlaceholderBackBufferClear, 0, nullptr);
+    // F-650: the placeholder clear. F-900: gate to first-draw-of-batch.
+    // Unconditional per-draw ClearRenderTargetView erased every previous draw
+    // in the batch list, so only the LAST draw's pixels could survive to the
+    // resolve (measured: per-draw clear + ~4000 draws/burst). The console
+    // clears once per frame, not per draw. m_batchDrawFrameHasDraw is false
+    // exactly on the first draw after BeginFrame/Flush, so clear then and skip
+    // on subsequent draws in the same open list.
+    const uint32_t targetW = m_drawsIntoGuestRt ? m_guestRtW : m_width;
+    const uint32_t targetH = m_drawsIntoGuestRt ? m_guestRtH : m_height;
+    EnsureGuestDepthStencil(targetW, targetH, DXGI_FORMAT_D24_UNORM_S8_UINT);
+
+    if (!m_batchDrawFrames || !m_batchDrawFrameHasDraw) {
+        m_commandList->ClearRenderTargetView(rtvHandle, kPlaceholderBackBufferClear, 0, nullptr);
+        if (m_guestDepthValid) {
+            m_commandList->ClearDepthStencilView(
+                m_guestDsv, D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL, 1.0f, 0, 0, nullptr);
+        }
+    }
+    // TEMP DIAGNOSTIC (F-900): where did this clear go? The guest RT reads
+    // (0,0,0,0) in g966 despite this clear running per-draw with
+    // (0.02,0.03,0.05,1) = (5,8,13,255) -- nonBlack=0 says the colour never
+    // reached the surface being read back. Compare the handle against the
+    // guest RTV and the back-buffer RTV directly.
+    {
+        static uint32_t s_clearDiag = 0;
+        const uint32_t cd = ++s_clearDiag;
+        if (cd <= 4 || (cd % 500) == 0) {
+            D3D12_CPU_DESCRIPTOR_HANDLE bbRtv(m_rtvHeap->GetCPUDescriptorHandleForHeapStart());
+            bbRtv.ptr += static_cast<size_t>(m_frameIndex) * m_rtvDescriptorSize;
+            MCLA_LOG_INFO("CLEAR-TARGET #{} intoGuestRt={} isGuestRtv={} isBackRtv={} "
+                          "guestRtv={:X} backRtv={:X} used={:X}",
+                          cd, m_drawsIntoGuestRt ? 1 : 0,
+                          (rtvHandle.ptr == m_guestRtv.ptr) ? 1 : 0,
+                          (rtvHandle.ptr == bbRtv.ptr) ? 1 : 0,
+                          static_cast<unsigned>(m_guestRtv.ptr & 0xFFFFFFFFu),
+                          static_cast<unsigned>(bbRtv.ptr & 0xFFFFFFFFu),
+                          static_cast<unsigned>(rtvHandle.ptr & 0xFFFFFFFFu));
+        }
+    }
     // F-XXX: the clear DEFINES the guest render target's contents, so the
     // resolve must copy it even when nothing was drawn into it.
     if (m_drawsIntoGuestRt) m_guestRtDrawn = true;
@@ -3749,7 +5267,147 @@ bool D3D12Backend::DrawDynamicMeshWithPipeline(const DynamicMeshDesc& desc,
     if (!m_drawsIntoGuestRt) {
         NoteBufferWrite("draw-path-clear");
     }
-    m_commandList->OMSetRenderTargets(1, &rtvHandle, FALSE, nullptr);
+    // F-XXX: MCLA_NO_DSV=1 forces pDsv=null (diagnostic): separates the
+    // depth-stencil half of the fault from everything else. The 32 guarded
+    // OMSET faults all carry dsvPtr=1; if the fault vanishes with no DSV
+    // bound, the depth path is implicated. Default OFF.
+    static const int s_noDsv = [] {
+        const char* e = std::getenv("MCLA_NO_DSV");
+        return (e && e[0] == '1') ? 1 : 0;
+    }();
+    const D3D12_CPU_DESCRIPTOR_HANDLE* pDsv =
+        (m_guestDepthValid && s_noDsv == 0) ? &m_guestDsv : nullptr;
+    // F-XXX: BIND ONCE PER LIST, NOT ONCE PER DRAW.
+    //
+    // MEASURED, build/w12.log: the first driver fault lands on draw 264,426,
+    // and the same two handles (rtv=3C311320, dsv=B36AD020) were passed on
+    // every one of those draws. The driver fault is a null inner pointer
+    // (nvwgf2umx.dll+0x43477C: mov rcx,[rax+0x28] with rax=0), i.e. state
+    // INSIDE the driver, not a rejected argument -- the D3D12 device is alive
+    // at the fault (deviceRemoved=0, lastPresentHr=S_OK). Re-binding identical
+    // targets ~1,700 times per frame is both unnecessary and the only thing
+    // that accumulates at that rate, so the redundant call is removed first:
+    // it is correct D3D12 usage on its own merits, and it is the cheapest way
+    // to test whether the redundant binds are what exhausts the driver.
+    //
+    // THE SKIP IS LEGAL ONLY WITHIN ONE COMMAND LIST. m_boundTargetsValid is
+    // cleared at Reset/Close/abandon (see its declaration in the header).
+    const uint64_t rtvKey = static_cast<uint64_t>(rtvHandle.ptr);
+    const uint64_t dsvKey = pDsv ? static_cast<uint64_t>(pDsv->ptr) : 0u;
+    if (m_boundTargetsValid && m_boundRtvKey == rtvKey &&
+        m_boundDsvKey == dsvKey) {
+        ++m_omSetSkips;
+    } else {
+    // F-XXX: guarded bind. This call was the w10 crash site (C0000005 reading
+    // 0x28 inside the vendor driver). The wrapper names the arguments and the
+    // device state on the FIRST fault and refuses the draw instead of letting
+    // the VEH handler park the render thread for the rest of the soak.
+    static std::atomic<uint32_t> s_omsetFaults{0};
+    // LATCH AT 32. A fault here means the runtime's own state is broken; the
+    // measured draw rate is ~12,000/s, and the VEH prints an unthrottled
+    // "VEH SEHPASS" row for every bypassed fault, so an unbounded guard would
+    // turn a crash into a log flood. The latch is named once, with the count
+    // already in s_omsetFaults, and every later draw is refused without a call.
+    if (s_omsetFaults.load(std::memory_order_relaxed) >= 32u) {
+        static std::atomic<bool> s_omsetLatchLogged{false};
+        if (!s_omsetLatchLogged.exchange(true, std::memory_order_relaxed)) {
+            MCLA_LOG_ERROR(
+                "OMSET-FAULT-LATCHED after 32 faults -- every later draw is "
+                "refused WITHOUT calling OMSetRenderTargets; the first 32 "
+                "OMSET-FAULT rows carry the arguments and device state");
+        }
+        return false;
+    }
+    unsigned long omsetCode = 0;
+    if (!TryOMSetRenderTargets(m_commandList.Get(), 1, &rtvHandle, FALSE, pDsv,
+                               &omsetCode)) {
+        const uint32_t fn =
+            s_omsetFaults.fetch_add(1, std::memory_order_relaxed) + 1;
+        const HRESULT removed =
+            m_device ? m_device->GetDeviceRemovedReason() : E_FAIL;
+        if (fn <= 8 || (fn % 200) == 0) {
+            MCLA_LOG_ERROR(
+                "OMSET-FAULT #{} code=0x{:08X} list={} rtv={:X} dsvPtr={} "
+                "dsv={:X} dsvHeap={} rtvHeap={} frameIndex={} presented={} "
+                "fence={} omCalls={} omSkips={} drawsThisFrame={} maxFrame={} "
+                "drawsIssued={} hasDraw={} drewGuestRt={} lastPresentHr={:08X} "
+                "deviceRemoved=0x{:08X} drawverts={} drawidx={} indexed={} "
+                "stride={} topo={} prim={} psoCache={} texPool={}",
+                fn, static_cast<unsigned>(omsetCode),
+                static_cast<const void*>(m_commandList.Get()),
+                static_cast<unsigned>(rtvHandle.ptr & 0xFFFFFFFFu),
+                pDsv ? 1 : 0,
+                static_cast<unsigned>(pDsv ? (pDsv->ptr & 0xFFFFFFFFu) : 0u),
+                static_cast<const void*>(m_guestDsvHeap.Get()),
+                static_cast<const void*>(m_rtvHeap.Get()), m_frameIndex,
+                m_presentedFrames, m_currentFenceValue, m_omSetCalls,
+                m_omSetSkips, m_drawsThisFrame, m_maxDrawsThisFrame,
+                m_stats.drawsIssued,
+                m_batchDrawFrameHasDraw ? 1 : 0,
+                m_drawsIntoGuestRt ? 1 : 0,
+                static_cast<uint32_t>(m_lastPresentHr),
+                static_cast<uint32_t>(removed),
+                desc.vertexCount, desc.indexCount, desc.indexed ? 1 : 0,
+                desc.vertexStride, static_cast<unsigned>(desc.topology),
+                desc.xenosPrimType, m_pipelineCache.Size(),
+                m_texturePoolSlots.size());
+            // F-XXX: dump the driver's stored validation messages (pull
+            // model, MCLA_D3D12_INFOQUEUE=1). This is what the driver itself
+            // complains about -- the named misuse the OMSET fault follows,
+            // instead of a silent crash. Capped at the first 6.
+            if (m_infoQueue && fn <= 6u) {
+                const uint64_t nMsgs = m_infoQueue->GetNumStoredMessages();
+                MCLA_LOG_ERROR("D3D12-INFOQUEUE-DUMP stored={} -- first {} shown",
+                               nMsgs, nMsgs < 6u ? nMsgs : 6u);
+                const uint64_t show = nMsgs < 6u ? nMsgs : 6u;
+                for (uint64_t i = 0; i < show; ++i) {
+                    alignas(8) uint8_t buf[2048];
+                    SIZE_T len = 0;
+                    const HRESULT gh = m_infoQueue->GetMessage(
+                        static_cast<UINT64>(i), reinterpret_cast<D3D12_MESSAGE*>(buf),
+                        &len);
+                    if (FAILED(gh) || len < sizeof(D3D12_MESSAGE)) {
+                        MCLA_LOG_ERROR("D3D12-INFOQUEUE-GET {} hr=0x{:08X} len={}",
+                                       i, static_cast<uint32_t>(gh),
+                                       static_cast<unsigned long long>(len));
+                        continue;
+                    }
+                    auto* msg = reinterpret_cast<D3D12_MESSAGE*>(buf);
+                    const char* descPtr =
+                        reinterpret_cast<const char*>(buf) + sizeof(D3D12_MESSAGE);
+                    const size_t descLen = len > sizeof(D3D12_MESSAGE)
+                        ? len - sizeof(D3D12_MESSAGE) : 0;
+                    MCLA_LOG_ERROR(
+                        "D3D12-INFOQUEUE-GET {} id={} sev={} desc={}",
+                        i, static_cast<unsigned>(msg->ID),
+                        static_cast<unsigned>(msg->Severity),
+                        std::string(descPtr, descLen).substr(0, 900));
+                }
+            }
+        }
+        return false;
+    }
+        ++m_omSetCalls;
+        m_boundTargetsValid = true;
+        m_boundRtvKey = rtvKey;
+        m_boundDsvKey = dsvKey;
+    }  // bind was needed
+    {
+        static std::atomic<uint32_t> s_targetLogCount{0};
+        const uint32_t tlN = s_targetLogCount.fetch_add(1, std::memory_order_relaxed) + 1;
+        static std::atomic<uint32_t> s_rectTargetLog{0};
+        uint32_t rN = 0;
+        if (desc.xenosPrimType == 8u) {
+            rN = s_rectTargetLog.fetch_add(1, std::memory_order_relaxed) + 1;
+        }
+        if (tlN <= 10 || (rN > 0 && (rN <= 20 || (rN % 500) == 0)) || (tlN % 2000) == 0) {
+            MCLA_LOG_ERROR("TEMP-G6-TARGET #{} (rect#{}) drawsIssued={} xenosPrim={} topo={} targetW={} targetH={} target={} rtvValid={} rtFormat={}",
+                           tlN, rN, m_stats.drawsIssued, desc.xenosPrimType, static_cast<unsigned>(desc.topology),
+                           targetW, targetH,
+                           m_drawsIntoGuestRt ? "GUEST_RT" : "SWAPCHAIN_BACKBUFFER",
+                           m_guestRtValid ? 1 : 0, static_cast<unsigned>(m_guestRtFormat));
+        }
+    }
 
     // 2026-10-02: the format of the render target that was JUST bound, read
     // from the bound resource's own descriptor rather than assumed from the
@@ -3835,11 +5493,27 @@ bool D3D12Backend::DrawDynamicMeshWithPipeline(const DynamicMeshDesc& desc,
         }
     }
 
-    // Viewport covering the full back buffer.
-    D3D12_VIEWPORT viewport = { 0.0f, 0.0f,
-                                static_cast<float>(m_width), static_cast<float>(m_height),
-                                0.0f, 1.0f };
-    D3D12_RECT scissor = { 0, 0, static_cast<LONG>(m_width), static_cast<LONG>(m_height) };
+    // Viewport covering the full back buffer or aspect-corrected letterbox/pillarbox.
+    D3D12_VIEWPORT viewport;
+    D3D12_RECT scissor;
+    // Guest-RT draws: the target is the guest's own surface, so the viewport is its
+    // extent; letterboxing to the window happens once, in the scanout blit.
+    if (m_drawsIntoGuestRt) {
+        viewport = { 0.0f, 0.0f, static_cast<float>(targetW), static_cast<float>(targetH),
+                     0.0f, 1.0f };
+        scissor = { 0, 0, static_cast<LONG>(targetW), static_cast<LONG>(targetH) };
+    } else if (m_graphicsSettings.aspectCorrection) {
+        viewport = GetAspectCorrectViewport(16.0f / 9.0f);
+        scissor.left = static_cast<LONG>(viewport.TopLeftX);
+        scissor.top = static_cast<LONG>(viewport.TopLeftY);
+        scissor.right = static_cast<LONG>(viewport.TopLeftX + viewport.Width);
+        scissor.bottom = static_cast<LONG>(viewport.TopLeftY + viewport.Height);
+    } else {
+        viewport = { 0.0f, 0.0f,
+                     static_cast<float>(m_width), static_cast<float>(m_height),
+                     0.0f, 1.0f };
+        scissor = { 0, 0, static_cast<LONG>(m_width), static_cast<LONG>(m_height) };
+    }
     m_commandList->RSSetViewports(1, &viewport);
     m_commandList->RSSetScissorRects(1, &scissor);
 
@@ -3898,6 +5572,21 @@ bool D3D12Backend::DrawDynamicMeshWithPipeline(const DynamicMeshDesc& desc,
                 n, desc.guestConstBytes != nullptr ? "guest" : "ZEROS",
                 pack.registersPacked, desc.guestConstBytesSize,
                 pack.zeroFilledBytes, pack.truncated ? 1 : 0, pack.ok ? 1 : 0);
+            // F-900: c8-c11 VALUES (what the VS matrix multiply consumes).
+            // Singleton row per process shape: proves "constants sane" vs
+            // "oPos=(0,0,0,0),w=0,clipped" without a debugger.
+            if (n == 1 && pack.ok && pack.registersPacked > 12) {
+                float c[16];
+                std::memcpy(c, cbDst + 8u * 16u, sizeof(c));
+                MCLA_LOG_WARN(
+                    "CONST-BANK-VALUES #1 "
+                    "c8 =({:.4f},{:.4f},{:.4f},{:.4f}) "
+                    "c9 =({:.4f},{:.4f},{:.4f},{:.4f}) "
+                    "c10=({:.4f},{:.4f},{:.4f},{:.4f}) "
+                    "c11=({:.4f},{:.4f},{:.4f},{:.4f})",
+                    c[0],c[1],c[2],c[3], c[4],c[5],c[6],c[7],
+                    c[8],c[9],c[10],c[11], c[12],c[13],c[14],c[15]);
+            }
         }
         // F-644: root parameter 2, NOT 1. Root parameter 1 is the s0 SAMPLER
         // descriptor table (CreateTestRootSignature); the CBV moved from 1 to 2
@@ -3905,7 +5594,35 @@ bool D3D12Backend::DrawDynamicMeshWithPipeline(const DynamicMeshDesc& desc,
         // renderer::pipeline_cache.cpp's ResolveConstantBankBinding must name
         // the same index or the reflected binding is reported invalid and every
         // real PSO refuses.
-        m_commandList->SetGraphicsRootConstantBufferView(2, cbGpu);
+        // F-932: the pixel stage gets its own bank. Without one it falls back
+        // to zeros (counted), never to the vertex bank.
+        D3D12_GPU_VIRTUAL_ADDRESS psGpu = 0;
+        uint8_t* psDst = MapUpload(renderer::kShaderConstantBankBytes, 256, psGpu);
+        if (psDst) {
+            if (desc.guestPsConstBytes != nullptr && desc.guestPsConstBytesSize > 0) {
+                (void)renderer::PackXenosConstantBank(
+                    static_cast<const uint8_t*>(desc.guestPsConstBytes),
+                    desc.guestPsConstBytesSize, psDst, renderer::kShaderConstantBankBytes);
+            } else {
+                std::memset(psDst, 0, renderer::kShaderConstantBankBytes);
+                static std::atomic<uint32_t> s_psZero{0};
+                const uint32_t z = s_psZero.fetch_add(1) + 1;
+                if (z <= 4 || (z % 1000u) == 0u)
+                    MCLA_LOG_ERROR("F932-PS-BANK-ZERO #{} (no pixel bank from the producer)", z);
+            }
+        }
+        if (!desc.usePrecompiledPipeline) {
+            m_commandList->SetGraphicsRootConstantBufferView(2, cbGpu);
+            if (psDst) m_commandList->SetGraphicsRootConstantBufferView(3, psGpu);
+        } else {
+            // Precompiled pipeline resource binding: bind root signature, heaps,
+            // tables (params 0..3), and SharedConstants CBV (param 6).
+            // Param 4 (VS constants b0, space4) and Param 5 (PS constants b1, space4)
+            // take cbGpu directly.
+            BindPrecompiledDrawResources(m_commandList.Get());
+            m_commandList->SetGraphicsRootConstantBufferView(4, cbGpu);
+            m_commandList->SetGraphicsRootConstantBufferView(5, psDst ? psGpu : cbGpu);  // F-932
+        }
     } else {
         // F-644: the CBV is NOT optional. Leaving root parameter 2 unset with a
         // descriptor-table-free CBV parameter bound is a D3D12 validation error
@@ -4003,7 +5720,34 @@ bool D3D12Backend::DrawDynamicMeshWithPipeline(const DynamicMeshDesc& desc,
                       "geomStageCreated for the per-variant counts",
                       m_cachePipelineDraws);
     }
-    BindDecodedTexture();  // no-op unless a decoded texture is active
+    // F-899 (2026-10-27): bind the guest's textures/sampler BEFORE the
+    // descriptor tables are set. BindGuestTextures writes SRVs into heap slots
+    // 1..(1+count-1) (t0..t3) and BindGuestSampler interns a sampler into the
+    // sampler heap; BindDecodedTexture then binds both tables. If the producer
+    // did not supply guest textures (guestTextures == nullptr), this is a
+    // no-op and the heap keeps whatever single bootstrap texture it had.
+    if (!desc.usePrecompiledPipeline) {
+        if (desc.guestTextures && desc.guestTextureCount) {
+            BindGuestTextures(desc.guestTextures, desc.guestTextureCount);
+        } else if (m_srvHeap) {
+            m_currentSrvTableGpu = m_srvHeap->GetGPUDescriptorHandleForHeapStart();
+        }
+        if (desc.hasGuestSampler) {
+            BindGuestSampler(desc.guestSampler);
+        }
+        BindDecodedTexture();  // no-op unless a decoded texture is active
+    } else {
+        // Precompiled pipeline: import textures into the SRV heap (slots 1..)
+        // and point the SharedConstants indices at those slots.
+        if (desc.guestTextures && desc.guestTextureCount) {
+            BindGuestTextures(desc.guestTextures, desc.guestTextureCount);
+        }
+        uint32_t indices[16] = {};
+        for (uint32_t t = 0; t < desc.guestTextureCount && t < 16; ++t) {
+            indices[t] = desc.guestTextures[t].descriptorIndex;
+        }
+        UpdatePrecompiledSharedConstants(indices, 16);
+    }
 
     if (desc.indexed) {
         // F-637: the capture's start index and base vertex. Both were hardcoded
@@ -4030,6 +5774,7 @@ bool D3D12Backend::DrawDynamicMeshWithPipeline(const DynamicMeshDesc& desc,
     }
 
     m_stats.drawsIssued++;
+    ++m_drawsThisFrame;
 
     // ---- DRAW-COMMANDLIST-BOUND ---------------------------------------------
     // THE STATE THAT COULD STILL SUPPRESS RASTERISATION, AS THIS FILE SETS IT.
@@ -4199,7 +5944,7 @@ bool D3D12Backend::DrawDynamicMeshWithPipeline(const DynamicMeshDesc& desc,
     //     it past the Close.
     // ---------------------------------------------------------------------
     s_drawIssuedOnList = true;
-    const bool rbRecorded = RecordDrawReadback();
+    const bool rbRecorded = m_batchDrawFrames ? false : RecordDrawReadback();
 
     // 2026-10-02 (F-727): the four dead ends below were measured on this runtime
     // and all four are real. They are recorded HERE, next to the working copy, so
@@ -4271,7 +6016,7 @@ bool D3D12Backend::DrawDynamicMeshWithPipeline(const DynamicMeshDesc& desc,
     // specified in preceding ResourceBarrier or as InitialState", and the list
     // then failed to Close. So the fix is to skip the transition when the
     // readback already performed it, not to weaken the readback.
-    if (!rbRecorded && !m_drawsIntoGuestRt) {
+    if (!m_drawsIntoGuestRt && !m_batchDrawFrames && !rbRecorded) {
         barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
         barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
         m_commandList->ResourceBarrier(1, &barrier);
@@ -4286,6 +6031,18 @@ bool D3D12Backend::DrawDynamicMeshWithPipeline(const DynamicMeshDesc& desc,
     // F-650: the draw path's own present, through the one sanctioned entry point.
     // This is the frame the console's scanout is meant to show, and the FRAME-OWNER
     // row it emits is what makes that claim checkable instead of assumed.
+    //
+    // F-899: UNLESS THE FRAME IS BATCHED. The guest's UI frame is one BURST of
+    // draw commands followed by ONE swap (measured: 553,926 enqueued commands,
+    // 3,400 XE_SWAP emits, build/g919.log). Presenting per draw would end the
+    // frame 11,500 times per guest frame -- and, because BeginFrame() refuses a
+    // second begin, the presents never happen at all: g919 shows begins=501
+    // against 553,926 draws. So in batch mode this returns WITHOUT presenting,
+    // the list stays open, and FlushDrawFrame() presents it once at the swap.
+    if (m_batchDrawFrames) {
+        m_batchDrawFrameHasDraw = true;
+        return true;
+    }
     const bool presented = PresentOwnedFrame(FrameOwner::Draw);
     // F-725: the readback copy, if one was recorded, was executed and fenced by
     // the call above. Now -- and only now -- is it safe to Map.
@@ -4481,9 +6238,31 @@ bool D3D12Backend::RecordDrawReadback() {
     // RENDER TARGET; sampling the back buffer would measure the PREVIOUS
     // frame's content and the row would be a lie about the draw (the row's
     // whole purpose: "a sample of the surface THIS draw wrote").
+    // TEMP F-907 BACKBUFFER-PROBE (env-gated, remove after the resolve path
+    // is settled): MCLA_PROBE_READBACK_BB=1 samples the SCANOUT backbuffer
+    // instead of the guest RT. The window shows black while the guest-RT
+    // readback shows navy+UI; sampling the backbuffer names which side of
+    // the resolve the content is lost on. Black here + UI in guest RT =
+    // resolve/present drops it; UI here = the window was stale, not the
+    // pipeline.
+    bool probeBb = false;
+    {
+        static int s_probeBb = -1;
+        if (s_probeBb < 0) {
+            const char* e = std::getenv("MCLA_PROBE_READBACK_BB");
+            s_probeBb = (e && e[0] == '1') ? 1 : 0;
+        }
+        probeBb = (s_probeBb == 1);
+        if (probeBb) {
+            MCLA_LOG_WARN("FLUSH-PROBE-BB sampling the scanout backbuffer "
+                          "instead of the guest RT (frameIndex={})",
+                          m_frameIndex);
+        }
+    }
     ID3D12Resource* sampleSource =
-        (m_drawsIntoGuestRt && m_guestRt) ? m_guestRt.Get()
-                                          : m_renderTargets[m_frameIndex].Get();
+        (m_drawsIntoGuestRt && m_guestRt && !probeBb)
+            ? m_guestRt.Get()
+            : m_renderTargets[m_frameIndex].Get();
     if (!sampleSource) return false;
 
     ++m_drawReadbackAttempts;
@@ -4491,14 +6270,19 @@ bool D3D12Backend::RecordDrawReadback() {
     // F-727: sample the ordering evidence BEFORE recording anything, so the row
     // describes the copy this call is about to record rather than some later one.
     // m_cachePipelineDraws was incremented at the top of the draw path, so its
-    // value here is the ordinal of the draw this sample is attributed to.
+    // value here is the most recent draw's ordinal.
     s_readbackCopyAfterDraw = s_drawIssuedOnList;
     s_readbackDrawSeq = static_cast<uint64_t>(m_cachePipelineDraws);
 
+    const D3D12_RESOURCE_STATES sampleState =
+        (m_drawsIntoGuestRt && !probeBb)
+            ? D3D12_RESOURCE_STATE_RENDER_TARGET
+            : (m_batchDrawFrames ? D3D12_RESOURCE_STATE_PRESENT
+                                 : D3D12_RESOURCE_STATE_RENDER_TARGET);
     D3D12_RESOURCE_BARRIER b = {};
     b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
     b.Transition.pResource = sampleSource;
-    b.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+    b.Transition.StateBefore = sampleState;
     b.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
     b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
     m_commandList->ResourceBarrier(1, &b);
@@ -4513,17 +6297,14 @@ bool D3D12Backend::RecordDrawReadback() {
     src.SubresourceIndex = 0;
     m_commandList->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
 
-    // Straight back to PRESENT, because the caller transitions to PRESENT next
-    // and D3D12 requires the tracked state to match what the caller asserts.
-    // F-XXX: for the GUEST RENDER TARGET the caller does NOT transition to
-    // PRESENT (it is not a scan-out surface and the draw path keeps drawing
-    // into it), so it goes back to RENDER_TARGET.
+    // Restore the sampled surface's prior state. A batched back-buffer draw
+    // has already transitioned it to PRESENT; guest-RT and non-batched draws
+    // leave their sample source in RENDER_TARGET. The F-907 probe samples the
+    // backbuffer: do not touch the guest-RT tracked state for it.
     b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
-    b.Transition.StateAfter = m_drawsIntoGuestRt
-                                  ? D3D12_RESOURCE_STATE_RENDER_TARGET
-                                  : D3D12_RESOURCE_STATE_PRESENT;
+    b.Transition.StateAfter = sampleState;
     m_commandList->ResourceBarrier(1, &b);
-    if (m_drawsIntoGuestRt) m_guestRtState = D3D12_RESOURCE_STATE_RENDER_TARGET;
+    if (m_drawsIntoGuestRt && !probeBb) m_guestRtState = sampleState;
     return true;
 }
 
@@ -4560,12 +6341,33 @@ void D3D12Backend::ReportDrawReadback() {
     const uint64_t fenceCompletedAtEntry =
         m_fence ? m_fence->GetCompletedValue() : 0;
     bool fenceWaited = false;
+    bool fenceWaitTimedOut = false;
     if (m_fence && fenceCompletedAtEntry < fenceTarget) {
         m_fence->SetEventOnCompletion(fenceTarget, m_fenceEvent);
-        WaitForSingleObject(m_fenceEvent, 2000);
+        // F-XXX (2026-10-27): CHECK THE WAIT. The timeout return was ignored,
+        // so a timed-out wait still fell through to Map -- the readback buffer
+        // could be read before the copy completed, and a zero sample could be
+        // an uncompleted copy rather than a rendered black pixel. A timed-out
+        // wait is recorded on the row and the Map is skipped: an unmeasured
+        // sample is honest, a fabricated zero is not.
         fenceWaited = true;
+        if (WaitForSingleObject(m_fenceEvent, 2000) != WAIT_OBJECT_0 ||
+            m_fence->GetCompletedValue() < fenceTarget) {
+            fenceWaitTimedOut = true;
+        }
     }
     const uint64_t fenceCompleted = m_fence ? m_fence->GetCompletedValue() : 0;
+    if (fenceWaitTimedOut) {
+        ++m_drawReadbackFenceTimeouts;
+        const uint64_t n = m_drawReadbackFenceTimeouts;
+        if (ShouldLogRefusal(n)) {
+            MCLA_LOG_WARN("D3D12-DRAW-PIXEL #{} fence-wait-timeout target={} "
+                          "completed={} -- the copy did not complete in 2 s; the "
+                          "sample is NOT taken rather than mapped uncompleted",
+                          n, fenceTarget, fenceCompleted);
+        }
+        return;
+    }
 
     void* mapped = nullptr;
     D3D12_RANGE range = { 0, 0 };
@@ -5131,6 +6933,63 @@ void D3D12Backend::ReportDrawReadback() {
     // different facts and only this one is the second.
     if (m_drawsIntoGuestRt) {
         m_guestRtChangedPx = changedPx;
+        m_guestRtModalRgba = modalKey;
+        m_guestRtModalCount = modalCount;
+    }
+
+    // Direct D3D12 frame capture: save live frames as top-down 32-bit BMPs for ground-truth inspection.
+    // Use the frame index that was just presented (before m_frameIndex advanced).
+    static uint32_t s_bmpSaved = 0;
+    static uint64_t s_lastBmpFrame = 0;
+    uint32_t bmpFrameIndex = (m_frameIndex == 0) ? (kBufferCount - 1) : (m_frameIndex - 1);
+    if (bmpFrameIndex >= kBufferCount) bmpFrameIndex = 0;
+    ID3D12Resource* bmpTarget = m_renderTargets[bmpFrameIndex].Get();
+    // Opt-in only (MCLA_BMP_DUMP=1): writing files from the present path is a debug cost.
+    static const bool s_bmpDump = [] { const char* e = std::getenv("MCLA_BMP_DUMP"); return e && e[0] == '1'; }();
+    if (s_bmpDump && s_bmpSaved < 24 && bmpTarget && m_width > 0 && m_height > 0 &&
+        (s_bmpSaved == 0 || m_presentedFrames >= s_lastBmpFrame + 25)) {
+        s_lastBmpFrame = m_presentedFrames;
+        char bmpName[64];
+        std::snprintf(bmpName, sizeof(bmpName), "d3d12_frame_%02u.bmp", s_bmpSaved++);
+        if (FILE* f = std::fopen(bmpName, "wb")) {
+#pragma pack(push, 1)
+            struct {
+                uint16_t bfType = 0x4D42;
+                uint32_t bfSize = 0;
+                uint16_t bfReserved1 = 0;
+                uint16_t bfReserved2 = 0;
+                uint32_t bfOffBits = 54;
+                uint32_t biSize = 40;
+                int32_t  biWidth = 0;
+                int32_t  biHeight = 0;
+                uint16_t biPlanes = 1;
+                uint16_t biBitCount = 32;
+                uint32_t biCompression = 0;
+                uint32_t biSizeImage = 0;
+                int32_t  biXPelsPerMeter = 0;
+                int32_t  biYPelsPerMeter = 0;
+                uint32_t biClrUsed = 0;
+                uint32_t biClrImportant = 0;
+            } hdr;
+#pragma pack(pop)
+            hdr.biWidth = static_cast<int32_t>(m_width);
+            hdr.biHeight = -static_cast<int32_t>(m_height); // top-down
+            hdr.bfSize = 54 + m_width * m_height * 4;
+            std::fwrite(&hdr, 1, sizeof(hdr), f);
+            std::vector<uint8_t> rowBuf(m_width * 4);
+            for (uint32_t row = 0; row < m_height; ++row) {
+                const uint8_t* srcRow = base + static_cast<size_t>(row) * pitch;
+                for (uint32_t col = 0; col < m_width; ++col) {
+                    // Swap R and B for BI_RGB Windows BMP
+                    rowBuf[col * 4 + 0] = srcRow[col * 4 + 2]; // B
+                    rowBuf[col * 4 + 1] = srcRow[col * 4 + 1]; // G
+                    rowBuf[col * 4 + 2] = srcRow[col * 4 + 0]; // R
+                    rowBuf[col * 4 + 3] = srcRow[col * 4 + 3]; // A
+                }
+                std::fwrite(rowBuf.data(), 1, m_width * 4, f);
+            }
+            std::fclose(f);
+        }
     }
 
     m_readbackBuffer->Unmap(0, nullptr);
@@ -5259,12 +7118,30 @@ void D3D12Backend::ReportLateFrameReadback() {
     const uint64_t fenceCompletedAtEntry =
         m_fence ? m_fence->GetCompletedValue() : 0;
     bool fenceWaited = false;
+    bool fenceWaitTimedOut = false;
     if (m_fence && fenceCompletedAtEntry < fenceTarget) {
         m_fence->SetEventOnCompletion(fenceTarget, m_fenceEvent);
-        WaitForSingleObject(m_fenceEvent, 2000);
+        // Same checked wait as the draw-path readback: a timed-out wait must
+        // not fall through to Map, or the sample would read an uncompleted
+        // copy and could report a fabricated zero.
         fenceWaited = true;
+        if (WaitForSingleObject(m_fenceEvent, 2000) != WAIT_OBJECT_0 ||
+            m_fence->GetCompletedValue() < fenceTarget) {
+            fenceWaitTimedOut = true;
+        }
     }
     const uint64_t fenceCompleted = m_fence ? m_fence->GetCompletedValue() : 0;
+    if (fenceWaitTimedOut) {
+        ++m_lateFrameReadbackFenceTimeouts;
+        const uint64_t n = m_lateFrameReadbackFenceTimeouts;
+        if (ShouldLogRefusal(n)) {
+            MCLA_LOG_WARN("LATE-FRAME-PIXEL #{} fence-wait-timeout target={} "
+                          "completed={} -- the copy did not complete in 2 s; the "
+                          "sample is NOT taken rather than mapped uncompleted",
+                          n, fenceTarget, fenceCompleted);
+        }
+        return;
+    }
 
     void* mapped = nullptr;
     D3D12_RANGE range = { 0, 0 };
@@ -5559,11 +7436,64 @@ void D3D12Backend::WaitForCopyFence(uint64_t fenceValue) {
     }
 }
 
+void D3D12Backend::SetGraphicsSettings(const GraphicsSettings& s) {
+    std::lock_guard<std::recursive_mutex> lock(m_mutex);
+    m_graphicsSettings = s;
+    MCLA_LOG_INFO("D3D12Backend: Graphics settings updated: internal={}x{}, scale={:.2f}, aspect={}, vsync={}",
+                  s.internalWidth, s.internalHeight, s.renderScale, s.aspectCorrection, s.vsync);
+}
+
+D3D12_VIEWPORT D3D12Backend::GetAspectCorrectViewport(float targetAspect) const {
+    if (m_width == 0 || m_height == 0) {
+        return { 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 1.0f };
+    }
+
+    if (targetAspect <= 0.0f) {
+        targetAspect = 16.0f / 9.0f;
+    }
+
+    const float w = static_cast<float>(m_width);
+    const float h = static_cast<float>(m_height);
+    const float windowAspect = w / h;
+
+    D3D12_VIEWPORT vp = { 0.0f, 0.0f, w, h, 0.0f, 1.0f };
+
+    constexpr float kAspectEpsilon = 0.001f;
+    if (windowAspect > targetAspect + kAspectEpsilon) {
+        // Window is wider than target aspect -> Pillarbox (black bars on left/right)
+        const float targetW = h * targetAspect;
+        vp.Width = targetW;
+        vp.Height = h;
+        vp.TopLeftX = (w - targetW) * 0.5f;
+        vp.TopLeftY = 0.0f;
+    } else if (windowAspect < targetAspect - kAspectEpsilon) {
+        // Window is taller than target aspect -> Letterbox (black bars on top/bottom)
+        const float targetH = w / targetAspect;
+        vp.Width = w;
+        vp.Height = targetH;
+        vp.TopLeftX = 0.0f;
+        vp.TopLeftY = (h - targetH) * 0.5f;
+    } else {
+        vp.TopLeftX = 0.0f;
+        vp.TopLeftY = 0.0f;
+        vp.Width = w;
+        vp.Height = h;
+    }
+
+    return vp;
+}
+
 bool D3D12Backend::Resize(uint32_t width, uint32_t height) {
     std::lock_guard<std::recursive_mutex> lock(m_mutex);
     if (!m_initialized || !m_swapChain) return false;
-    if (width == 0 || height == 0) return false;
 
+    if (width == 0 || height == 0) {
+        m_isMinimized = true;
+        MCLA_LOG_INFO("D3D12Backend: Window minimized (width={}, height={}), skipping ResizeBuffers", width, height);
+        return true;
+    }
+
+    m_isMinimized = false;
     MCLA_LOG_INFO("D3D12Backend: Resizing swap chain to {}x{}", width, height);
 
     WaitForGpu();
@@ -5596,7 +7526,9 @@ bool D3D12Backend::Resize(uint32_t width, uint32_t height) {
     // from the window-resize path (src/app.cpp:328 OnResize -> RESIZE command ->
     // src/render_thread.cpp:4183), and build/w707.log:386 shows it firing once
     // during initialization, before any draw.
-    PublishClipDisableExtent("resize", m_width, m_height, m_cachePipelineDraws);
+    // Guest-RT draws keep the guest surface's extent; only the window changed.
+    if (!m_guestRtValid)
+        PublishClipDisableExtent("resize", m_width, m_height, m_cachePipelineDraws);
 
     m_frameIndex = m_swapChain->GetCurrentBackBufferIndex();
 
@@ -5725,6 +7657,22 @@ void D3D12Backend::AbandonFrame(const char* owner) {
     }
     m_inFrame = false;
     m_frameWriter = FrameOwner::None;
+    m_boundTargetsValid = false;  // list closed; see the cache's declaration
+    if (m_drawsThisFrame > m_maxDrawsThisFrame)
+        m_maxDrawsThisFrame = m_drawsThisFrame;
+    m_drawsThisFrame = 0;
+    // F-900: REVERT THE GUEST-RT STATE LIE. (see header for the full rationale)
+    {
+        static uint32_t s_abandonDiag = 0;
+        const uint32_t ad = ++s_abandonDiag;
+        if (ad <= 6) {
+            MCLA_LOG_INFO("ABANDON-STATE #{} owner={} guestRtState={} restoring={}",
+                          ad, owner,
+                          static_cast<unsigned>(m_guestRtState),
+                          static_cast<unsigned>(m_guestRtStateAtFrameStart));
+        }
+    }
+    m_guestRtState = m_guestRtStateAtFrameStart;
     const uint64_t n = ++m_framesAbandoned;
     if (ShouldLogRefusal(n)) {
         MCLA_LOG_WARN(
@@ -5738,6 +7686,22 @@ void D3D12Backend::AbandonFrame(const char* owner) {
             n, owner, m_beginFrameBegins, m_frameIndex, m_presentedFrames,
             m_drawOwnedFrames);
     }
+}
+
+bool D3D12Backend::BeginFrameForDraw() {
+   std::lock_guard<std::recursive_mutex> lock(m_mutex);
+   if (m_batchDrawFrames && m_inFrame) {
+       const uint64_t n = ++m_batchDrawFrameReuses;
+       if (ShouldLogRefusal(n)) {
+           MCLA_LOG_WARN(
+               "D3D12-DRAW-BATCH-REUSE #{} frameIndex={} presented={} drawn={} "
+               "-- continued the open batch command list; the guest swap "
+               "closes and presents it",
+               n, m_frameIndex, m_presentedFrames, m_drawOwnedFrames);
+       }
+       return true;
+   }
+   return BeginFrame();
 }
 
 bool D3D12Backend::BeginFrame() {
@@ -5789,9 +7753,20 @@ bool D3D12Backend::BeginFrame() {
                                 static_cast<uint32_t>(hr));
         return false;
     }
+    // F-XXX: a fresh list has nothing bound. See the cache's declaration.
+    m_boundTargetsValid = false;
 
     m_inFrame = true;
+    m_batchDrawFrameHasDraw = false;
     m_uploadOffset = 0;
+    m_srvRingOffset = 0;
+    m_currentSrvTableGpu = m_srvHeap ? m_srvHeap->GetGPUDescriptorHandleForHeapStart()
+                                     : D3D12_GPU_DESCRIPTOR_HANDLE{};
+    // F-900: snapshot the TRACKED guest-RT state before this frame records
+    // anything. If this frame is later abandoned, AbandonFrame restores it --
+    // the discarded recording never executed, so every state change it made to
+    // the flag was a lie about the resource's real state.
+    m_guestRtStateAtFrameStart = m_guestRtState;
     ++m_beginFrameBegins;
     return true;
 }
@@ -5801,8 +7776,8 @@ bool D3D12Backend::EnsureFbTexture(uint32_t width, uint32_t height) {
         return true;
     }
 
-    m_fbTexture.Reset();
-    m_fbUpload.Reset();
+    RetireTarget(std::move(m_fbTexture));
+    RetireTarget(std::move(m_fbUpload));
     m_fbFootprint = {};
     m_fbTexW = 0;
     m_fbTexH = 0;
@@ -6133,7 +8108,15 @@ bool D3D12Backend::MayWriteBackBuffer(FrameOwner owner) {
     // is None, not Draw. The latch (m_drawPathTookBackBuffer) is what blocks
     // Clear -- release it exactly like the Blit path does above.
     if (owner == FrameOwner::Clear) {
-        if (m_drawPathTookBackBuffer) {
+        // Subagent 1 fix: do NOT release m_drawPathTookBackBuffer for Clear once draws
+        // have started; allowing Clear to touch the back buffer destroys the drawn frame.
+        // Disable protection explicitly with MCLA_PROTECT_DRAW_BUFFER=0.
+        static int s_protectDrawBuffer = -1;
+        if (s_protectDrawBuffer < 0) {
+            const char* e = std::getenv("MCLA_PROTECT_DRAW_BUFFER");
+            s_protectDrawBuffer = (e && e[0] == '0') ? 0 : 1;
+        }
+        if (s_protectDrawBuffer == 0 && m_drawPathTookBackBuffer) {
             m_drawPathTookBackBuffer = false;
             MCLA_LOG_INFO("FRAME-OWNER latch released for guest CLEAR "
                           "(draw had claimed the buffer; clear may write now)");
@@ -6172,7 +8155,69 @@ bool D3D12Backend::MayWriteBackBuffer(FrameOwner owner) {
 // copy of the same eleven lines, so "which writer produced the frame" was not
 // recorded anywhere and could only be inferred from PRESENT-BLIT vs DRAW-CP
 // counts. The FRAME-OWNER row below is that fact, once per presented frame.
+void D3D12Backend::SetBatchDrawFrames(bool on) {
+    std::lock_guard<std::recursive_mutex> lock(m_mutex);
+    m_batchDrawFrames = on;
+    MCLA_LOG_WARN("D3D12-DRAW-BATCH mode={} | on means the guest's draw burst "
+                  "accumulates in ONE command list and the guest's own swap "
+                  "(render_thread.cpp PRESENT, !IsHeartbeatPresent) closes and "
+                  "presents it once. off reproduces one-present-per-draw.",
+                  on ? 1 : 0);
+}
+
+// F-899: THE FRAME END THE HOST NEVER HAD.
+//
+// Called from render_thread.cpp's `case RenderCommand::PRESENT` when the guest
+// really swaps. PresentOwnedFrame(FrameOwner::Draw) is what closes that list,
+// resolves the guest render target into the scan-out surface and presents --
+// i.e. the same tail one draw used to own, now owned by the frame instead of by
+// whichever draw happened to be first.
+bool D3D12Backend::FlushDrawFrame() {
+    std::lock_guard<std::recursive_mutex> lock(m_mutex);
+    if (!m_initialized || !m_inFrame) return false;
+    // TEMP F-900 FLUSH-PROBE (env-gated, remove after execution is settled):
+    // stamp the guest RT RED immediately before the readback copy. If the
+    // readback then shows RED, the open batch list executes and the copy
+    // works, so all-black samples mean the guest draws really output black.
+    // If it still shows BLACK/ZERO, the executed list is empty (or the copy
+    // reads the wrong surface) and no draw-content theory can explain it.
+    {
+        static int s_probeRed = -1;
+        if (s_probeRed < 0) {
+            const char* e = std::getenv("MCLA_PROBE_FLUSH_RED");
+            s_probeRed = (e && e[0] == '1') ? 1 : 0;
+        }
+        if (s_probeRed == 1 && m_drawsIntoGuestRt && m_guestRt) {
+            const float red[4] = {1.0f, 0.0f, 0.0f, 1.0f};
+            m_commandList->ClearRenderTargetView(m_guestRtv, red, 0, nullptr);
+            MCLA_LOG_WARN("FLUSH-PROBE-RED stamped guest RT red before readback");
+        }
+    }
+    static uint64_t s_lastReadbackPresent = 0;
+    const bool readbackDue =
+        m_drawReadbackAttempts == 0 ||
+        (m_presentedFrames >= s_lastReadbackPresent + 25);
+    const bool rbRecorded =
+        m_batchDrawFrameHasDraw && readbackDue && RecordDrawReadback();
+    if (rbRecorded) {
+        s_lastReadbackPresent = m_presentedFrames;
+    }
+    m_batchDrawFrameHasDraw = false;
+    const bool presented = PresentOwnedFrame(FrameOwner::Draw);
+    if (rbRecorded) {
+        // Safe only after PresentOwnedFrame executed and signalled the list the
+        // copy was recorded into (ReportDrawReadback waits on that fence).
+        ReportDrawReadback();
+    }
+    return presented;
+}
+
 bool D3D12Backend::PresentOwnedFrame(FrameOwner owner) {
+    if (m_isMinimized) {
+        AbandonFrame("minimized");
+        return false;
+    }
+
     // F-XXX: THE RESOLVE, BEFORE THE LIST IS CLOSED. The guest's render
     // target is copied into the scan-out surface HERE, on the same command
     // list as the draws, so the copy sees the draws' output and the window
@@ -6183,31 +8228,103 @@ bool D3D12Backend::PresentOwnedFrame(FrameOwner owner) {
     // IT RUNS ONLY FOR THE DRAW PATH. The clear path owns the back buffer
     // itself (it clears it), and the blit path overwrites it wholesale, so
     // neither may have the guest's render target copied over it.
-    if (owner == FrameOwner::Draw && m_drawsIntoGuestRt) {
+    if (owner == FrameOwner::Draw && m_drawsIntoGuestRt && !m_hadBackBufferDraw) {
         (void)ResolveGuestRenderTarget();
     }
     HRESULT hr = m_commandList->Close();
     if (FAILED(hr)) {
+        // F-900 / F-898(d): THIS EXIT WAS SILENT. No log, no counter -- the
+        // only silent exit in the present path. The consequences are worse than
+        // silent: the list never executes, NO Signal runs, so
+        // s_lastSignalledFenceValue keeps an OLDER value, the next readback's
+        // fenceTarget is stale, `fenceCompletedAtEntry >= fenceTarget` short-
+        // circuits the wait, and Map returns the PREVIOUS readback's bytes
+        // printed as a fresh sample (fenceWaited=0). The F-900 timeout gate
+        // cannot catch this class -- it guards the wait, not the submission.
+        // Named and counted so the next zero sample can be checked against it.
+        ++m_presentCloseFailures;
+        const uint64_t cn = m_presentCloseFailures;
+        if (ShouldLogRefusal(cn)) {
+            MCLA_LOG_ERROR("PRESENT-CLOSE-FAILED #{} owner={} hr=0x{:08X} -- the "
+                           "command list did NOT execute, no Signal was issued, and "
+                           "the frame latch is released; any readback after this "
+                           "row maps STALE bytes under a stale fenceTarget",
+                           cn, static_cast<int>(owner), static_cast<uint32_t>(hr));
+        }
         m_inFrame = false;
         m_frameWriter = FrameOwner::None;
+        m_boundTargetsValid = false;  // list closed; see the cache's declaration
+        if (m_drawsThisFrame > m_maxDrawsThisFrame)
+            m_maxDrawsThisFrame = m_drawsThisFrame;
+        m_drawsThisFrame = 0;
         return false;
     }
 
     ID3D12CommandList* ppCommandLists[] = { m_commandList.Get() };
     m_commandQueue->ExecuteCommandLists(1, ppCommandLists);
 
-    hr = m_swapChain->Present(1, 0);
+    const UINT syncInterval = m_graphicsSettings.vsync ? 1 : 0;
+    hr = m_swapChain->Present(syncInterval, 0);
     m_lastPresentHr = hr;
+    // F-XXX: A FAILED Present WAS INVISIBLE AT THE DEFAULT LOG LEVEL. The only
+    // row that ever printed m_lastPresentHr is FRAME-OWNER, which is INFO, and
+    // src/app.cpp:55 defaults the level to Error -- so a device removal at
+    // Present would leave no line at all in a soak. (Measured on w10/w11:
+    // zero [info] rows, so no FRAME-OWNER row exists in either log.) This row
+    // carries GetDeviceRemovedReason(), which is the one value that separates
+    // "this frame could not be shown" from "every later D3D12 call is
+    // undefined". DXGI_STATUS_OCCLUDED (0x087A0001) SUCCEEDS and does not
+    // reach here.
+    if (FAILED(hr)) {
+        static uint64_t s_presentFailedRows = 0;
+        const uint64_t pn = ++s_presentFailedRows;
+        if (ShouldLogRefusal(pn)) {
+            const HRESULT removed =
+                m_device ? m_device->GetDeviceRemovedReason() : E_FAIL;
+            MCLA_LOG_ERROR(
+                "PRESENT-FAILED #{} hr=0x{:08X} syncInterval={} "
+                "deviceRemoved=0x{:08X} frameIndex={} presented={} drawn={} "
+                "-- a failed Present is not just a dropped frame: if "
+                "deviceRemoved is non-zero, every later command-list call is "
+                "undefined",
+                pn, static_cast<uint32_t>(hr), syncInterval,
+                static_cast<uint32_t>(removed), m_frameIndex,
+                m_presentedFrames, m_drawOwnedFrames);
+        }
+    }
 
     m_currentFenceValue++;
     // F-728: record the value on the SAME Signal, before m_frameIndex moves.
     // The readback's wait has to name the list it is waiting for, and this is
     // the only line that knows which value that is. Signalling is unchanged and
     // unconditional; only the result is now inspected.
-    if (SUCCEEDED(m_commandQueue->Signal(m_fence.Get(), m_currentFenceValue))) {
+    const HRESULT signalHr = m_commandQueue->Signal(m_fence.Get(), m_currentFenceValue);
+    if (SUCCEEDED(signalHr)) {
         s_lastSignalledFenceValue = m_currentFenceValue;
+    } else {
+        // F-900: a FAILED Signal leaves s_lastSignalledFenceValue stale, so the
+        // next readback's fenceTarget is an older value and the wait is skipped
+        // (fenceCompleted >= staleTarget) -- Map then returns whatever the
+        // previous completed copy left in the readback buffer, printed as a
+        // fresh sample. Previously this branch was an empty if with no else and
+        // no log, i.e. the same silent class as the Close() failure above.
+        ++m_signalFailures;
+        if (ShouldLogRefusal(m_signalFailures)) {
+            MCLA_LOG_ERROR("PRESENT-SIGNAL-FAILED #{} value={} hr=0x{:08X} -- "
+                           "Signal on m_fence failed; s_lastSignalledFenceValue "
+                           "stays at {}, so the next readback waits on an OLDER "
+                           "list (its target is stale and the wait will be "
+                           "skipped)",
+                           m_signalFailures, m_currentFenceValue,
+                           static_cast<uint32_t>(signalHr),
+                           s_lastSignalledFenceValue);
+        }
     }
     m_fenceValues[m_frameIndex] = m_currentFenceValue;
+    if (SUCCEEDED(signalHr))
+        for (auto& r : m_retiredTargets)
+            if (r.first == UINT64_MAX) r.first = m_currentFenceValue;
+    PruneRetiredTargets();
     // F-761: counted against the index that was just presented, BEFORE the
     // advance below, so "how many times was this buffer shown" and "how many
     // presents have there been" are two numbers a reader can divide.
@@ -6225,6 +8342,11 @@ bool D3D12Backend::PresentOwnedFrame(FrameOwner owner) {
     }
     m_frameIndex = m_swapChain->GetCurrentBackBufferIndex();
     m_inFrame = false;
+    m_boundTargetsValid = false;  // list closed; see the cache's declaration
+    if (m_drawsThisFrame > m_maxDrawsThisFrame)
+        m_maxDrawsThisFrame = m_drawsThisFrame;
+    m_drawsThisFrame = 0;
+    m_uploadOffset = 0;  // reset arena for the next frame (batch mode reuses the same region)
 
     if (owner == FrameOwner::Draw) {
         m_drawPathTookBackBuffer = true;
@@ -6253,7 +8375,7 @@ bool D3D12Backend::PresentOwnedFrame(FrameOwner owner) {
 
 bool D3D12Backend::PresentBgra(uint32_t width, uint32_t height, const uint8_t* pixels) {
     std::lock_guard<std::recursive_mutex> lock(m_mutex);
-    if (!m_initialized || !m_device || !pixels || width == 0 || height == 0) return false;
+    if (!m_initialized || m_isMinimized || !m_device || !pixels || width == 0 || height == 0) return false;
 
     // F-650: this function is the SECOND writer to the back buffer, and the
     // heavier of the two -- it ends in CopyResource(back, m_fbTexture), which
@@ -6406,7 +8528,7 @@ bool D3D12Backend::PresentBgra(uint32_t width, uint32_t height, const uint8_t* p
 
 bool D3D12Backend::ClearAndPresent(float r, float g, float b, float a) {
     std::lock_guard<std::recursive_mutex> lock(m_mutex);
-    if (!m_initialized) return false;
+    if (!m_initialized || m_isMinimized) return false;
 
     // F-650: the third writer. ClearRenderTargetView is not a neutral no-op --
     // it is a full-surface overwrite, so a clear-only present arriving after a
@@ -6642,6 +8764,8 @@ void D3D12Backend::Shutdown() {
     m_fbHost.clear();
     m_fbHost.shrink_to_fit();
     m_srvHeap.Reset();
+    m_srvRingOffset = 0;
+    m_currentSrvTableGpu = {};
     m_decodedTextureSrvGpu = {};
     m_testPipeline.Reset();
     m_rootSignature.Reset();
@@ -6966,9 +9090,24 @@ bool D3D12Backend::BeginRenderPass(const D3D12Backend::RenderPassDesc& desc) {
     D3D12_CPU_DESCRIPTOR_HANDLE dsvHandle = {};
     bool hasDsv = desc.dsv.has_value();
     if (hasDsv) dsvHandle = desc.dsv->cpuHandle;
-    m_commandList->OMSetRenderTargets(static_cast<UINT>(rtvHandles.size()),
-                                      rtvHandles.data(), FALSE,
-                                      hasDsv ? &dsvHandle : nullptr);
+    // F-XXX: guarded bind (same reason as the blit site above).
+    unsigned long passOmsetCode = 0;
+    if (!TryOMSetRenderTargets(m_commandList.Get(),
+                               static_cast<UINT>(rtvHandles.size()),
+                               rtvHandles.data(), FALSE,
+                               hasDsv ? &dsvHandle : nullptr, &passOmsetCode)) {
+        static std::atomic<uint32_t> s_passOmsetFaults{0};
+        const uint32_t fn =
+            s_passOmsetFaults.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (fn <= 8 || (fn % 200) == 0) {
+            MCLA_LOG_ERROR(
+                "PASS-OMSET-FAULT #{} code=0x{:08X} rtvs={} hasDsv={}",
+                fn, static_cast<unsigned>(passOmsetCode), rtvHandles.size(),
+                hasDsv ? 1 : 0);
+        }
+        return false;
+    }
+    m_boundTargetsValid = false;  // targets changed; see cache decl
     for (const auto& rtv : desc.rtvs) {
         if (rtv.clear) {
             m_commandList->ClearRenderTargetView(rtv.cpuHandle, rtv.clearColor, 0, nullptr);

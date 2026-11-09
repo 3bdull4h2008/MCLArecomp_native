@@ -64,6 +64,7 @@ PPC_FUNC(sub_821C2AB8) {
     MCLA_LOG_WARN("POOL-ROUTER #{} r3={:08X} r4={:08X} lr={:08X}", n,
                   ctx.r3.u32, ctx.r4.u32, lr_val);
   }
+  __imp__sub_821C2AB8(ctx, base);
 }
 
 // SESSION 44c: the census on sub_821C09C8 (pool-free dispatcher: r3 heap, r4
@@ -200,7 +201,36 @@ extern "C" void hk_sub_82130930(mcla::native::PPCContext &ctx, uint8_t *base);
 extern "C" void hk_sub_82130A18(mcla::native::PPCContext &ctx, uint8_t *base);
 extern "C" void hk_sub_822A3998(mcla::native::PPCContext &ctx, uint8_t *base);
 extern "C" void hk_sub_82554E20(mcla::native::PPCContext &ctx, uint8_t *base);
+// X901/X902 (2026-10-24, conformer session): the probes for the UI
+// state-machine bootstrap chain.
+//
+// MECHANISM, MEASURED THE HARD WAY (this build's own control): these four
+// addresses are reached by DIRECT `bl`/`b` edges (generated code emits
+// `sub_X(ctx, base);` -- a C++ call to the weak alias, e.g.
+// generated/ppc_xenon/ppc_recomp.109.cpp:2171 for sub_825578B8), and
+// dispatcher->SetFunction does NOT intercept a direct alias call. Proof from
+// this session (w/x903): 0x825578B8 hooked with Get+Set logged **0 rows while
+// its caller sub_82554E20 ticked 36 times** -- the call at 0x82554E64 is on
+// that function's mandatory path. So these are compile-time PPC_FUNC overrides
+// (the same mechanism src/gpu_device.cpp and src/task_dispatch_trace.cpp use),
+// NOT SetFunction hooks: an override also catches the indirect/dispatcher
+// edge, because the dispatcher's default binding is the same weak alias
+// (src/hooks/config_dispatch.cpp:66-76).
+//
+// Rule 4 measured before the override: `addr_owners.py --check` reported 1
+// site (generated map only) for each of 0x821F9380, 0x82693E10, 0x825578B8,
+// 0x821FBAA8 -- no other owner in the tree.
+PPC_FUNC_IMPL(__imp__sub_821F9380);
+PPC_FUNC_IMPL(__imp__sub_82553DD0);
+PPC_FUNC_IMPL(__imp__sub_822A6CE0);
+PPC_FUNC_IMPL(__imp__sub_822C9DB8);
+PPC_FUNC_IMPL(__imp__sub_822C9DC8);
+PPC_FUNC_IMPL(__imp__sub_82693E10);
+PPC_FUNC_IMPL(__imp__sub_825578B8);
+PPC_FUNC_IMPL(__imp__sub_821FBAA8);
 extern "C" void hk_sub_82554590(mcla::native::PPCContext &ctx, uint8_t *base);
+PPC_FUNC_IMPL(__imp__sub_82554590);
+PPC_FUNC_IMPL(__imp__sub_82554800);
 extern "C" void hk_GpuKick(mcla::native::PPCContext &ctx, uint8_t *base);
 // hk_sub_824569C8 removed 2026-09-28 (F-609 one-owner sweep): its only
 // registration bound guest 0x824569C8, a function a compile-time PPC_FUNC body
@@ -215,6 +245,8 @@ PPC_FUNC_IMPL(__imp__sub_82413660);
 PPC_FUNC_IMPL(__imp__sub_82411840);
 
 static PPCFunc *g_orig_sub_82554E20 = nullptr;
+// X901/X902 probes are compile-time PPC_FUNC overrides (see the note at the
+// declarations above), so they hold no GetFunction slots.
 // SESSION 36: g_orig_sub_821C29A0 / g_orig_sub_82130B50 / g_fast_pool_alloc /
 // g_debug_alloc_caller and the hk_sub_821C29A0 hook were removed. That hook was
 // registered only via SetFunction, which in SESSION 36 filled only m_functions,
@@ -605,6 +637,19 @@ void mcla_ApplyPatches(mcla::App::FunctionDispatcher *dispatcher) {
       MCLA_LOG_ERROR("sub_82554E20 not found in dispatcher");
     }
 
+    // X901/X902 (2026-10-24): the four bootstrap-chain probes are COMPILE-TIME
+    // PPC_FUNC overrides defined further down this file, not SetFunction hooks.
+    // Measured reason: SetFunction cannot intercept a direct `bl` edge, because
+    // generated code emits `sub_X(ctx, base);` -- a C++ call to the weak alias
+    // (ppc_recomp.109.cpp:2171 for sub_825578B8). The control that proved it:
+    // 0x825578B8 hooked via Get+Set logged 0 rows in x903 while its caller
+    // sub_82554E20 ticked 36 times, with 0x82554E64 (the bl) on the mandatory
+    // path. So the register-an-override mechanism is the only honest one here.
+    // One install line is still printed so the arming is visible in the log.
+    MCLA_LOG_WARN("X901-PROBES armed as compile-time PPC_FUNC overrides: "
+                  "0x821F9380 (H1), 0x82693E10 (H2), 0x825578B8 (control), "
+                  "0x821FBAA8 (H1 caller)");
+
     // DELETED 2026-09-28 (F-609 one-owner sweep): the save-original-then-hook
     // on 0x824569C8. It looked like the sanctioned idiom -- GetFunction sits
     // between the two SetFunction calls, single file -- but the "original" it
@@ -831,15 +876,898 @@ PPC_FUNC_IMPL(hk_GpuKick) {
 // src/kernel/imports.cpp:4891/:4892/:4917/:145 is the sole owner. Restore the
 // VFS interposition there, not here, if it is ever wanted.
 
+// ---------------------------------------------------------------------------
+// X901 (2026-10-24, conformer session) -- instruments only, no guest-visible
+// write, no short-circuit. Three probes, one per hypothesis.
+//
+// Static facts these hooks are built on (all re-measured from
+// build/cache/mcla_pe.bin this session, offsets = VA - 0x82000000):
+//  * sub_821F9380 @0x821F9394 reads [this+52]; @0x821F93B8-0x821F93D0 asks the
+//    allocator (0x82130528) for `lis 0x0004; ori 0x0864` = 0x40864 bytes;
+//    @0x821F93E0-0x821F93F4 calls 0x821CA540(0x827D7770, "$/tune/" @0x8201B26C);
+//    @0x821F93F8-0x821F9408 calls 0x82693E10(obj+4, "HSM.sc" @0x8201B264);
+//    @0x821F940C-0x821F9414 masks the RETURN low byte and, when 0, kills
+//    [this+52] through its vtable slot 0 and stores 0 (0x821F9418-0x821F9438).
+//  * sub_82693E10 @0x82693E4C calls 0x821CA6A8(0x827D7770, <name>, 0x8201149C,
+//    0, 1) FIRST and bails to 0x82694104 when that returns 0; only then does it
+//    allocate `li r3,20000` (0x82693E64) and store it at [this+0x4C].
+//  * sub_82554E20 body (0x82554E20-0x82556700): state [this+12] -> early return
+//    at 0x825566DC when 2 or 3; [this+8] and [this+16]; the dword at
+//    0x828EA3BC is a SAVE/RESTORE slot (r24 = [0x828EA3BC] then
+//    [0x828EA3BC] = this on entry, [0x828EA3BC] = r24 at every exit) -- it is
+//    NOT an object registry; [0x828EA3F4] is a handler-table base; the
+//    argument at r4 is a pointer whose dword is decremented once per executed
+//    bytecode (0x82554E7C-0x82554EAC) and whose 0 value ends the tick
+//    (0x825566D0). [this+84] is the per-tick bytecode counter (zeroed at
+//    0x82554E78, +1 at 0x82554EB8) -- it is the direct measure of "did the
+//    manager advance anything".
+//  * The REAL lookup table is 0x82811134: sub_825578B8 is a 3-instruction
+//    wrapper that calls 0x82557618(&0x82811134, key) (open-addressed map,
+//    +0 = bucket array, +4 = bucket count, 8-byte entries {key, value},
+//    key 0 = empty slot). Its result is dereferenced at 0x82554E70
+//    (`lwz r27,8(r3)`) with NO null check, so the map's bucket count decides
+//    whether this tick has an object to interpret at all.
+// ---------------------------------------------------------------------------
+static void X901ReadGuestCStr(mcla::native::GuestMemoryView &mem,
+                              uint32_t va, char *out, size_t cap) {
+  if (cap == 0)
+    return;
+  size_t i = 0;
+  for (; i + 1 < cap; ++i) {
+    uint8_t b = 0;
+    if (!mem.ReadU8(va + i, &b) || b == 0)
+      break;
+    out[i] = (b >= 32 && b < 127) ? static_cast<char>(b) : '?';
+  }
+  out[i] = '\0';
+}
+
+static void X902TrackScript(uint32_t self, uint32_t f8k, uint32_t bcB);
 PPC_FUNC_IMPL(hk_sub_82554E20) {
   static int callCount = 0;
   callCount++;
+  const uint32_t lrVal =
+      static_cast<uint32_t>(g_ppcContext ? g_ppcContext->lr : 0);
   if (callCount <= 50 || (callCount % 1000) == 0) {
-    MCLA_LOG_INFO("hk_sub_82554E20[{}]: lr={:08X}", callCount,
-                  static_cast<uint32_t>(g_ppcContext ? g_ppcContext->lr : 0));
+    MCLA_LOG_INFO("hk_sub_82554E20[{}]: lr={:08X}", callCount, lrVal);
   }
+
+  // ---- X901-H3 / X901-H4 -------------------------------------------------
+  // Reads only. Every guest pointer goes through the checked view.
+  auto &mem = mcla::native::GetActiveGuestMemoryView();
+  const uint32_t self = ctx.r3.u32;
+  const uint32_t ctrPtr = ctx.r4.u32;
+  const bool print = (callCount <= 16 || (callCount % 32) == 0);
+
+  uint32_t state = 0, f8 = 0, f16 = 0, ctrBefore = 0;
+  if (self != 0) {
+    (void)mem.ReadU32BE(self + 12, &state);
+    (void)mem.ReadU32BE(self + 8, &f8);
+    (void)mem.ReadU32BE(self + 16, &f16);
+  }
+  const uint32_t pcPre = f16;  // PC read BEFORE the tick runs (self+16)
+  if (ctrPtr != 0)
+    (void)mem.ReadU32BE(ctrPtr, &ctrBefore);
+
+  uint32_t mapData = 0, mapCount = 0, curSlot = 0, handlerTab = 0;
+  (void)mem.ReadU32BE(0x82811134, &mapData);   // bucket array
+  (void)mem.ReadU32BE(0x82811138, &mapCount);  // bucket count
+  (void)mem.ReadU32BE(0x828EA3BC, &curSlot);   // save/restore slot (pre-push)
+  (void)mem.ReadU32BE(0x828EA3F4, &handlerTab);
+
+  // H3: scan the WHOLE lookup table (bounded), count live entries, and check
+  // every live object's vtable word against 0x82085364 -- the swfC / legals
+  // movie-root vtable FDBF8-CHASE prints. Printed on tick #1 and then every
+  // 8th tick so a registry that GROWS is visible.
+  const bool scan = (callCount == 1 || (callCount % 8) == 0);
+  int regShown = 0;
+  int liveEntries = 0;
+  int rootVtableSeen = 0;
+  if (scan && mapData != 0 && mapCount > 0 && mapCount <= 4096) {
+    for (uint32_t i = 0; i < mapCount; ++i) {
+      uint32_t k = 0, v = 0;
+      if (!mem.ReadU32BE(mapData + i * 8, &k))
+        break;
+      (void)mem.ReadU32BE(mapData + i * 8 + 4, &v);
+      if (k == 0)
+        continue;
+      liveEntries++;
+      uint32_t vt = 0, w4 = 0, w8 = 0, w12 = 0, w16 = 0;
+      if (v != 0) {
+        (void)mem.ReadU32BE(v + 0, &vt);
+        (void)mem.ReadU32BE(v + 4, &w4);
+        (void)mem.ReadU32BE(v + 8, &w8);
+        (void)mem.ReadU32BE(v + 12, &w12);
+        (void)mem.ReadU32BE(v + 16, &w16);
+      }
+      if (vt == 0x82085364u)
+        rootVtableSeen++;
+      if (regShown < 6) {
+        MCLA_LOG_WARN("X901-H3-REG #{} slot={} key={:08X} obj={:08X} "
+                      "vt={:08X} +4={:08X} +8={:08X} +12={:08X} +16={:08X}{}",
+                      callCount, i, k, v, vt, w4, w8, w12, w16,
+                      (vt == 0x82085364u) ? " <== MOVIE-ROOT VTABLE" : "");
+        regShown++;
+      }
+    }
+    MCLA_LOG_WARN("X901-H3-REGSCAN #{} buckets={} live={} rootVtableHits={}",
+                  callCount, mapCount, liveEntries, rootVtableSeen);
+  }
+
   if (g_orig_sub_82554E20)
     g_orig_sub_82554E20(ctx, base);
+
+  uint32_t ctrAfter = 0, advanced = 0, curSlotAfter = 0;
+  if (ctrPtr != 0)
+    (void)mem.ReadU32BE(ctrPtr, &ctrAfter);
+  if (self != 0)
+    (void)mem.ReadU32BE(self + 84, &advanced);  // per-tick bytecode counter
+  (void)mem.ReadU32BE(0x828EA3BC, &curSlotAfter);
+  uint32_t pcPost = 0;
+  if (self != 0)
+    (void)mem.ReadU32BE(self + 16, &pcPost);
+
+  // Brief F-923 probes 1+2 (cadence #1..4 + every 64th): PC delta and the
+  // bytecode window. If the opcode byte at pcPre is 45, the BE32 at pcPre+3
+  // is the called script native's VA -- the front-runner for the wait.
+  const bool probeTick = (callCount <= 4 || (callCount % 64) == 0);
+  if (probeTick && mapData != 0 && mapCount > 0 && mapCount <= 4096) {
+    uint32_t scriptObj = 0;
+    for (uint32_t i = 0; i < mapCount; ++i) {
+      uint32_t k = 0, v = 0;
+      if (!mem.ReadU32BE(mapData + i * 8, &k)) break;
+      (void)mem.ReadU32BE(mapData + i * 8 + 4, &v);
+      if (k == f8) { scriptObj = v; break; }
+    }
+    uint32_t bcBase = 0;
+    if (scriptObj != 0)
+      (void)mem.ReadU32BE(scriptObj + 8, &bcBase);
+    uint8_t winB[16] = {0};
+    if (bcBase != 0) {
+      for (uint32_t i = 0; i < 16u; ++i) {
+        uint8_t b = 0;
+        if (!mem.ReadU8(bcBase + pcPre + i, &b)) break;
+        winB[i] = b;
+      }
+    }
+    uint32_t nativeVa = 0;
+    if (bcBase != 0 && winB[0] == 45u) {
+      for (uint32_t i = 0; i < 4u; ++i)
+        nativeVa = (nativeVa << 8) | winB[3 + i];
+    }
+    MCLA_LOG_ERROR("X901-PROBE #{} pc={}->{} dpc={} budget={} obj={:08X} "
+                   "bc={:08X} op0={} win={:02X}{:02X}{:02X}{:02X} nativeVA={:08X}",
+                   callCount, pcPre, pcPost,
+                   static_cast<int32_t>(pcPost) - static_cast<int32_t>(pcPre),
+                   ctrBefore, scriptObj, bcBase,
+                   static_cast<unsigned>(winB[0]),
+                   static_cast<unsigned>(winB[0]),
+                   static_cast<unsigned>(winB[1]),
+                   static_cast<unsigned>(winB[2]),
+                   static_cast<unsigned>(winB[3]), nativeVa);
+    // Brief F-923 probe 3b: the native's own gate word. sub_82553DD0 (the
+    // opcode-45 target) tests BE32[g+12] where g=BE32[0x828DA3BC] (handler
+    // table object). If that is stuck at 0, the native never completes and
+    // the tick yields forever. Print g, its state, and its float slot.
+    uint32_t gObj = 0, gState = 0, gFloat = 0;
+    (void)mem.ReadU32BE(0x828DA3BC, &gObj);
+    if (gObj != 0) {
+      (void)mem.ReadU32BE(gObj + 12, &gState);
+      (void)mem.ReadU32BE(gObj + 36, &gFloat);
+    }
+    MCLA_LOG_ERROR("X901-NATGATE #{} g={:08X} gState={} gFloat={:08X} "
+                   "nativeCtr={} pc={}",
+                   callCount, gObj, gState, gFloat, ctrBefore, pcPre);
+  }
+
+  // Brief F-923: distinct script threads (PREDICTION: the LoadPlayer/
+  // LoadCity script never starts or is parked; falsifier = more than one
+  // distinct self, or any X902-LOADPLAYER rows).
+  {
+    uint32_t scriptObj = 0;
+    if (mapData != 0 && mapCount > 0 && mapCount <= 4096 && f8 != 0) {
+      for (uint32_t i = 0; i < mapCount; ++i) {
+        uint32_t k = 0, v = 0;
+        if (!mem.ReadU32BE(mapData + i * 8, &k)) break;
+        (void)mem.ReadU32BE(mapData + i * 8 + 4, &v);
+        if (k == f8) { scriptObj = v; break; }
+      }
+    }
+    uint32_t bcX = 0;
+    if (scriptObj != 0)
+      (void)mem.ReadU32BE(scriptObj + 8, &bcX);
+    if (callCount <= 4 || (callCount % 500) == 0 || bcX != 0) {
+      X902TrackScript(self, f8, bcX);
+    }
+  }
+
+  // Brief F-923 X902 probes (Tasks 1-4). All read-only; X902- labels at
+  // ERROR; first-16 + every-500th cadence. To be removed before commit.
+  {
+    // Task 3: read g fully each sampled tick. g == self (A0C1DF80, the
+    // screen/script object). ever2 is sticky for g+12 == 2.
+    uint32_t g = 0, gx[11] = {0};
+    uint32_t bC0 = 0, cb = 0;
+    (void)mem.ReadU32BE(0x828DA3BC, &g);
+    if (g != 0) {
+      for (uint32_t i = 0u; i < 11u; ++i)
+        (void)mem.ReadU32BE(g + i * 4u, &gx[i]);
+    }
+    {
+      uint8_t byteC0 = 0;
+      (void)mem.ReadU8(0x828DA3C0, &byteC0);
+      bC0 = byteC0;
+      (void)mem.ReadU32BE(0x828DA3C4, &cb);
+    }
+    static bool ever2 = false;
+    if (g != 0 && gx[3] == 2u) ever2 = true;  // gx[3] = BE32[g+12]
+    if (callCount <= 4 || (callCount % 500) == 0) {
+      MCLA_LOG_ERROR(
+          "X902-G #{} g={:08X} +0..+40=[{:08X},{:08X},{:08X},{:08X},{:08X},"
+          "{:08X},{:08X},{:08X},{:08X},{:08X}] bC0={:02X} cb={:08X} "
+          "ever2={}",
+          callCount, g, gx[0], gx[1], gx[2], gx[3], gx[4],
+          gx[5], gx[6], gx[7], gx[8], gx[9], bC0, cb, ever2 ? 1 : 0);
+    }
+
+    // Task 1: the loop body. Dump bytecode 0..63 once (first probe tick).
+    // NOT gated on g: g is the restored out-of-window value (always 0);
+    // the map lookup keys on f8 (the registry key at self+8) which is
+    // valid before the tick.
+    static bool bodyDumped = false;
+    if (!bodyDumped && f8 != 0 && mapData != 0) {
+      uint32_t scriptObj2 = 0;
+      if (mapData != 0 && mapCount > 0 && mapCount <= 4096 &&
+          f8 != 0) {
+        for (uint32_t i = 0; i < mapCount; ++i) {
+          uint32_t k = 0, v = 0;
+          if (!mem.ReadU32BE(mapData + i * 8, &k)) break;
+          (void)mem.ReadU32BE(mapData + i * 8 + 4, &v);
+          if (k == f8) { scriptObj2 = v; break; }
+        }
+      }
+      uint32_t bcB = 0;
+      if (scriptObj2 != 0)
+        (void)mem.ReadU32BE(scriptObj2 + 8, &bcB);
+      if (bcB != 0) {
+        std::string hex;
+        for (uint32_t i = 0u; i < 64u; ++i) {
+          uint8_t b = 0;
+          if (!mem.ReadU8(bcB + i, &b)) break;
+          char tmp[4];
+          snprintf(tmp, sizeof(tmp), "%02X ", b);
+          hex += tmp;
+        }
+        MCLA_LOG_ERROR("X902-LOOPBODY bc={:08X} bytes={}", bcB, hex);
+        bodyDumped = true;
+      }
+    }
+  }
+
+  // Brief F-923: visible at default level (was WARN, invisible). The state
+  // field (self+12) and the bytecode counter (adv) say whether the script
+  // thread is PARKED (state frozen, adv frozen) or SPINNING (adv advancing,
+  // just never calling LoadCity). Cadence: boot rows + every 500th tick.
+  const bool errPrint = (callCount <= 16 || (callCount % 500) == 0);
+  if (errPrint) {
+    MCLA_LOG_ERROR("X901-H3-TICK #{} self={:08X} lr={:08X} st={} f8={:08X} "
+                   "f16={} ctrPtr={:08X} ctr={}->{} adv={} curPrev={:08X} "
+                   "curAfter={:08X} map={:08X}/{} tab={:08X}{}",
+                   callCount, self, lrVal, state, f8, f16, ctrPtr, ctrBefore,
+                   ctrAfter, advanced, curSlot, curSlotAfter, mapData, mapCount,
+                   handlerTab, (rootVtableSeen > 0) ? " ROOT-IN-REGISTRY" : "");
+  }
+
+  // Cycle C1 (M1 gate): name the ticking script(s) from scrProgram, NOT
+  // from a nearby string. The X902-SCRIPT nameCand heuristic ("longest ASCII
+  // run near the bytecode base") is exactly what the gate forbids, so this
+  // dumps the object words and attempts a C-string read at every
+  // pointer-shaped slot instead: whichever slot yields a printable
+  // script-like name is the name field. First tick per distinct `self`
+  // only, plus callCount<=4 boot rows. Read-only, checked view, capped.
+  {
+    static uint32_t s_seen[8] = {};
+    static uint32_t s_seenN = 0;
+    bool isNew = false;
+    if (self != 0) {
+      bool found = false;
+      for (uint32_t i = 0; i < s_seenN; ++i)
+        if (s_seen[i] == self) found = true;
+      if (!found && s_seenN < 8u) {
+        s_seen[s_seenN++] = self;
+        isNew = true;
+      }
+    }
+    if ((isNew || callCount <= 4) && self != 0) {
+      uint32_t sObj = 0;
+      if (mapData != 0 && mapCount > 0 && mapCount <= 4096 && f8 != 0) {
+        for (uint32_t i = 0; i < mapCount; ++i) {
+          uint32_t k = 0, v = 0;
+          if (!mem.ReadU32BE(mapData + i * 8, &k)) break;
+          (void)mem.ReadU32BE(mapData + i * 8 + 4, &v);
+          if (k == f8) { sObj = v; break; }
+        }
+      }
+      uint32_t bcB = 0;
+      if (sObj != 0)
+        (void)mem.ReadU32BE(sObj + 8, &bcB);
+      MCLA_LOG_ERROR("C1-SCRPROG #{} self={:08X} key={:08X} sObj={:08X} bc={:08X}",
+                     callCount, self, f8, sObj, bcB);
+      uint32_t sw[16] = {0};
+      for (uint32_t i = 0; i < 16u; ++i)
+        (void)mem.ReadU32BE(self + i * 4u, &sw[i]);
+      MCLA_LOG_ERROR("C1-SELF +0..+60=[{:08X},{:08X},{:08X},{:08X},{:08X},{:08X},{:08X},{:08X},{:08X},{:08X},{:08X},{:08X},{:08X},{:08X},{:08X},{:08X}]",
+                     sw[0], sw[1], sw[2], sw[3], sw[4], sw[5], sw[6], sw[7],
+                     sw[8], sw[9], sw[10], sw[11], sw[12], sw[13], sw[14], sw[15]);
+      uint32_t ow[16] = {0};
+      if (sObj != 0)
+        for (uint32_t i = 0; i < 16u; ++i)
+          (void)mem.ReadU32BE(sObj + i * 4u, &ow[i]);
+      MCLA_LOG_ERROR("C1-SOBJ +0..+60=[{:08X},{:08X},{:08X},{:08X},{:08X},{:08X},{:08X},{:08X},{:08X},{:08X},{:08X},{:08X},{:08X},{:08X},{:08X},{:08X}]",
+                     ow[0], ow[1], ow[2], ow[3], ow[4], ow[5], ow[6], ow[7],
+                     ow[8], ow[9], ow[10], ow[11], ow[12], ow[13], ow[14], ow[15]);
+      // Pointer-slot C-string attempt on both objects.
+      for (uint32_t i = 0; i < 16u; ++i) {
+        for (uint32_t w = 0; w < 2u; ++w) {
+          const uint32_t v = w == 0 ? sw[i] : ow[i];
+          if (!((v >= 0x82000000u && v < 0x82900000u) ||
+                (v >= 0xA0000000u && v < 0xC0000000u)))
+            continue;
+          char txt[49] = {};
+          X901ReadGuestCStr(mem, v, txt, sizeof(txt));
+          const size_t tl = strlen(txt);
+          if (tl >= 4u &&
+              ((txt[0] >= 'A' && txt[0] <= 'Z') || (txt[0] >= 'a' && txt[0] <= 'z'))) {
+            MCLA_LOG_ERROR("C1-STR {}+{}={:08X} len={} text='{}'",
+                           w == 0 ? "self" : "sObj", i * 4u, v,
+                           static_cast<uint32_t>(tl), txt);
+          }
+        }
+      }
+      // Bytecode header (script blob may carry its own name/header).
+      if (bcB != 0) {
+        char hexB[49] = {};
+        char* p = hexB;
+        for (uint32_t i = 0; i < 16u; ++i) {
+          uint8_t by = 0;
+          (void)mem.ReadU8(bcB + i, &by);
+          p += snprintf(p, 4, "%02X ", by);
+        }
+        MCLA_LOG_ERROR("C1-BC-HDR #{} bc={:08X} bytes={}", callCount, bcB, hexB);
+      }
+    }
+  }
+}
+
+// Brief F-923 probe 3a: the opcode-45 native sub_82553DD0, entered on every
+// script tick at PC 47. Reads only: g=*(0x828DA3BC) + its state/float, and
+// the native's own return value. Decides whether the native would advance:
+// state==1 slow-accumulate vs never, and what its return is.
+PPC_FUNC(sub_82553DD0) {
+  static std::atomic<uint32_t> s_natCalls{0};
+  const uint32_t n = s_natCalls.fetch_add(1) + 1;
+  const uint32_t lrVal =
+      static_cast<uint32_t>(g_ppcContext ? g_ppcContext->lr : 0);
+  auto &mem = mcla::native::GetActiveGuestMemoryView();
+  uint32_t gObj = 0, gState = 0, gFloat = 0;
+  (void)mem.ReadU32BE(0x828DA3BC, &gObj);
+  if (gObj != 0) {
+    (void)mem.ReadU32BE(gObj + 12, &gState);
+    (void)mem.ReadU32BE(gObj + 36, &gFloat);
+  }
+  const uint32_t r3 = ctx.r3.u32;
+  uint32_t arg0 = 0, arg4 = 0;
+  if (r3 != 0) {
+    (void)mem.ReadU32BE(r3 + 0, &arg0);
+    (void)mem.ReadU32BE(r3 + 4, &arg4);
+  }
+  // Brief F-923: the native's threshold constants (sub_82553DD0 reads f13
+  // from [0x82000ED4], f13b from [0x828110CC], f12 from [0x82002C64]).
+  // If any is 0/NaN the compare never trips and the wait never completes.
+  uint32_t cA = 0, cB = 0, cC = 0;
+  (void)mem.ReadU32BE(0x82000ED4u, &cA);
+  (void)mem.ReadU32BE(0x828110CCu, &cB);
+  (void)mem.ReadU32BE(0x82002C64u, &cC);
+  if (n <= 4 || (n % 64) == 0) {
+    float fA, fB, fC;
+    memcpy(&fA, &cA, 4);
+    memcpy(&fB, &cB, 4);
+    memcpy(&fC, &cC, 4);
+    MCLA_LOG_ERROR("X901-NATIVE-CONST #{} cA={:08X} ({:.3f}) cB={:08X} "
+                   "({:.3f}) cC={:08X} ({:.3f})",
+                   n, cA, fA, cB, fB, cC, fC);
+  }
+  if (n <= 16 || (n % 64) == 0) {
+    MCLA_LOG_ERROR("X901-NATIVE #{} g={:08X} state={} float={:08X} r3={:08X} "
+                   "arg0={:08X} arg4={:08X} lr={:08X}",
+                   n, gObj, gState, gFloat, r3, arg0, arg4, lrVal);
+    // Brief F-923 Task 3 in-window full read: this hook runs while the
+    // interpreter has the script object installed in the slot, so g is
+    // valid here (unlike the tick hook, which pre-dates the install).
+    uint32_t gx[11] = {0};
+    if (gObj != 0) {
+      for (uint32_t i = 0u; i < 11u; ++i)
+        (void)mem.ReadU32BE(gObj + i * 4u, &gx[i]);
+    }
+    uint8_t byteC0 = 0;
+    uint32_t cb = 0;
+    (void)mem.ReadU8(0x828DA3C0, &byteC0);
+    (void)mem.ReadU32BE(0x828DA3C4, &cb);
+    static bool ever2w = false;
+    if (gObj != 0 && gx[3] == 2u) ever2w = true;
+    MCLA_LOG_ERROR("X902-G-WINDOW #{} +0..+40=[{:08X},{:08X},{:08X},{:08X},"
+                   "{:08X},{:08X},{:08X},{:08X},{:08X},{:08X}] bC0={:02X} "
+                   "cb={:08X} ever2={}",
+                   n,
+                   gx[0], gx[1], gx[2], gx[3], gx[4],
+                   gx[5], gx[6], gx[7], gx[8], gx[9],
+                   static_cast<unsigned>(byteC0), cb, ever2w ? 1 : 0);
+  }
+  __imp__sub_82553DD0(ctx, base);
+  if (n <= 16 || (n % 64) == 0) {
+    const uint32_t ret = ctx.r3.u32;
+    uint32_t gState2 = 0, gFloat2 = 0;
+    if (gObj != 0) {
+      (void)mem.ReadU32BE(gObj + 12, &gState2);
+      (void)mem.ReadU32BE(gObj + 36, &gFloat2);
+    }
+    MCLA_LOG_ERROR("X901-NATIVE-RET #{} ret={:08X} gState2={} gFloat2={:08X}",
+                   n, ret, gState2, gFloat2);
+  }
+}
+
+// Brief F-923: the loop's FindObject native (both opcode-45 sites at PC 16
+// and PC 36 decode LE to this VA). sub_822A6CE0 = mgr from
+// BE32[0x82874374], then sub_821E80F8(mgr,arg); 0 means "not found".
+// Log-only: args, mgr, and the return value (the lookup outcome).
+PPC_FUNC(sub_822A6CE0) {
+  static std::atomic<uint32_t> s_findCalls{0};
+  const uint32_t n = s_findCalls.fetch_add(1) + 1;
+  const uint32_t r3 = ctx.r3.u32;
+  const uint32_t r4 = ctx.r4.u32;
+  auto &mem = mcla::native::GetActiveGuestMemoryView();
+  uint32_t mgr = 0;
+  (void)mem.ReadU32BE(0x82874374u, &mgr);
+  uint32_t arg0 = 0, arg4 = 0;
+  if (r3 != 0) {
+    (void)mem.ReadU32BE(r3 + 0, &arg0);
+    (void)mem.ReadU32BE(r3 + 4, &arg4);
+  }
+  if (n <= 16 || (n % 500) == 0) {
+    MCLA_LOG_ERROR("X902-FINDOBJ #{} r3={:08X} r4={:08X} mgr={:08X} "
+                   "arg0={:08X} arg4={:08X} lr={:08X}",
+                   n, r3, r4, mgr, arg0, arg4,
+                   static_cast<uint32_t>(g_ppcContext ? g_ppcContext->lr : 0));
+  }
+  __imp__sub_822A6CE0(ctx, base);
+  if (n <= 16 || (n % 500) == 0) {
+    MCLA_LOG_ERROR("X902-FINDOBJ-RET #{} ret={:08X} r10={:08X}",
+                   n, ctx.r3.u32, ctx.r10.u32);
+  }
+}
+
+// Brief F-923: Player_LoadPlayer (0x822C9DB8 = name @0x8203ACE4) and
+// Player_LoadRemotePlayer (0x822C9DC8 = name @0x8203ACAC), both registered
+// in sub_822CA238. Log-only entry counters; addr_owners --check exits 0 for
+// both (generated map only).
+PPC_FUNC(sub_822C9DB8) {
+  static std::atomic<uint32_t> s_loadP{0};
+  const uint32_t n = s_loadP.fetch_add(1) + 1;
+  if (n <= 16 || (n % 500) == 0) {
+    MCLA_LOG_ERROR("X902-LOADPLAYER #{} r3={:08X} r4={:08X} lr={:08X}",
+                   n, ctx.r3.u32, ctx.r4.u32,
+                   static_cast<uint32_t>(g_ppcContext ? g_ppcContext->lr : 0));
+  }
+  __imp__sub_822C9DB8(ctx, base);
+}
+PPC_FUNC(sub_822C9DC8) {
+  static std::atomic<uint32_t> s_loadR{0};
+  const uint32_t n = s_loadR.fetch_add(1) + 1;
+  if (n <= 16 || (n % 500) == 0) {
+    MCLA_LOG_ERROR("X902-LOADREMOTE #{} r3={:08X} r4={:08X} lr={:08X}",
+                   n, ctx.r3.u32, ctx.r4.u32,
+                   static_cast<uint32_t>(g_ppcContext ? g_ppcContext->lr : 0));
+  }
+  __imp__sub_822C9DC8(ctx, base);
+}
+
+// Cycle C1 (M1 gate): did anything ever issue mcCareer_StartNewScript?
+// sub_826C2160 registers "mcCareer_StartNewScript" (@0x820BD5C0, plain) with
+// handler sub_826C0010 and "mcCareer_StartNewScript_SC" (@0x820BD5A4) with
+// handler sub_826C0068 (generated/ppc_xenon/ppc_recomp.140.cpp:15610-15710;
+// S1/S3 raw-byte verified: 0x820BD5A4=_SC / 0x820BD5C0=plain).
+// 0 direct-`bl` callers (ppc_xrefs calls) -- the interpreter dispatches by
+// name -- so entries here prove a script issued the command. Log-only,
+// read-only, ERROR-level, capped (campaign brief). Labels corrected C2
+// after C1 reviewers S1/S3/S4 flagged the original _SC/non-SC swap.
+PPC_FUNC_IMPL(__imp__sub_826C0010);
+PPC_FUNC(sub_826C0010) {
+  static std::atomic<uint32_t> s_spawnPl{0};
+  const uint32_t n = s_spawnPl.fetch_add(1) + 1;
+  auto &mem = mcla::native::GetActiveGuestMemoryView();
+  const uint32_t sctx = ctx.r3.u32;
+  uint32_t w0 = 0, w8 = 0, namePtr = 0, nameLen = 0;
+  if (sctx != 0) {
+    (void)mem.ReadU32BE(sctx + 0u, &w0);
+    (void)mem.ReadU32BE(sctx + 8u, &w8);
+    if (w8 != 0)
+      (void)mem.ReadU32BE(w8 + 0u, &namePtr);
+  }
+  char nameBuf[65] = {};
+  if (namePtr != 0) {
+    X901ReadGuestCStr(mem, namePtr, nameBuf, sizeof(nameBuf));
+    nameLen = static_cast<uint32_t>(strlen(nameBuf));
+  }
+  // The handler itself reads arg = BE32[obj+436] (plain StartNewScript)
+  // with obj from lis(-32121)=0x82870000 minus 10020
+  // (ppc_recomp.140.cpp:10458-10465; S1/S3 verified pairing is
+  // 0010<->0x820BD5C0 plain, 0068<->0x820BD5A4 _SC).
+  uint32_t cfgObj = 0, cfgArg = 0;
+  (void)mem.ReadU32BE(0x82870000u - 10020u, &cfgObj);
+  if (cfgObj != 0)
+    (void)mem.ReadU32BE(cfgObj + 436u, &cfgArg);
+  if (n <= 16 || (n % 500) == 0) {
+    MCLA_LOG_ERROR("C1-SPAWN #{} sctx={:08X} w0={:08X} w8={:08X} "
+                   "namePtr={:08X} name='{}' len={} cfgObj={:08X} "
+                   "cfgArg={:08X} lr={:08X}",
+                   n, sctx, w0, w8, namePtr, nameBuf, nameLen, cfgObj, cfgArg,
+                   static_cast<uint32_t>(g_ppcContext ? g_ppcContext->lr : 0));
+  }
+  __imp__sub_826C0010(ctx, base);
+  if (n <= 16 || (n % 500) == 0) {
+    MCLA_LOG_ERROR("C1-SPAWN-RET #{} ret={:08X}", n, ctx.r3.u32);
+  }
+}
+
+PPC_FUNC_IMPL(__imp__sub_826C0068);
+PPC_FUNC(sub_826C0068) {
+  static std::atomic<uint32_t> s_spawnSc{0};
+  const uint32_t n = s_spawnSc.fetch_add(1) + 1;
+  auto &mem = mcla::native::GetActiveGuestMemoryView();
+  const uint32_t sctx = ctx.r3.u32;
+  uint32_t w0 = 0, w8 = 0, namePtr = 0, nameLen = 0;
+  if (sctx != 0) {
+    (void)mem.ReadU32BE(sctx + 0u, &w0);
+    (void)mem.ReadU32BE(sctx + 8u, &w8);
+    if (w8 != 0)
+      (void)mem.ReadU32BE(w8 + 0u, &namePtr);
+  }
+  char nameBuf[65] = {};
+  if (namePtr != 0) {
+    X901ReadGuestCStr(mem, namePtr, nameBuf, sizeof(nameBuf));
+    nameLen = static_cast<uint32_t>(strlen(nameBuf));
+  }
+  // _SC twin reads BE32[obj+440] (ppc_recomp.140.cpp:10514-10521).
+  uint32_t cfgObj = 0, cfgArg = 0;
+  (void)mem.ReadU32BE(0x82870000u - 10020u, &cfgObj);
+  if (cfgObj != 0)
+    (void)mem.ReadU32BE(cfgObj + 440u, &cfgArg);
+  if (n <= 16 || (n % 500) == 0) {
+    MCLA_LOG_ERROR("C1-SPAWN-SC #{} sctx={:08X} w0={:08X} w8={:08X} "
+                   "namePtr={:08X} name='{}' len={} cfgObj={:08X} "
+                   "cfgArg={:08X} lr={:08X}",
+                   n, sctx, w0, w8, namePtr, nameBuf, nameLen, cfgObj, cfgArg,
+                   static_cast<uint32_t>(g_ppcContext ? g_ppcContext->lr : 0));
+  }
+  __imp__sub_826C0068(ctx, base);
+  if (n <= 16 || (n % 500) == 0) {
+    MCLA_LOG_ERROR("C1-SPAWN-SC-RET #{} ret={:08X}", n, ctx.r3.u32);
+  }
+}
+
+// Cycle C1 (M1 gate): "STARTUP_CHECKS_COMPLETE" is materialised only in
+// sub_821F9380+0x1e8 (the UI bootstrap that prints 0 X901-H1 rows) and in
+// sub_821FF450+0x220 (ppc_xrefs xref 0x8201B1E8). Entry census on the latter
+// -- addr_owners --check exits 0 with only the generated map. Log-only.
+PPC_FUNC_IMPL(__imp__sub_821FF450);
+PPC_FUNC(sub_821FF450) {
+  static std::atomic<uint32_t> s_startup{0};
+  const uint32_t n = s_startup.fetch_add(1) + 1;
+  if (n <= 16 || (n % 500) == 0) {
+    MCLA_LOG_ERROR("C1-STARTUP #{} r3={:08X} r4={:08X} r5={:08X} lr={:08X}",
+                   n, ctx.r3.u32, ctx.r4.u32, ctx.r5.u32,
+                   static_cast<uint32_t>(g_ppcContext ? g_ppcContext->lr : 0));
+  }
+  __imp__sub_821FF450(ctx, base);
+  if (n <= 16 || (n % 500) == 0) {
+    MCLA_LOG_ERROR("C1-STARTUP-RET #{} ret={:08X}", n, ctx.r3.u32);
+  }
+}
+
+// Cycle C3 (M1 follow-up): where does the non-SC CareerSetup load drop out?
+// C2 evidence: C1-SPAWNER fires 3x (Boot + both CareerSetup paths) but
+// C2-SCRIPTREG shows exactly ONE sub_825578C8 insertion (lr inside
+// sub_82557A68+0x450, hash=445CE4A3). The loader chain per E2:
+//   sub_82727908 (shim) -> sub_82727668 (blob load) ->
+//     sub_82727DA8 (intrusive list insert) -> sub_82728010 (bytecode hook /
+//     bytecode base setup) -> sub_82557A68 (scrThread registration) ->
+//     sub_825578C8 (script map insert).
+// Owner checks (cycle start): all four are generated-map-only (1 site each),
+// so these are the single owners. All log-only, ERROR, capped.
+PPC_FUNC_IMPL(__imp__sub_82727668);
+PPC_FUNC(sub_82727668) {
+  static std::atomic<uint32_t> s_load{0};
+  const uint32_t n = s_load.fetch_add(1) + 1;
+  auto &mem = mcla::native::GetActiveGuestMemoryView();
+  const uint32_t pathPtr = ctx.r4.u32;  // shim routes caller r3 -> callee r4
+  char pathBuf[65] = {};
+  if (pathPtr != 0) {
+    X901ReadGuestCStr(mem, pathPtr, pathBuf, sizeof(pathBuf));
+  }
+  if (n <= 16 || (n % 64) == 0) {
+    MCLA_LOG_ERROR("C3-LOADER #{} pathPtr={:08X} path='{}' r5={:08X} "
+                   "r6={:08X} r7={:08X} r8={:08X} lr={:08X}",
+                   n, pathPtr, pathBuf, ctx.r5.u32, ctx.r6.u32, ctx.r7.u32,
+                   ctx.r8.u32,
+                   static_cast<uint32_t>(g_ppcContext ? g_ppcContext->lr : 0));
+  }
+  __imp__sub_82727668(ctx, base);
+  if (n <= 16 || (n % 64) == 0) {
+    MCLA_LOG_ERROR("C3-LOADER-RET #{} ret={:08X}", n, ctx.r3.u32);
+  }
+}
+
+PPC_FUNC_IMPL(__imp__sub_82728010);
+PPC_FUNC(sub_82728010) {
+  static std::atomic<uint32_t> s_bchook{0};
+  const uint32_t n = s_bchook.fetch_add(1) + 1;
+  if (n <= 16 || (n % 64) == 0) {
+    MCLA_LOG_ERROR("C3-BCHOOK #{} r3={:08X} r4={:08X} r5={:08X} lr={:08X}",
+                   n, ctx.r3.u32, ctx.r4.u32, ctx.r5.u32,
+                   static_cast<uint32_t>(g_ppcContext ? g_ppcContext->lr : 0));
+  }
+  __imp__sub_82728010(ctx, base);
+  if (n <= 16 || (n % 64) == 0) {
+    MCLA_LOG_ERROR("C3-BCHOOK-RET #{} ret={:08X}", n, ctx.r3.u32);
+  }
+}
+
+PPC_FUNC_IMPL(__imp__sub_82557A68);
+PPC_FUNC(sub_82557A68) {
+  static std::atomic<uint32_t> s_reg57{0};
+  const uint32_t n = s_reg57.fetch_add(1) + 1;
+  if (n <= 16 || (n % 64) == 0) {
+    auto &mem = mcla::native::GetActiveGuestMemoryView();
+    // C5 (M1 follow-up): dump the lookup-name buffers so each call shows
+    // WHICH name the registrar compared (the member strings for Boot/
+    // non-SC/_SC), plus the [0x82811130] indirect-dispatch function pointer
+    // read inside sub_82557F10. Read-only, checked view, capped.
+    char name3[49] = {}, name4[49] = {};
+    uint32_t fnptr = 0;
+    if (ctx.r3.u32 != 0 && ctx.r3.u32 != 0xCDCDCDCDu)
+      X901ReadGuestCStr(mem, ctx.r3.u32, name3, sizeof(name3));
+    if (ctx.r4.u32 != 0 && ctx.r4.u32 != 0xCDCDCDCDu)
+      X901ReadGuestCStr(mem, ctx.r4.u32, name4, sizeof(name4));
+    (void)mem.ReadU32BE(0x82811130u, &fnptr);
+    MCLA_LOG_ERROR("C5-REG57NAME #{} r3={:08X} name3='{}' r4={:08X} "
+                   "name4='{}' r5={:08X} fnptr82811130={:08X} lr={:08X}",
+                   n, ctx.r3.u32, name3, ctx.r4.u32, name4, ctx.r5.u32, fnptr,
+                   static_cast<uint32_t>(g_ppcContext ? g_ppcContext->lr : 0));
+  }
+  if (n <= 16 || (n % 64) == 0) {
+    MCLA_LOG_ERROR("C3-REG57 #{} r3={:08X} r4={:08X} r5={:08X} lr={:08X}",
+                   n, ctx.r3.u32, ctx.r4.u32, ctx.r5.u32,
+                   static_cast<uint32_t>(g_ppcContext ? g_ppcContext->lr : 0));
+  }
+  __imp__sub_82557A68(ctx, base);
+  if (n <= 16 || (n % 64) == 0) {
+    MCLA_LOG_ERROR("C3-REG57-RET #{} ret={:08X}", n, ctx.r3.u32);
+  }
+}
+
+// C5 (M1 follow-up): the blob loader inside sub_82727668. Log the RESOLVED
+// path argument and the return value so each of Boot / CareerSetup /
+// CareerSetup_SC shows whether its member was even found and what the
+// loader itself did (r3=out buffer, r4=path string, r5=limit).
+// Owner check: generated-map-only (1 site), single owner.
+PPC_FUNC_IMPL(__imp__sub_823DB670);
+PPC_FUNC(sub_823DB670) {
+  static std::atomic<uint32_t> s_blob{0};
+  const uint32_t n = s_blob.fetch_add(1) + 1;
+  auto &mem = mcla::native::GetActiveGuestMemoryView();
+  const uint32_t pathPtr = ctx.r4.u32;
+  char pathBuf[65] = {};
+  if (pathPtr != 0 && pathPtr != 0xCDCDCDCDu)
+    X901ReadGuestCStr(mem, pathPtr, pathBuf, sizeof(pathBuf));
+  if (n <= 16 || (n % 64) == 0) {
+    MCLA_LOG_ERROR("C5-BLOB #{} pathPtr={:08X} path='{}' r3={:08X} "
+                   "r5={:08X} lr={:08X}",
+                   n, pathPtr, pathBuf, ctx.r3.u32, ctx.r5.u32,
+                   static_cast<uint32_t>(g_ppcContext ? g_ppcContext->lr : 0));
+  }
+  __imp__sub_823DB670(ctx, base);
+  if (n <= 16 || (n % 64) == 0) {
+    MCLA_LOG_ERROR("C5-BLOB-RET #{} ret={:08X}", n, ctx.r3.u32);
+  }
+}
+
+PPC_FUNC_IMPL(__imp__sub_82727DA8);
+PPC_FUNC(sub_82727DA8) {
+  static std::atomic<uint32_t> s_listins{0};
+  const uint32_t n = s_listins.fetch_add(1) + 1;
+  if (n <= 16 || (n % 64) == 0) {
+    MCLA_LOG_ERROR("C3-LISTINS #{} r3={:08X} r4={:08X} lr={:08X}",
+                   n, ctx.r3.u32, ctx.r4.u32,
+                   static_cast<uint32_t>(g_ppcContext ? g_ppcContext->lr : 0));
+  }
+  __imp__sub_82727DA8(ctx, base);
+  if (n <= 16 || (n % 64) == 0) {
+    MCLA_LOG_ERROR("C3-LISTINS-RET #{} ret={:08X}", n, ctx.r3.u32);
+  }
+}
+
+// Brief F-923: distinct script threads in hk_sub_82554E20. PREDICTION: a
+// second script (the one that calls LoadPlayer/LoadCity) never starts or is
+// parked. Track distinct `self`; print each new self + name candidate.
+static std::atomic<uint32_t> s_scriptCount{0};
+static uint32_t s_scriptSelves[64] = {};
+static uint32_t s_scriptSeen = 0;
+static void X902TrackScript(uint32_t self, uint32_t f8k, uint32_t bcB) {
+  if (self == 0 || s_scriptSeen >= 64u) return;
+  for (uint32_t i = 0u; i < s_scriptSeen; ++i)
+    if (s_scriptSelves[i] == self) return;
+  s_scriptSelves[s_scriptSeen++] = self;
+  const uint32_t total = s_scriptCount.fetch_add(1) + 1;
+  // Name candidate: first printable ASCII run near the bytecode base.
+  char nameCand[64] = {};
+  if (bcB != 0) {
+    auto &mem = mcla::native::GetActiveGuestMemoryView();
+    uint8_t buf[320];
+    uint32_t got = 0;
+    for (uint32_t i = 0u; i < 320u; ++i) {
+      uint8_t b = 0;
+      if (!mem.ReadU8(bcB + (i < 96u ? i : (i - 96u) + 192u), &b)) break;
+      buf[got++] = b;
+      if (got >= 320u) break;
+    }
+    uint32_t bestS = 0, bestL = 0;
+    for (uint32_t i = 0u; i < got;) {
+      const uint8_t c = buf[i];
+      if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+          (c >= '0' && c <= '9') || c == '_') {
+        uint32_t j = i;
+        while (j < got && ((buf[j] >= 'A' && buf[j] <= 'Z') ||
+                (buf[j] >= 'a' && buf[j] <= 'z') ||
+                (buf[j] >= '0' && buf[j] <= '9') || buf[j] == '_'))
+          ++j;
+        if (j - i > bestL && j - i >= 5u) { bestS = i; bestL = j - i; }
+        i = j;
+      } else {
+        ++i;
+      }
+    }
+    if (bestL > 0) {
+      const uint32_t n = bestL < 63u ? bestL : 63u;
+      for (uint32_t i = 0u; i < n; ++i) nameCand[i] = (char)buf[bestS + i];
+      nameCand[n] = '\0';
+    }
+  }
+  MCLA_LOG_ERROR("X902-SCRIPT #{}/distinct={} self={:08X} key={:08X} "
+                 "bc={:08X} nameCand='{}'",
+                 total, s_scriptSeen, self, f8k, bcB, nameCand);
+}
+
+// X901-H1: does the UI state-machine bootstrap sub_821F9380 actually run?
+PPC_FUNC(sub_821F9380) {
+  static std::atomic<uint32_t> s_calls{0};
+  const uint32_t n = s_calls.fetch_add(1) + 1;
+  const uint32_t lrEntry =
+      static_cast<uint32_t>(g_ppcContext ? g_ppcContext->lr : 0);
+  const uint32_t self = ctx.r3.u32;
+  auto &mem = mcla::native::GetActiveGuestMemoryView();
+  uint32_t uiMgr = 0;
+  // C2 fix (E3 raw-byte verified): the global is [0x8286D804], not
+  // [0x8287D804] -- sub_821FBAA8 does lis(-32121)=0x82870000 then
+  // lwz -10236 -> 0x82870000 - 10236 = 0x8286D804. The old literal was
+  // the signed D-offset -10236 (0xD804) unsignedified as +55300; every
+  // X901-H1 reading at 0x8287D804 was a wrong-VA read and is void.
+  (void)mem.ReadU32BE(0x8286D804, &uiMgr);  // the global sub_821FBAA8 passes in
+  uint32_t f52 = 0;
+  if (self != 0)
+    (void)mem.ReadU32BE(self + 52, &f52);
+
+  // Row #1 is unconditional (a zero is not a result until the instrument is
+  // shown firing -- LONG_TODO_MASTER §1 rule 19); then <=8, then every 64.
+  if (n <= 8 || (n % 64) == 0) {
+    MCLA_LOG_WARN("X901-H1-BOOTSTRAP #{} self={:08X} [8286D804]={:08X} "
+                  "self+52={:08X} lr={:08X}",
+                  n, self, uiMgr, f52, lrEntry);
+  }
+
+  __imp__sub_821F9380(ctx, base);
+
+  const uint32_t ret = ctx.r3.u32;  if (n <= 8 || (n % 64) == 0) {
+    uint32_t f52After = 0;
+    if (self != 0)
+      (void)mem.ReadU32BE(self + 52, &f52After);
+    MCLA_LOG_WARN("X901-H1-RET #{} ret={:08X} low={} self+52={:08X} ({})", n,
+                  ret, ret & 0xFFu, f52After,
+                  f52After == 0 ? "ZEROED" : "KEPT");
+  }
+}
+
+// X902-CTL: rule-19 positive control. sub_825578B8 = lookup of `key` in the
+// 0x82811134 map; it has 7 direct-`bl` callers, one of them inside
+// sub_82554E20 (which ticks every 4 s). A row here proves the compile-time
+// override is armed for a direct-`bl` target, which is what turns the zeros on
+// 0x821F9380/0x82693E10 into measurements.
+PPC_FUNC(sub_825578B8) {
+  static std::atomic<uint32_t> s_calls{0};
+  const uint32_t n = s_calls.fetch_add(1) + 1;
+  const uint32_t key = ctx.r4.u32;  // 0x825578BC: mr r4,r3 (the caller's arg)
+  const uint32_t lrEntry =
+      static_cast<uint32_t>(g_ppcContext ? g_ppcContext->lr : 0);
+
+  __imp__sub_825578B8(ctx, base);
+
+  const uint32_t ret = ctx.r3.u32;
+  if (n <= 16 || (n % 64) == 0) {
+    auto &mem = mcla::native::GetActiveGuestMemoryView();
+    uint32_t vt = 0, w4 = 0, w8 = 0;
+    if (ret != 0) {
+      (void)mem.ReadU32BE(ret + 0, &vt);
+      (void)mem.ReadU32BE(ret + 4, &w4);
+      (void)mem.ReadU32BE(ret + 8, &w8);
+    }
+    MCLA_LOG_WARN("X902-CTL-LOOKUP #{} key={:08X} ret={:08X} vt={:08X} "
+                  "+4={:08X} +8={:08X} lr={:08X}{}",
+                  n, key, ret, vt, w4, w8, lrEntry,
+                  (ret == 0) ? " <== MAP MISS (null -> 0x82554E70 derefs it)"
+                             : "");
+  }
+}
+
+// X902-H1C: the bootstrap's ONLY static predecessor. 0x821FBAA8 loads its
+// `this` from [0x8286D804] and tail-calls sub_821F9380 with it (C2: VA
+// corrected from 0x8287D804; E3 raw-byte verified, see H1 hook above).
+PPC_FUNC(sub_821FBAA8) {
+  static std::atomic<uint32_t> s_calls{0};
+  const uint32_t n = s_calls.fetch_add(1) + 1;
+  const uint32_t lrEntry =
+      static_cast<uint32_t>(g_ppcContext ? g_ppcContext->lr : 0);
+  auto &mem = mcla::native::GetActiveGuestMemoryView();
+  uint32_t uiMgr = 0;
+  (void)mem.ReadU32BE(0x8286D804, &uiMgr);
+  if (n <= 8 || (n % 64) == 0) {
+    MCLA_LOG_WARN("X902-H1C-CALLER #{} [8286D804]={:08X} lr={:08X}", n, uiMgr,
+                  lrEntry);
+  }
+  __imp__sub_821FBAA8(ctx, base);
+}
+
+// X901-H2: is sub_82693E10(obj+4, "HSM.sc") called, and what does it return?
+PPC_FUNC(sub_82693E10) {
+  static std::atomic<uint32_t> s_calls{0};
+  const uint32_t n = s_calls.fetch_add(1) + 1;
+  const uint32_t lrEntry =
+      static_cast<uint32_t>(g_ppcContext ? g_ppcContext->lr : 0);
+  const uint32_t obj = ctx.r3.u32;
+  const uint32_t namep = ctx.r4.u32;
+  auto &mem = mcla::native::GetActiveGuestMemoryView();
+  char name[65];
+  name[0] = '\0';
+  X901ReadGuestCStr(mem, namep, name, sizeof(name));
+
+  if (n <= 8 || (n % 64) == 0) {
+    MCLA_LOG_WARN("X901-H2-CALL #{} obj={:08X} namePtr={:08X} name='{}' "
+                  "lr={:08X}",
+                  n, obj, namep, name, lrEntry);
+  }
+
+  __imp__sub_82693E10(ctx, base);
+
+  const uint32_t ret = ctx.r3.u32;
+  if (n <= 8 || (n % 64) == 0) {
+    uint32_t p0 = 0, p4 = 0, p76 = 0;
+    if (obj != 0) {
+      (void)mem.ReadU32BE(obj + 0, &p0);
+      (void)mem.ReadU32BE(obj + 4, &p4);
+      (void)mem.ReadU32BE(obj + 76, &p76);  // the 20,000-byte script-VM block
+    }
+    MCLA_LOG_WARN("X901-H2-RET #{} name='{}' ret={:08X} low={} obj0={:08X} "
+                  "obj4={:08X} obj76={:08X}",
+                  n, name, ret, ret & 0xFFu, p0, p4, p76);
+  }
 }
 
 // SESSION 36: PPC_FUNC_IMPL(hk_sub_821C29A0) removed - dead code with a
@@ -894,8 +1822,28 @@ PPC_FUNC_IMPL(hk_sub_822A3998) {
 }
 
 PPC_FUNC_IMPL(hk_sub_82554590) {
-  // Placeholder
-  MCLA_LOG_INFO("hk_sub_82554590 called");
+  // Brief F-923 Task 4: entry census. Chained to the original (was a
+  // log-only body); still exactly one owner for this VA.
+  static std::atomic<uint32_t> s_e54590{0};
+  const uint32_t n = s_e54590.fetch_add(1) + 1;
+  if (n <= 16 || (n % 500) == 0) {
+    MCLA_LOG_ERROR("X902-ENTRY54590 #{} lr={:08X} r3={:08X} r4={:08X}",
+                   n, static_cast<uint32_t>(ctx.lr), ctx.r3.u32, ctx.r4.u32);
+  }
+  __imp__sub_82554590(ctx, base);
+}
+
+// Brief F-923 Task 4: the screen-object publisher. addr_owners --check
+// 0x82554800 exits 0 (only the generated map claims it), so this override is
+// the single owner. Entry census only; chains to the original.
+PPC_FUNC(sub_82554800) {
+  static std::atomic<uint32_t> s_e54800{0};
+  const uint32_t n = s_e54800.fetch_add(1) + 1;
+  if (n <= 16 || (n % 500) == 0) {
+    MCLA_LOG_ERROR("X902-ENTRY54800 #{} lr={:08X} r3={:08X} r4={:08X}",
+                   n, static_cast<uint32_t>(ctx.lr), ctx.r3.u32, ctx.r4.u32);
+  }
+  __imp__sub_82554800(ctx, base);
 }
 
 // Press Start handler shim, dispatched by the bytecode interpreter's

@@ -318,19 +318,21 @@ uint32_t CaptureTextureDescriptors(const uint32_t* fetchWindow,
             break;
         }
 
-        // DrawPacket::textureDescriptors[i] is 32 bits, so it cannot hold the
-        // 24-byte descriptor. Per renderer/texture_decode.cpp:1154-1156 and
-        // d3d12_backend.h:216-221 the backend consumes a 24-BYTE SNAPSHOT handed
-        // over by the producer, and textureDescriptors[i] is documented as that
-        // snapshot's guest address. There is no guest-addressable copy of a
-        // register-file slot on this hardware, so there is nothing honest to
-        // store here yet: a fabricated address would bind the wrong texture,
-        // which renders a wrong image with no error anywhere.
-        //
-        // The slot's decode is therefore deliberately NOT performed from guessed
-        // bytes. What IS recorded is the count, because "the window had N kTexture
-        // slots" is the fact that tells the next stream whether the register file
-        // is worth plumbing at all.
+        // Snapshot the 6 register dwords (24 bytes) into the packet so the render
+        // thread can decode and bind the texture. The fetch slot IS the descriptor.
+        for (uint32_t w = 0; w < kFetchSlotDwords; ++w) {
+            const uint32_t dw = d[w];
+            packet.textureDescriptorBytes[found][w * 4 + 0] =
+                static_cast<uint8_t>((dw >> 24) & 0xFFu);
+            packet.textureDescriptorBytes[found][w * 4 + 1] =
+                static_cast<uint8_t>((dw >> 16) & 0xFFu);
+            packet.textureDescriptorBytes[found][w * 4 + 2] =
+                static_cast<uint8_t>((dw >> 8) & 0xFFu);
+            packet.textureDescriptorBytes[found][w * 4 + 3] =
+                static_cast<uint8_t>(dw & 0xFFu);
+        }
+        // base_address is dword_1 bits 12:20 << 12 (registers.h:736-752).
+        packet.texturePoolVa[found] = d[1] & 0xFFFFF000u;
         ++found;
     }
 
@@ -351,7 +353,7 @@ uint32_t CaptureTextureDescriptors(const uint32_t* fetchWindow,
         }
     }
 
-    packet.textureCount = 0;  // no snapshot address is derivable yet; see above
+    packet.textureCount = found;
     return packet.textureCount;
 }
 

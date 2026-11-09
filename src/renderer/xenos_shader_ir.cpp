@@ -611,7 +611,10 @@ static void DerivePixelInterpolatorsFromInstructionStream(ShaderProgram& out) {
             const bool srcSel[3] = {d.src1Select, d.src2Select, d.src3Select};
             for (int i = 0; i < 3; ++i) {
                 if (!srcSel[i]) continue;                 // c-register, not a GPR
-                if ((srcReg[i] & 0x80) != 0) continue;    // immediate, not a GPR
+                // bit 7 is the abs flag (is_src_temp_value_absolute), NOT an
+                // immediate marker: when srcNSelect==1 the operand is always a
+                // temp register (ucode.h:1884-1892). Only bit 6 (relative) widens
+                // the prefix via dynamic addressing. (F-647-era misclassification.)
                 if ((srcReg[i] & 0x40) != 0) {            // kLoopRelative
                     boundUnknown = true;
                     continue;
@@ -648,10 +651,25 @@ static void DerivePixelInterpolatorsFromInstructionStream(ShaderProgram& out) {
         // A vertex fetch cannot appear in a pixel program; skipping it keeps
         // this pass from reading a field that means nothing for this stage.
         if (d.kind == InstructionKind::VertexFetch) continue;
+        // Texture fetch: raise the bound from the SOURCE register (the texture
+        // coordinate), which the reference processes via GatherOperandInformation
+        // (shader_translator.cc:402, :452). A fetch that reads rN and writes rN
+        // needs rN seeded with an interpolant before the sample overwrites it.
+        if (d.srcRelative) {
+            boundUnknown = true;
+        } else if (d.srcRegister < kGuestRegisterCount) {
+            bound = std::max(bound, d.srcRegister + 1u);
+        }
         if (!FetchWritesRegister(d)) continue;
         if (d.dstRelative) boundUnknown = true;
         else if (d.dstRegister < kGuestRegisterCount) {
-            written.insert(d.dstRegister);
+            // Only count the destination as "written" when it is a different
+            // register from the source. When src==dst the fetch reads the old
+            // value (coordinate) first and overwrites it with the sample result,
+            // so the register must remain eligible for interpolant seeding.
+            if (d.srcRelative || d.srcRegister != d.dstRegister) {
+                written.insert(d.dstRegister);
+            }
             bound = std::max(bound, d.dstRegister + 1u);
         }
     }
@@ -703,8 +721,29 @@ static void DerivePixelInterpolatorsFromInstructionStream(ShaderProgram& out) {
     const uint32_t limit = std::min(interpolatorCount, kVsExportInterpolantLast + 1u);
 
     for (const IrInstruction* ir : order) {
-        if (ir->isFetch) continue;
         const DecodedInstruction& d = ir->decoded;
+        // Texture fetch source register (texture coordinate) is also a READ
+        // that may need an interpolant seed. The reference processes fetch
+        // operands via GatherOperandInformation (shader_translator.cc:402, :452).
+        if (ir->isFetch && d.kind == InstructionKind::TextureFetch) {
+            if (d.srcRelative) continue;
+            const uint32_t r = d.srcRegister & 0x3F;
+            if (r >= limit) continue;
+            if (written.count(r) != 0) continue;
+            if (out.interpolators.size() >= kMaxDerivedInputs) break;
+            bool dup = false;
+            for (const auto& in : out.interpolators)
+                if (in.reg == r) { dup = true; break; }
+            if (dup) continue;
+            VertexInput vi;
+            vi.address    = 0;
+            vi.usage      = uint16_t(kUsageTexCoord);
+            vi.usageIndex = uint16_t(r);
+            vi.reg        = uint16_t(r);
+            out.interpolators.push_back(vi);
+            continue;
+        }
+        if (ir->isFetch) continue;
         if (d.kind != InstructionKind::Alu) continue;
         const uint32_t srcs[3] = {d.src1Register, d.src2Register, d.src3Register};
         const bool sels[3] = {d.src1Select, d.src2Select, d.src3Select};
@@ -986,16 +1025,59 @@ uint64_t ComputeShaderProgramHash(const ShaderProgram& prog) {
         HashBE32(h, ir.address);
         HashVal(h, ir.isFetch);
         HashVal(h, ir.decoded.kind);
-        // Fingerprint the fetch-side operand fields only. DecodeInstruction
-        // fills dstRegister/srcRegister/constIndex/fetchOpcode for fetch
-        // instructions and leaves them at their defaults for ALU ones, so an
-        // ALU instruction contributes kind/isFetch/address/unknown but not
-        // its vector/scalar opcodes, destinations, masks or sources.
         HashBE32(h, ir.decoded.fetchOpcode);
         HashBE32(h, ir.decoded.dstRegister);
         HashBE32(h, ir.decoded.srcRegister);
         HashBE32(h, ir.decoded.constIndex);
         HashVal(h, ir.decoded.unknown);
+        // F-XXX (2026-10-27): the ALU body is now IN the hash. It previously
+        // contributed kind/isFetch/address/unknown only -- its own comment said
+        // so -- which meant two programs with identical header geometry but
+        // different ALU words produced identical programHash, identical
+        // PipelineKey, and the PSO cache served one program's compiled shader
+        // to the other draw, silently. Every decoded field that reaches the
+        // generated HLSL is hashed: opcodes, destinations, write masks,
+        // saturate/export, the three sources (register, swizzle, select,
+        // negate), the abs/const-relative bits and the predicate.
+        const DecodedInstruction& d = ir.decoded;
+        HashVal(h, d.vectorOpcode);
+        HashVal(h, d.scalarOpcode);
+        HashBE32(h, d.vectorDest);
+        HashBE32(h, d.scalarDest);
+        HashVal(h, d.vectorDestRelative);
+        HashVal(h, d.scalarDestRelative);
+        HashBE32(h, d.vectorWriteMask);
+        HashBE32(h, d.scalarWriteMask);
+        HashVal(h, d.vectorSaturate);
+        HashVal(h, d.scalarSaturate);
+        HashVal(h, d.exportData);
+        HashBE32(h, d.src1Register);
+        HashBE32(h, d.src2Register);
+        HashBE32(h, d.src3Register);
+        HashBE32(h, d.src1Swizzle);
+        HashBE32(h, d.src2Swizzle);
+        HashBE32(h, d.src3Swizzle);
+        HashVal(h, d.src1Select);
+        HashVal(h, d.src2Select);
+        HashVal(h, d.src3Select);
+        HashVal(h, d.src1Negate);
+        HashVal(h, d.src2Negate);
+        HashVal(h, d.src3Negate);
+        HashVal(h, d.absConstants);
+        HashVal(h, d.const0Relative);
+        HashVal(h, d.const1Relative);
+        HashVal(h, d.constAddressRegisterRelative);
+        HashVal(h, d.isPredicated);
+        HashVal(h, d.predicateCondition);
+        // Fetch-shape fields the HLSL also depends on: the fetch destination
+        // swizzle (zero/one fills), the source swizzle, the tfetch dimension
+        // (resource selection) and the vfetch format/stride/offset triple.
+        HashBE32(h, d.dstSwizzle);
+        HashBE32(h, d.srcSwizzle);
+        HashBE32(h, d.dimension);
+        HashBE32(h, d.vertexFormat);
+        HashBE32(h, d.stride);
+        HashBE32(h, static_cast<uint32_t>(d.offset));
     }
 
     return h;

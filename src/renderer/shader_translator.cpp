@@ -1,5 +1,7 @@
 #include "shader_translator.h"
 
+#include "precompiled_shaders.h"
+
 // Phase 5: per-opcode Xenos microcode -> HLSL lowering.
 //
 // Consumes the normalized IR produced by xenos_shader_ir (DecodedInstruction
@@ -36,6 +38,7 @@
 #include <atomic>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <set>
 #include <string>
@@ -129,11 +132,43 @@ std::vector<VertexInputRef> ReferencedVertexInputs(const ShaderProgram& prog) {
     // been seen in that same order can donate its stride; a mini ahead of its
     // full fetch keeps 0 rather than borrowing a later one.
     uint32_t previousFullStride = 0;
+    uint32_t fallbackOrdinal = 0;
+    static const uint32_t kFallbackUsage[] = {
+        0u,  // POSITION (0, 0)
+        3u,  // NORMAL (3, 0)
+        6u,  // TANGENT (6, 0)
+        5u,  // TEXCOORD (5, 0)
+        5u,  // TEXCOORD (5, 1)
+        10u, // COLOR (10, 0)
+        1u,  // BLENDWEIGHT (1, 0)
+        2u,  // BLENDINDICES (2, 0)
+    };
+    static const uint32_t kFallbackUsageIndex[] = {
+        0u,  // POSITION0
+        0u,  // NORMAL0
+        0u,  // TANGENT0
+        0u,  // TEXCOORD0
+        1u,  // TEXCOORD1
+        0u,  // COLOR0
+        0u,  // BLENDWEIGHT0
+        0u,  // BLENDINDICES0
+    };
     for (const auto& ir : prog.instructions) {
         if (!ir.isFetch || ir.decoded.kind != InstructionKind::VertexFetch)
             continue;
         uint32_t usage = 0, usageIndex = 0;
-        resolve(ir.address, usage, usageIndex);
+        if (!prog.vertexElements.empty()) {
+            resolve(ir.address, usage, usageIndex);
+        } else {
+            if (fallbackOrdinal < 8) {
+                usage = kFallbackUsage[fallbackOrdinal];
+                usageIndex = kFallbackUsageIndex[fallbackOrdinal];
+            } else {
+                usage = 5u; // TEXCOORD
+                usageIndex = fallbackOrdinal - 6;
+            }
+            ++fallbackOrdinal;
+        }
         if (usage >= 14) usage = 0;
         bool seen = false;
         for (const auto& in : inputs)
@@ -229,15 +264,13 @@ constexpr uint32_t kRegisterCount = 32;
 // trail. The guest facts above are cited to w706.log rows, which are this tree's
 // own output.
 //
-// WHAT IS NOT HERE, AND WHY. The GATE (whether a given draw has clip_disable set
-// and the vport enables clear) lives in pipeline_cache.cpp, which decodes
-// PA_CL_CLIP_CNTL / PA_CL_VTE_CNTL into DecodedXenosRenderState and is not this
-// file's to change; per-draw gating therefore needs a cooperation that does not
-// exist yet. Until it does, the rescale is applied to every vertex shader and
-// the log says so (kClipDisableRescaleAlwaysNote). The EXTENT, by contrast, is
-// not guessed: SetClipDisableViewportExtent is called from the backend at the
-// point it sets the D3D12 viewport, from the same m_width/m_height the viewport
-// uses, so the two cannot disagree.
+// The per-draw gate is decoded alongside the pipeline state and passed explicitly.
+// The guest-state condition is clip_disable set with all six VTE viewport enables clear.
+// The registers vary by draw, so a title-wide assumption is invalid.
+// This request comes from the same snapshot used for pipeline-state derivation.
+// The rescale is emitted only for draws whose decoded registers require it.
+// The extent comes from SetClipDisableViewportExtent and the same target
+// dimensions used to set the D3D12 viewport.
 struct ClipDisableRescale {
     float scaleX = 0.0f, scaleY = 0.0f, scaleZ = 1.0f;
     float offsetX = 0.0f, offsetY = 0.0f, offsetZ = 0.0f;
@@ -748,8 +781,11 @@ void LogUnwrittenRegisterReads(const ShaderProgram& prog, bool ps,
 class HlslGenerator {
 public:
     HlslGenerator(const ShaderProgram& prog, std::string& out,
-                  uint64_t& unsupported)
-        : prog_(prog), out_(out), unsupported_(unsupported) {
+                  uint64_t& unsupported, bool applyClipDisableRescale)
+        : prog_(prog),
+          out_(out),
+          unsupported_(unsupported),
+          applyClipDisableRescale_(applyClipDisableRescale) {
         for (const auto& c : prog_.constants) {
             if (c.info.registerSet == RegisterSet::Sampler)
                 samplerConstants_.emplace(c.info.registerIndex, &c);
@@ -797,6 +833,9 @@ public:
             AppendBody(ps);          // writes into the caller's (now empty) buffer
             body.swap(out_);         // cache the generated body
             out_.swap(scratch);      // restore caller's buffer to empty
+            // The pixel-shader multiply of the sampled texture by iTexCoord1
+            // (r0 * r1) is guest-intended: the intro fades via per-vertex
+            // alpha in the vertex colour. Do not strip it.
         }
 
         // Pin the VS entry signature to the authoritative input layout BEFORE
@@ -847,11 +886,10 @@ private:
     const ShaderProgram& prog_;
     std::string& out_;
     uint64_t& unsupported_;
-    // True until AppendEpilogue withholds the rescale. Initialised TRUE, not
-    // false: a pixel program writes no position, so nothing is ever withheld
-    // and the flag must not read as "something was missing" for a stage the
-    // transform does not apply to.
+    // True until a vertex epilogue omits the rescale. Pixel programs keep true
+    // because they have no position epilogue to transform.
     bool clipRescaleBaked_ = true;
+    bool applyClipDisableRescale_ = false;
     // Set by AppendEpilogue. Both are TEXT/classification, never numbers: see the
     // oPosShape() comment above and AppendEpilogue's own block.
     std::string oPosShape_;
@@ -957,6 +995,24 @@ private:
                     return false;
             }
         }
+        // F-900: log the PINNED inputs (post exact/fallback rewrite). This is
+        // the semantic set the VS signature is emitted from -- if the pin
+        // silently re-indexed an input (unique-usage fallback), the HLSL
+        // signature still prints the pinned pair, so a layout-vs-shader
+        // mismatch would show here as missing/duplicated entries, not in the
+        // dump. Throttled: translations repeat per draw.
+        {
+            static std::atomic<uint32_t> s_pinDiag{0};
+            const uint32_t pd = s_pinDiag.fetch_add(1, std::memory_order_relaxed) + 1;
+            if (pd <= 4) {
+                std::string txt;
+                for (const auto& in : vsInputs_) {
+                    txt += std::string(VertexUsageSemanticName(in.usage)) +
+                           std::to_string(in.usageIndex) + " ";
+                }
+                MCLA_LOG_INFO("VS-PIN #{} inputs={} [{}]", pd, vsInputs_.size(), txt.c_str());
+            }
+        }
         return true;
     }
 
@@ -1022,7 +1078,14 @@ private:
     }
 
     // Build an operand string for `kind`, following the reference op().
-    std::string EmitOperand(const DecodedInstruction& instr, OperandKind kind) {
+    // `forceMask` (when non-zero) overrides the per-kind component mask so a
+    // caller can ask for a SINGLE slot component (bit i set = slot i). Without
+    // it the per-opcode/write-mask swizzle is emitted as before. Callers must
+    // NEVER append ".x"/".w" style suffixes to EmitOperand's result: the
+    // returned operand is already fully swizzled, and a second suffix produces
+    // `rN.xyzw.w` -- HLSL DXC rejects.
+    std::string EmitOperand(const DecodedInstruction& instr, OperandKind kind,
+                            uint32_t forceMask = 0) {
         uint32_t reg = 0;
         uint32_t swizzle = 0;
         bool select = true;
@@ -1147,6 +1210,9 @@ private:
         case OperandKind::Vector1:
         case OperandKind::Vector2: {
             uint32_t mask;
+            if (forceMask != 0) {
+                mask = forceMask;
+            } else
             switch (instr.vectorOpcode) {
             case AluVectorOpcode::Dp2Add:
                 mask = (kind == OperandKind::Vector2) ? 0b1 : 0b11;
@@ -1288,23 +1354,11 @@ private:
             out_ += "Texture3D   t3D  : register(t2);\n";
             out_ += "TextureCube tCube : register(t3);\n";
             out_ += "SamplerState s0 : register(s0);\n\n";
-            // A Texture2D tex_<slot> placeholder is declared per sampler slot
-            // tfetch uses, bound at register(t<slot>). The name is derived
-            // from the slot index only (the sampler-table lookup does not
-            // change it) and the emitted body never references these — the
-            // fetches sample the generic resources above.
-            for (uint32_t index : usedSamplers) {
-                auto it = samplerConstants_.find(index);
-                const char* dimName =
-                    samplerDim[index] == 3 ? "t3D"
-                    : samplerDim[index] == 2 ? "tCube"
-                    : samplerDim[index] == 1 ? "t2D"
-                                             : "t1D";
-                std::string texName = (it != samplerConstants_.end())
-                    ? "tex_" + std::to_string(index)
-                    : std::string("tex_") + std::to_string(index);
-                out_ += "Texture2D " + texName + " : register(t" + std::to_string(index) + ");\n";
-            }
+            // F-900: tex_<slot> placeholders REMOVED (were here). They declared
+            // a second Texture2D at the same register(tN) already bound above
+            // (t1D/t2D/t3D/tCube), always as Texture2D even for cube/3D/1D, while
+            // the emitted body never references tex_* (fetches sample the
+            // generic resources). Duplicate-register + wrong-type declarations.
         }
     }
 
@@ -1346,20 +1400,63 @@ private:
         out_ += "void main(\n";
         if (ps) {
             out_ += "    in float4 iPos : SV_Position,\n";
+            std::unordered_set<std::string> emittedInterpolators;
+            auto appendInterpolator = [&](const VertexInput& interp) {
+                const uint32_t usage = interp.usage >= 14 ? 0 : interp.usage;
+                const std::string semantic =
+                    std::string(VertexUsageSemanticName(usage)) +
+                    std::to_string(interp.usageIndex);
+                out_ += "    in float4 i" + std::string(kUsageVariables[usage]) +
+                        std::to_string(interp.usageIndex) + " : " + semantic +
+                        ",\n";
+                emittedInterpolators.insert(semantic);
+            };
+
+            if (pairing_ != nullptr && pairing_->vsKnown) {
+                for (uint32_t vd = 0; vd < 16; ++vd) {
+                    if ((pairing_->vsWritesInterpolators & (1u << vd)) == 0)
+                        continue;
+                    const std::string semantic =
+                        "TEXCOORD" + std::to_string(vd);
+                    if (emittedInterpolators.count(semantic) != 0) continue;
+
+                    auto interp = std::find_if(
+                        prog_.interpolators.begin(), prog_.interpolators.end(),
+                        [&](const VertexInput& candidate) {
+                            const uint32_t usage =
+                                candidate.usage >= 14 ? 0 : candidate.usage;
+                            return std::string(VertexUsageSemanticName(usage)) +
+                                       std::to_string(candidate.usageIndex) ==
+                                   semantic;
+                        });
+                    if (interp != prog_.interpolators.end()) {
+                        appendInterpolator(*interp);
+                    } else {
+                        out_ += "    in float4 iUnused" + semantic + " : " +
+                                semantic + ",\n";
+                        emittedInterpolators.insert(semantic);
+                    }
+                }
+            }
+
             for (const auto& interp : prog_.interpolators) {
                 if (interp.reg >= kRegisterCount || !referencedRegisters_[interp.reg])
                     continue;
-                const uint32_t usage = interp.usage >= 14 ? 0 : interp.usage;
-                out_ += "    in float4 i" + std::string(kUsageVariables[usage]) +
-                        std::to_string(interp.usageIndex) + " : " +
-                        VertexUsageSemanticName(usage) +
-                        std::to_string(interp.usageIndex) + ",\n";
+                if (pairing_ != nullptr && pairing_->vsKnown) {
+                    const uint32_t usage =
+                        interp.usage >= 14 ? 0 : interp.usage;
+                    const std::string semantic =
+                        std::string(VertexUsageSemanticName(usage)) +
+                        std::to_string(interp.usageIndex);
+                    if (emittedInterpolators.count(semantic) != 0) continue;
+                }
+                appendInterpolator(interp);
             }
             if (psExportRegs_.count(0)) out_ += "    out float4 oC0 : SV_Target0,\n";
             if (psExportRegs_.count(1)) out_ += "    out float4 oC1 : SV_Target1,\n";
             if (psExportRegs_.count(2)) out_ += "    out float4 oC2 : SV_Target2,\n";
             if (psExportRegs_.count(3)) out_ += "    out float4 oC3 : SV_Target3,\n";
-            if (psExportRegs_.count(61)) out_ += "    out float4 oDepth : SV_Depth,\n";
+            if (psExportRegs_.count(61)) out_ += "    out float oDepth : SV_Depth,\n";
         } else {
             for (const auto& in : vsInputs_) {
                 const uint32_t usage = in.usage >= 14 ? 0 : in.usage;
@@ -1384,6 +1481,18 @@ private:
     // ---- body -------------------------------------------------------------
 
     void AppendBody(bool ps) {
+        if (!ps) {
+            // Guarantee SV_Position is fully written on every code path. The
+            // guest's export write mask may omit components (notably w), and
+            // DXC rejects a VS whose SV_Position output is not definitely
+            // assigned on all paths ("Not all elements of output SV_Position
+            // were written", g920_err.log). Unwritten components default to the
+            // hardware's unwritten-GPR value for xyz (0.0) and to 1.0 for w,
+            // matching the measured guest convention (r1.w = 1.0f before the
+            // position export, shader_translator.cpp:1501). Components the guest
+            // DOES write override these defaults.
+            out_ += "    oPos = float4(0.0, 0.0, 0.0, 1.0);\n";
+        }
         for (const auto& ir : prog_.instructions) {
             if (ir.decoded.unknown) {
                 ++unsupported_;
@@ -1404,6 +1513,12 @@ private:
             // AppendSignature only declares an oC*/oDepth target that the
             // body actually wrote.
             out_ += "    // exports emitted inline\n";
+            return;
+        }
+        if (!applyClipDisableRescale_) {
+            clipRescaleBaked_ = false;
+            oPosShape_ = "clipSpacePosition";
+            out_ += "    // clip_disable rescale not requested (VS already outputs clip space)\n";
             return;
         }
         // ---- VS: guest-pixel -> host clip space (see ClipDisableRescale) -----
@@ -1662,9 +1777,15 @@ private:
         }
 
         // MaxA -> address register write.
+        // Reference: dxbc_shader_translator_alu.cc:612-624 -- a0 = round_ni(
+        // operand0.SelectFromSwizzled(3) + 0.5), clamped to [-256, 255]. The
+        // component comes from operand 0 at slot 3, so emit that ONE component
+        // (mask 0b1000) instead of appending ".w" to an already-swizzled
+        // operand (which produced `rN.xyzw.w`, HLSL DXC rejects).
         if (instr.vectorOpcode == AluVectorOpcode::MaxA) {
             out_ += "    a0 = (int)clamp(floor(" +
-                    EmitOperand(instr, OperandKind::Vector0) + ".w + 0.5), -256.0, 255.0);\n";
+                    EmitOperand(instr, OperandKind::Vector0, 0b1000) +
+                    " + 0.5), -256.0, 255.0);\n";
         }
 
         // Vector write.
@@ -1677,6 +1798,15 @@ private:
                 instr.exportData && !ps && instr.vectorDest == 63;
 
         if (vectorWriteMask != 0 && !suppressVsExport) {
+            // SV_Depth is a scalar in HLSL (must be float, not float4) and the
+            // guest depth register (61) carries only its X lane: the reference
+            // writes X to scalar oDepth with used_write_mask == 0b0001
+            // (.research/xenia/src/xenia/gpu/dxbc_shader_translator.cc:1591-1594).
+            // Declaring float4 oDepth made DXC reject the shader with
+            // "SV_Depth must be float" (measured: mcla_pe.bin container at
+            // offset 8206072, translator_probe (d)). So the depth export is a
+            // plain float, written from the computed vector's X lane only.
+            const bool isDepthExport = (exportReg == "oDepth");
             std::string dst;
             if (!exportReg.empty()) {
                 dst = exportReg;
@@ -1685,12 +1815,15 @@ private:
                 dst = RegName(instr.vectorDest);
                 NoteRegister(instr.vectorDest);
             }
-            dst += '.';
-            for (uint32_t i = 0; i < 4; i++) {
-                if ((vectorWriteMask >> i) & 0x1) dst += kSwizzle[i];
+            if (!isDepthExport) {
+                dst += '.';
+                for (uint32_t i = 0; i < 4; i++) {
+                    if ((vectorWriteMask >> i) & 0x1) dst += kSwizzle[i];
+                }
             }
 
             out_ += "    " + dst + " = ";
+            if (isDepthExport) out_ += "(";
             if (instr.vectorSaturate) out_ += "saturate(";
 
             switch (instr.vectorOpcode) {
@@ -1770,10 +1903,15 @@ private:
                 out_ += EmitOperand(instr, OperandKind::Vector0);
                 break;
             case AluVectorOpcode::Max4:
-                out_ += "max(max(" + EmitOperand(instr, OperandKind::Vector0) + ".x, " +
-                        EmitOperand(instr, OperandKind::Vector0) + ".y), max(" +
-                        EmitOperand(instr, OperandKind::Vector0) + ".z, " +
-                        EmitOperand(instr, OperandKind::Vector0) + ".w))";
+                // Reference: dxbc_shader_translator_alu.cc:355 -- max over the
+                // components of operand 0. Each component is its own
+                // single-slot operand (mask bit i = slot i); the old text
+                // appended ".x/.y/.z/.w" to the full-swizzled operand, giving
+                // `rN.xyzw.x` -- not tokenizable HLSL.
+                out_ += "max(max(" + EmitOperand(instr, OperandKind::Vector0, 0b0001) + ", " +
+                        EmitOperand(instr, OperandKind::Vector0, 0b0010) + "), max(" +
+                        EmitOperand(instr, OperandKind::Vector0, 0b0100) + ", " +
+                        EmitOperand(instr, OperandKind::Vector0, 0b1000) + "))";
                 break;
             case AluVectorOpcode::SetpEqPush:
             case AluVectorOpcode::SetpNePush:
@@ -1789,9 +1927,19 @@ private:
                 out_ += "0.0";
                 break;
             case AluVectorOpcode::Dst:
-                out_ += "float4(1.0, " + EmitOperand(instr, OperandKind::Vector1) +
-                        ".y, " + EmitOperand(instr, OperandKind::Vector0) + ".z, " +
-                        EmitOperand(instr, OperandKind::Vector1) + ".w)";
+                // Reference: dxbc_shader_translator_alu.cc:576-604 --
+                // result = (1.0,
+                //           op0.SelectFromSwizzled(1) * op1.SelectFromSwizzled(1),
+                //           op0.SelectFromSwizzled(2),
+                //           op1.SelectFromSwizzled(2)).
+                // The old emission was wrong twice over: it appended ".y/.z/.w"
+                // to already-swizzled operands (invalid HLSL) AND read the Y
+                // product from op1 alone (dropping the op0 factor) and the W
+                // from op1 slot 3 instead of slot 2.
+                out_ += "float4(1.0, " + EmitOperand(instr, OperandKind::Vector0, 0b0010) +
+                        " * " + EmitOperand(instr, OperandKind::Vector1, 0b0010) + ", " +
+                        EmitOperand(instr, OperandKind::Vector0, 0b0100) + ", " +
+                        EmitOperand(instr, OperandKind::Vector1, 0b0100) + ")";
                 break;
             default:
                 ++unsupported_;
@@ -1800,6 +1948,7 @@ private:
             }
 
             if (instr.vectorSaturate) out_ += ')';
+            if (isDepthExport) out_ += ").x";
             out_ += ";\n";
         }
 
@@ -1829,12 +1978,27 @@ private:
             uint32_t zeroMask =
                 instr.exportData ? (0b1111 & ~(instr.vectorWriteMask | instr.scalarWriteMask)) : 0;
             uint32_t oneMask = instr.vectorWriteMask & instr.scalarWriteMask;
+            const bool isDepthFill = (exportReg == "oDepth");
             for (uint32_t i = 0; i < 4; i++) {
                 uint32_t mask = 1u << i;
+                // oDepth is a scalar float: only lane 0 (X) exists. Lanes
+                // 1..3 have no depth meaning and must not be written.
+                if (isDepthFill && i != 0) continue;
                 if (zeroMask & mask) {
-                    out_ += std::string("    ") + exportReg + "." + kSwizzle[i] + " = 0.0;\n";
+                    // SV_Position.w must not be left at 0: a 0 in w makes the
+                    // rasteriser's perspective divide produce Inf/NaN and drops
+                    // the geometry, and the clip_disable rescale's offset term
+                    // (offset * oPos.w) vanishes. The measured guest convention
+                    // sets r1.w = 1.0 before the position export
+                    // (shader_translator.cpp:1501), so an unwritten w defaults to
+                    // 1.0 rather than the generic unwritten-channel 0.0. Other
+                    // channels keep 0.0 (unwritten GPR default).
+                    const char* fill = (exportReg == "oPos" && i == 3) ? "1.0" : "0.0";
+                    if (isDepthFill) out_ += std::string("    oDepth = ") + fill + ";\n";
+                    else out_ += std::string("    ") + exportReg + "." + kSwizzle[i] + " = " + fill + ";\n";
                 } else if (oneMask & mask) {
-                    out_ += std::string("    ") + exportReg + "." + kSwizzle[i] + " = 1.0;\n";
+                    if (isDepthFill) out_ += "    oDepth = 1.0;\n";
+                    else out_ += std::string("    ") + exportReg + "." + kSwizzle[i] + " = 1.0;\n";
                 }
             }
         }
@@ -2042,7 +2206,8 @@ private:
                     EmitOperand(instr, OperandKind::Scalar0) + "), -256.0, 255.0);\n";
         }
 
-        // Scalar write.
+        // Scalar write. oDepth is a scalar float, so a scalar write to the
+        // depth export is a plain assignment of the scalar value (the X lane).
         uint32_t scalarWriteMask = instr.scalarWriteMask;
         if (instr.exportData) scalarWriteMask &= ~instr.vectorWriteMask;
         if (scalarWriteMask != 0 && !suppressVsExport) {
@@ -2054,9 +2219,11 @@ private:
                 dst = RegName(instr.scalarDest);
                 NoteRegister(instr.scalarDest);
             }
-            dst += '.';
-            for (uint32_t i = 0; i < 4; i++) {
-                if ((scalarWriteMask >> i) & 0x1) dst += kSwizzle[i];
+            if (exportReg != "oDepth") {
+                dst += '.';
+                for (uint32_t i = 0; i < 4; i++) {
+                    if ((scalarWriteMask >> i) & 0x1) dst += kSwizzle[i];
+                }
             }
             out_ += "    " + dst + " = ps;\n";
         }
@@ -2159,12 +2326,17 @@ private:
             for (uint32_t i = 0; i < comps; i++)
                 src += kSwizzle[(instr.srcSwizzle >> (i * 2)) & 0x3];
 
-            std::string texName = instr.dimension == 3 ? "t3D"
-                                : instr.dimension == 2 ? "tCube"
+            std::string texName = instr.dimension == 3 ? "tCube"
+                                : instr.dimension == 2 ? "t3D"
                                 : instr.dimension == 1 ? "t2D"
                                                        : "t1D";
+            std::string sampleCoord = src;
+            // NOTE: unnormalized star texcoords were briefly divided by 64.0
+            // here to paint grey stars. That width is unproven and samples the
+            // wrong texels, so the divide is reverted: sample raw coords. See
+            // README Status blockers.
             out_ += "    " + RegName(instr.dstRegister) + "." + lhsSwz +
-                    " = " + texName + ".SampleLevel(s0, " + src + ", 0);\n";
+                    " = " + texName + ".SampleLevel(s0, " + sampleCoord + ", 0);\n";
             emitZeroOne(RegName(instr.dstRegister));
         }
 
@@ -2226,10 +2398,10 @@ bool SetClipDisableViewportExtent(uint32_t extentX, uint32_t extentY) {
 // See the note beside the declaration in shader_translator.h for why this is
 // defined out here rather than inside the file's anonymous namespace.
 const char* const kClipDisableRescaleGateNote =
-    "applied to EVERY vertex shader. The gate is a MEASURED constant, not a per-draw "
-    "read: r2204 bit 16 (clip_disable) is set and all six r2206 vport_*_ena are clear "
-    "in every draw build/w706.log recorded (w706.log:1676-1678, :1722-1724, :1769-1771). "
-    "Per-draw gating needs the decode in pipeline_cache.cpp, which is not this file's.";
+    "per draw: applied only when PA_CL_CLIP_CNTL is present with clip_disable set and "
+    "PA_CL_VTE_CNTL is present with all six vport_*_ena clear. The gate is decoded from "
+    "the same register snapshot used to derive the pipeline state; no title-wide "
+    "assumption is made.";
 
 bool QueryClipDisableRescale(ClipDisableRescaleConstants* out) {
     if (!out) return false;
@@ -2251,6 +2423,7 @@ static bool TranslateShaderImpl(const uint8_t* container, size_t size,
                                 const VertexInputSemantic* pinLayout, size_t pinCount,
                                 bool havePin, TranslatedShader& out,
                                 std::string& error,
+                                bool applyClipDisableRescale,
                                 const PixelShaderPairing* pairing = nullptr) {
     // Reset all per-call state up front so a failure path never leaks state
     // from a prior call on the same object.
@@ -2274,6 +2447,55 @@ static bool TranslateShaderImpl(const uint8_t* container, size_t size,
         error = "container parse failed";
         out.error = error;
         return false;
+    }
+
+    // ------------------------------------------------------------------
+    // PRE-COMPILED SHADER CENSUS (docs/SHADER_TRANSLATION_PLAN.md steps 5-6).
+    //
+    // Ask the setup-time cache whether this exact shader already has a DXIL blob
+    // compiled by tools/xenosrecomp.
+    //
+    // The key is the MICROCODE, not the container: the guest builds its own
+    // 96..204-byte container around the same code that sits in a >= 236-byte
+    // container inside the retail .fxc, so a container hash never matches
+    // (measured: 514 entries, 0 hits). `prog` already carries the two fields
+    // that locate the code -- virtualSize + physicalOffset, shaderSize bytes.
+    //
+    // Reported ONCE per distinct shader (NotePrecompiledShaderLookup returns true
+    // on first sighting) so a soak stays linear in distinct guest shaders rather
+    // than draws.
+    //
+    // This does NOT yet substitute the blob into the PSO: the generated DXIL is
+    // built against shader_common.h's resource model, so using it needs a
+    // matching root signature. Until that lands the census is the measurement
+    // that says how much of the frame a substitution would cover.
+    // ------------------------------------------------------------------
+    {
+        const size_t codeStart = size_t(prog.virtualSize) + size_t(prog.physicalOffset);
+        const uint8_t* microcode = nullptr;
+        if (size != 0 && codeStart + prog.shaderSize <= size) {
+            microcode = container + codeStart;
+        }
+        const uint64_t cacheHash =
+            mcla::renderer::MicrocodeCacheHash(microcode, prog.shaderSize, out.isVertex);
+
+        mcla::renderer::PrecompiledShaderView pre;
+        const bool hit = cacheHash != 0 && mcla::renderer::FindPrecompiledShader(cacheHash, pre);
+        out.precompiledCacheHash = cacheHash;
+        out.precompiledAvailable = hit;
+        out.precompiledDxilSize = uint32_t(pre.dxilSize);
+        out.precompiledSpecConstantsMask = pre.specConstantsMask;
+
+        if (mcla::renderer::NotePrecompiledShaderLookup(cacheHash != 0 ? cacheHash : 1u, hit)) {
+            MCLA_LOG_INFO("PRECOMP-SHADER hash={:016X} hit={} pixels={} codeBytes={} "
+                          "dxilBytes={} specMask=0x{:X}",
+                          cacheHash, hit ? 1 : 0, out.isVertex ? 0 : 1,
+                          prog.shaderSize, uint32_t(pre.dxilSize), pre.specConstantsMask);
+            // MCLA_DUMP_SHADERS=1 puts the container and its microcode on disk so
+            // the runtime bytes can be diffed against the retail .fxc's.
+            mcla::renderer::DumpShaderContainer(cacheHash, container, size, microcode,
+                                               prog.shaderSize);
+        }
     }
 
     // THE PER-DRAW INTERPOLATOR INTERSECTION, applied at the one point where a
@@ -2364,7 +2586,7 @@ static bool TranslateShaderImpl(const uint8_t* container, size_t size,
         if (ir.decoded.unknown) ++out.unknownOpcodeCount;
 
     uint64_t unsupported = 0;
-    HlslGenerator gen(prog, out.hlsl, unsupported);
+    HlslGenerator gen(prog, out.hlsl, unsupported, applyClipDisableRescale);
     // The pin is applied INSIDE the generator, between pass 1 (which records the
     // fetched inputs in vsInputs_) and AppendSignature (which emits their
     // semantics), so the signature and the body always agree.
@@ -2376,6 +2598,15 @@ static bool TranslateShaderImpl(const uint8_t* container, size_t size,
     gen.SetPairingReport(prog.isVertex ? nullptr : &pairing2);
     const bool ok = gen.Generate();
     out.unsupportedOpcodeCount = unsupported;
+    // Census before refusing: nothing reported this count, so its frequency is unmeasured.
+    if (unsupported != 0) {
+        static std::atomic<uint32_t> s_unsupShaders{0};
+        const uint32_t n = s_unsupShaders.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (n <= 64 || (n % 256) == 0)
+            MCLA_LOG_ERROR("SHADER-UNSUPPORTED #{} {} unsupported={} unknown={} instrs={}",
+                           n, prog.isVertex ? "vs" : "ps", unsupported,
+                           out.unknownOpcodeCount, prog.instructions.size());
+    }
     out.instructionCount = prog.instructions.size();
     // Read the generator's own record of what its epilogue did, not a re-read of
     // the process global: Generate() has already returned, and the two cannot
@@ -2400,37 +2631,35 @@ static bool TranslateShaderImpl(const uint8_t* container, size_t size,
     // file's own arithmetic wearing the pipeline's clothes; the shape is a
     // classification and the expression is quoted out of the emitted string.
     //
-    // Once per VERTEX program, from the render thread. The cadence matches
-    // VS-RESCALE-UNBAKED above (a static one-shot latch, AppendEpilogue :1208-1223)
-    // because both answer a once-per-program question about the same epilogue, and
-    // neither is a rate: a marker that fires per translation would be a flood
-    // row, which is what CP-T3-CENSUS is the in-tree model against.
+    // At most once per rescale-request variant, from the render thread. Both
+    // guest-pixel and host-clip-space forms may occur in one run, so each gets a
+    // bounded row instead of logging every translation.
     //
     // Names no other tracked marker. `oPos` is an HLSL identifier, not a marker
     // token, and soak_census.py counts matching LINES -- a tracked marker named in
     // this row's prose would make that other marker's count uncountable.
-    // Measured on build/w710.log's programs, both vertex rows would print the
-    // same shape and the same one-line expression shape, so this is 2 rows for the
-    // 2 vertex programs in that soak.
     if (prog.isVertex) {
-        static std::atomic<bool> s_oPosLogged{false};
-        bool expected = false;
-        if (s_oPosLogged.compare_exchange_strong(expected, true)) {
+        static std::atomic<uint32_t> s_oPosLoggedVariants{0};
+        const uint32_t variantId = applyClipDisableRescale ? 2u : 1u;
+        const uint32_t variantBit = 1u << (variantId - 1u);
+        const uint32_t previous =
+            s_oPosLoggedVariants.fetch_or(variantBit, std::memory_order_relaxed);
+        if ((previous & variantBit) == 0u) {
             const std::string& shape = gen.oPosShape();
             const std::string writes = gen.oPosWriteExpression();
             MCLA_LOG_WARN(
-                "VS-POSITION-SHAPE #1: the emitted vertex program writes the "
+                "VS-POSITION-SHAPE #{} rescaleRequested={}: the emitted vertex program writes the "
                 "position system-value as {}; the writes are exactly [{}]. "
                 "TEXT ONLY, no value: the host API has no shader-output "
                 "readback, so any coordinate printed here would be this "
-                "translator's arithmetic rather than the pipeline's output. The "
-                "rescale shown in those writes is the reference's affine map "
-                "applied to XYZ with the offset scaled by W, in the epilogue, "
-                "which is where the reference puts it in both of its backends. "
+                "translator's arithmetic rather than the pipeline's output. "
+                "When requested and baked, the rescale is the reference's affine "
+                "map applied to XYZ with the offset scaled by W, in the epilogue. "
                 "A consumer of this semantic should read three corners and "
                 "generate the fourth; it is not a rectangle tuple and not a "
                 "centre-plus-extent. decl=out float4 oPos : SV_Position "
                 "rescaleBaked={} expr={}",
+                variantId, applyClipDisableRescale ? 1 : 0,
                 shape.empty() ? "<no position written>" : shape,
                 writes.empty() ? "<no assignment to the position>" : writes,
                 out.clipRescaleBaked ? 1 : 0,
@@ -2443,21 +2672,24 @@ static bool TranslateShaderImpl(const uint8_t* container, size_t size,
 }
 
 bool TranslateShader(const uint8_t* container, size_t size,
-                     std::string_view /*commonHeader*/, TranslatedShader& out) {
+                     std::string_view /*commonHeader*/, TranslatedShader& out,
+                     bool applyClipDisableRescale) {
     std::string error;
-    return TranslateShaderImpl(container, size, nullptr, 0, false, out, error);
+    return TranslateShaderImpl(container, size, nullptr, 0, false, out, error,
+                               applyClipDisableRescale);
 }
 
 bool TranslateShaderPinned(const uint8_t* container, size_t size,
                            const VertexInputSemantic* layout, size_t layoutCount,
                            TranslatedShader& out, std::string& error,
+                           bool applyClipDisableRescale,
                            const PixelShaderPairing* pairing) {
     if (!layout && layoutCount != 0) {
         error = "TranslateShaderPinned: null layout with a non-zero count";
         return false;
     }
     return TranslateShaderImpl(container, size, layout, layoutCount, true, out,
-                               error, pairing);
+                               error, applyClipDisableRescale, pairing);
 }
 
 }  // namespace mcla::renderer

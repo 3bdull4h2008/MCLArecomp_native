@@ -16,6 +16,10 @@
 #include "common/logging.h"
 #include <algorithm>  // std::min, in Flatten()
 #include <cstdlib>
+#include <deque>
+#include <mutex>
+#include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace mcla::renderer {
@@ -24,6 +28,12 @@ namespace {
 
 template <typename T>
 using ComPtr = Microsoft::WRL::ComPtr<T>;
+
+static_assert(DxcRuntime::kSitCbuffer == D3D_SIT_CBUFFER);
+static_assert(DxcRuntime::kSitTexture == D3D_SIT_TEXTURE);
+static_assert(DxcRuntime::kSitSampler == D3D_SIT_SAMPLER);
+static_assert(DxcRuntime::kSitStructuredBuffer == D3D_SIT_STRUCTURED);
+static_assert(DxcRuntime::kSitByteAddressBuffer == D3D_SIT_BYTEADDRESS);
 
 std::wstring ToWide(std::string_view s) {
     if (s.empty()) return {};
@@ -91,6 +101,59 @@ constexpr uint32_t kCensusFirstN = 4;
 constexpr uint32_t kCensusEvery = 200;
 
 bool ShouldLog(uint64_t n) { return n <= kCensusFirstN || (n % kCensusEvery) == 0; }
+
+// ---- compile latency + DXIL cache telemetry (soak-visible) ----------------
+//
+// PC-TRANSLATE counts compiles but carries no time, so a soak cannot tell
+// whether a new draw's PSO cost is DXC or the guest. A silent zero compile
+// time would also be indistinguishable from "never measured" (Rule 19:
+// LONG_TODO_MASTER.md SS1), which is why the latency is printed per compile
+// (bounded to the first few, then every 200th, like the census above)
+// together with the running average and maximum. QueryPerformanceFrequency
+// cannot fail on any supported Windows; the `freqHz == 0` arm exists only so
+// a hypothetical failure reads as 0us ("not measured") rather than as
+// garbage, and the 0 itself is what would expose it.
+int64_t QpcNowUs() {
+    static LONGLONG freqHz = 0;
+    if (freqHz == 0) {
+        LARGE_INTEGER f{};
+        if (QueryPerformanceFrequency(&f) && f.QuadPart > 0) freqHz = f.QuadPart;
+    }
+    LARGE_INTEGER now{};
+    QueryPerformanceCounter(&now);
+    if (freqHz == 0) return 0;
+    return static_cast<int64_t>((now.QuadPart * 1000000LL) / freqHz);
+}
+std::atomic<uint64_t> g_dxLatencyN{0};         // successful DxcRuntime::Compile calls
+std::atomic<uint64_t> g_dxLatencyUsTotal{0};   // sum of their wall times (us)
+std::atomic<uint64_t> g_dxLatencyMax{0};       // slowest single compile (us)
+std::atomic<uint64_t> g_dxCacheHits{0};        // DXIL-cache hits (no DXC call)
+// DXIL cache size: a dozen KB per entry all-in (HLSL source + DXIL +
+// reflection), so 512 entries is a few MB worst case and survives a long
+// soak's distinct-shader growth; past that, FIFO eviction re-compiles.
+constexpr size_t kDxilCacheMax = 512;
+// FNV-1a over HLSL + entry + profile + keepReflection (same constants as
+// DxcHashBytes below). The map key is NOT trusted for correctness: entries
+// carry the full strings and Compile verifies them on every hit, so a
+// 64-bit collision degrades to an extra compile, never to wrong DXIL.
+uint64_t DxilCacheKeyOf(std::string_view hlsl, std::string_view entry,
+                        std::string_view profile, bool keepReflection) {
+    uint64_t h = 1469598103934665603ull;
+    auto mix = [&h](std::string_view s) {
+        for (char ch : s) {
+            h ^= static_cast<unsigned char>(ch);
+            h *= 1099511628211ull;
+        }
+        h ^= 0xFFull;  // separator: ("AB","C") must not hash like ("A","BC")
+        h *= 1099511628211ull;
+    };
+    mix(hlsl);
+    mix(entry);
+    mix(profile);
+    h ^= keepReflection ? 1ull : 2ull;
+    h *= 1099511628211ull;
+    return h;
+}
 
 // DXC's error blob is multi-line. Collapse it to one bounded line so a census
 // marker stays a single grep-able log record instead of scattering fragments.
@@ -189,6 +252,35 @@ struct DxcRuntime::Impl {
     ComPtr<IDxcBlob> lastReflection;
     uint64_t lastReflectionKey = 0;
     uint64_t lastReflectionSize = 0;
+    // DXIL cache: compiled HLSL served again when the same
+    // HLSL + entry + profile + keepReflection is requested under a
+    // DIFFERENT PipelineKey (same shader, different state). PipelineCache
+    // dedupes by PipelineKey, so without this the same HLSL is re-compiled
+    // once per distinct state, and again after a PipelineCache FIFO
+    // eviction re-queues an old key. Measured instance (build/X0info.log,
+    // DXC-REFLECT-SOURCE rows #1..#3): two pipeline pairs produced an
+    // identical 4508-byte VS DXIL container and an identical 1664-byte
+    // reflection for (evidently) identical HLSL, i.e. one of the four
+    // guest shader pairs was compiled twice. A hit returns the DXIL bytes
+    // (and the reflection side-channel state) of the real earlier compile
+    // of the identical inputs -- byte-for-byte, not a re-derive. Bounded
+    // FIFO at kDxilCacheMax entries (see the anonymous namespace above).
+    struct DxilCacheEntry {
+        std::string hlsl;
+        std::string entry;
+        std::string profile;
+        bool keepReflection = false;
+        std::vector<uint8_t> dxil;
+        ComPtr<IDxcBlob> reflection;  // null when that compile produced none
+        uint64_t reflectionSize = 0;
+    };
+    std::unordered_map<uint64_t, DxilCacheEntry> dxilCache;
+    std::deque<uint64_t> dxilCacheOrder;  // FIFO eviction order (cache keys)
+    // Guards dxilCache + dxilCacheOrder ONLY. Never held across a DXC
+    // compile: lookups copy out under the lock, then the reflection-slot
+    // restore happens outside it, on the same thread that owns this
+    // instance (dxc_runtime.h: one DxcRuntime per compiling thread).
+    std::mutex dxilCacheMutex;
 };
 
 // FNV-1a 64. A content key, not a pointer: two DXIL blobs of the same size can
@@ -208,6 +300,12 @@ DxcRuntime::~DxcRuntime() {
     if (!impl_) return;
     impl_->utils.Reset();
     impl_->compiler.Reset();
+    // The DXIL cache holds IDxcBlob reflections -- dxcompiler.dll objects,
+    // like lastReflection. They must be released HERE, before FreeLibrary
+    // below, not by delete impl_ (which runs after the image is unmapped);
+    // that release order is the w692 fault (see the note below).
+    impl_->dxilCache.clear();
+    impl_->dxilCacheOrder.clear();
     // Every COM pointer this object holds MUST be released here, while
     // dxcompiler.dll is still mapped. All three of them are dxcompiler.dll
     // OBJECTS: their Release() is a virtual call through a vtable that lives
@@ -249,6 +347,8 @@ bool DxcRuntime::Load(std::string_view dllDir, std::string& usedDir, std::string
         return true;
     }
     if (!impl_) return false;
+    const int64_t loadT0 = QpcNowUs();
+    uint32_t candidatesProbed = 0;
 
     // Candidate DLL directories, in priority order; the first holding BOTH
     // dxcompiler.dll and dxil.dll wins. Every rejection is recorded so the error
@@ -319,6 +419,7 @@ bool DxcRuntime::Load(std::string_view dllDir, std::string& usedDir, std::string
     std::string rejected;
     for (const auto& c : candidates) {
         if (c.dir.empty()) continue;
+        ++candidatesProbed;
         const std::string sep =
             (c.dir.back() == '/' || c.dir.back() == '\\') ? "" : "\\";
         const std::string compilerPath = c.dir + sep + "dxcompiler.dll";
@@ -351,25 +452,35 @@ bool DxcRuntime::Load(std::string_view dllDir, std::string& usedDir, std::string
         return false;
     }
 
+    char absCompilerPath[MAX_PATH] = {};
+    char absDxilPath[MAX_PATH] = {};
+    GetFullPathNameA((dir + "dxcompiler.dll").c_str(), MAX_PATH, absCompilerPath, nullptr);
+    GetFullPathNameA((dir + "dxil.dll").c_str(), MAX_PATH, absDxilPath, nullptr);
+    const std::string resolvedDxil = absDxilPath[0] ? std::string(absDxilPath) : (dir + "dxil.dll");
+    const std::string resolvedCompiler = absCompilerPath[0] ? std::string(absCompilerPath) : (dir + "dxcompiler.dll");
+
     // Pre-load dxil.dll by full path: the loader matches imports by module base
     // name, so dxcompiler.dll binds to this copy instead of one found elsewhere.
-    impl_->dxil = LoadLibraryA((dir + "dxil.dll").c_str());
+    impl_->dxil = LoadLibraryA(resolvedDxil.c_str());
     if (!impl_->dxil) {
         error = "LoadLibrary(dxil.dll) failed: " + WinErrorText(GetLastError());
         MCLA_LOG_ERROR("DXC-RUNTIME-LOAD-FAILED reason=loadlibrary-dxil-failed "
                        "path={} detail={}",
-                       dir + "dxil.dll", error);
+                       resolvedDxil, error);
         return false;
     }
     impl_->dxcompiler =
-        LoadLibraryExA((dir + "dxcompiler.dll").c_str(), nullptr,
+        LoadLibraryExA(resolvedCompiler.c_str(), nullptr,
                        LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR |
                            LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
+    if (!impl_->dxcompiler) {
+        impl_->dxcompiler = LoadLibraryA(resolvedCompiler.c_str());
+    }
     if (!impl_->dxcompiler) {
         error = "LoadLibrary(dxcompiler.dll) failed: " + WinErrorText(GetLastError());
         MCLA_LOG_ERROR("DXC-RUNTIME-LOAD-FAILED reason=loadlibrary-dxcompiler-failed "
                        "path={} detail={}",
-                       dir + "dxcompiler.dll", error);
+                       resolvedCompiler, error);
         return false;
     }
     impl_->createInstance = reinterpret_cast<DxcCreateInstanceProc>(
@@ -408,6 +519,13 @@ bool DxcRuntime::Load(std::string_view dllDir, std::string& usedDir, std::string
     // The gate marker: the resolved ABSOLUTE path, so a soak can tell a real load
     // from a CWD-dependent near-miss (which is what build/w664.log recorded).
     MCLA_LOG_INFO("DXC-RUNTIME-LOADED path={}", dir);
+    // Init wall: what Load itself cost (candidate probing + LoadLibrary +
+    // DxcCreateInstance), separate from the guest boot around it. One line
+    // per process, not per compile, so it cannot flood a long soak.
+    MCLA_LOG_INFO("DXC-LOAD-TIME ms={} candidatesProbed={} -- DLL search + "
+                  "LoadLibrary + DxcCreateInstance cost",
+                  static_cast<uint64_t>((QpcNowUs() - loadT0) / 1000),
+                  candidatesProbed);
     return true;
 }
 
@@ -428,6 +546,60 @@ bool DxcRuntime::Compile(std::string_view hlsl, std::string_view entry,
         // a soak must be able to tell them apart.
         RecordOutcome(stage, false, "runtime-not-loaded", "DxcRuntime::Load never succeeded");
         return false;
+    }
+
+    // DXIL cache lookup (long-term queue relief). The cache key is over the
+    // effective inputs (empty entry means "main", as below). A hit skips
+    // IDxcCompiler3::Compile entirely and restores the reflection side
+    // channel to the fitting state, including the "no reflection" state
+    // (key 0), which ReflectBindings treats as "fall back to the container
+    // path". A hit is deliberately NOT counted in PC-TRANSLATE: that
+    // marker's `submitted` means "DXC was asked to compile", and the census
+    // (tools/soak_census.py) compares it against DXC-OUTPUTS, which counts
+    // real compiles only. Counting hits there would make submitted exceed
+    // real DXC calls and read as dropped logging. Same precedent as
+    // DXC-REFLECT-MISSING: a NEW marker name for a new event.
+    const int64_t compileT0 = QpcNowUs();
+    const std::string_view effEntry = entry.empty() ? std::string_view("main") : entry;
+    const uint64_t cacheKey = DxilCacheKeyOf(hlsl, effEntry, profile, keepReflection);
+    bool cacheHit = false;
+    std::vector<uint8_t> cachedDxil;
+    ComPtr<IDxcBlob> cachedReflection;
+    uint64_t cachedReflectionSize = 0;
+    {
+        std::lock_guard<std::mutex> lk(impl_->dxilCacheMutex);
+        auto hit = impl_->dxilCache.find(cacheKey);
+        if (hit != impl_->dxilCache.end() && hit->second.keepReflection == keepReflection &&
+            std::string_view(hit->second.hlsl) == hlsl &&
+            std::string_view(hit->second.entry) == effEntry &&
+            std::string_view(hit->second.profile) == profile) {
+            cachedDxil = hit->second.dxil;
+            cachedReflection = hit->second.reflection;
+            cachedReflectionSize = hit->second.reflectionSize;
+            cacheHit = true;
+        }
+    }
+    if (cacheHit) {
+        dxil = std::move(cachedDxil);
+        if (cachedReflection) {
+            impl_->lastReflection = cachedReflection;
+            impl_->lastReflectionKey = DxcHashBytes(dxil.data(), dxil.size());
+            impl_->lastReflectionSize = cachedReflectionSize;
+        } else {
+            impl_->lastReflection.Reset();
+            impl_->lastReflectionKey = 0;
+            impl_->lastReflectionSize = 0;
+        }
+        const uint64_t n = g_dxCacheHits.fetch_add(1) + 1;
+        if (ShouldLog(n)) {
+            MCLA_LOG_INFO("DXC-CACHE-HIT #{} stage={} -- DXIL served from the "
+                          "cache without an IDxcCompiler3::Compile call for "
+                          "the same HLSL+entry+profile; PC-TRANSLATE "
+                          "submitted still counts real DXC compilations only",
+                          n, StageName(stage));
+        }
+        // No DXC-LATENCY row on a hit: no DXC call happened.
+        return true;
     }
 
     ComPtr<IDxcBlobEncoding> sourceBlob;
@@ -585,6 +757,58 @@ bool DxcRuntime::Compile(std::string_view hlsl, std::string_view entry,
         }
     }
 
+    // Compile latency + cache insert. The clock covers the whole call
+    // (blob creation, the DXC Compile, the reflection and errors GetOutput
+    // calls and the DXC-OUTPUTS census above): for the worker in
+    // pipeline_cache.cpp this is the per-stage cost of one queued task,
+    // which is what a long soak's compile queue must account for. A NEW
+    // marker (DXC-LATENCY), not a field on PC-TRANSLATE or DXC-OUTPUTS, so
+    // neither marker's tracked format changes.
+    {
+        const int64_t usDelta = QpcNowUs() - compileT0;
+        const uint64_t us = usDelta > 0 ? static_cast<uint64_t>(usDelta) : 0u;
+        const uint64_t n = g_dxLatencyN.fetch_add(1) + 1;
+        const uint64_t totalUs = g_dxLatencyUsTotal.fetch_add(us) + us;
+        uint64_t maxUs = g_dxLatencyMax.load(std::memory_order_relaxed);
+        while (us > maxUs && !g_dxLatencyMax.compare_exchange_weak(
+                                 maxUs, us, std::memory_order_relaxed)) {
+        }
+        if (ShouldLog(n)) {
+            MCLA_LOG_INFO("DXC-LATENCY #{} stage={} compileUs={} avgUs={} "
+                          "maxUs={} -- wall time of one successful "
+                          "DxcRuntime::Compile (blob + DXC + reflection + "
+                          "errors); PC-TRANSLATE counts the compile, this "
+                          "says what it cost",
+                          n, StageName(stage), us, totalUs / n, maxUs);
+        }
+    }
+    // Cache insert (miss path only): keep the DXIL build, the reflection
+    // blob it was reflected from, and the full key so a later identical
+    // request need not re-invoke DXC. FIFO eviction at kDxilCacheMax; an
+    // evicted entry simply re-compiles next time, never a wrong answer.
+    {
+        std::lock_guard<std::mutex> lk(impl_->dxilCacheMutex);
+        if (impl_->dxilCache.find(cacheKey) == impl_->dxilCache.end()) {
+            while (impl_->dxilCache.size() >= kDxilCacheMax) {
+                const uint64_t oldKey = impl_->dxilCacheOrder.front();
+                impl_->dxilCacheOrder.pop_front();
+                impl_->dxilCache.erase(oldKey);
+            }
+        }
+        Impl::DxilCacheEntry fresh;
+        fresh.hlsl = std::string(hlsl);
+        fresh.entry = std::string(effEntry);
+        fresh.profile = std::string(profile);
+        fresh.keepReflection = keepReflection;
+        fresh.dxil = dxil;
+        fresh.reflection = impl_->lastReflection;
+        fresh.reflectionSize = impl_->lastReflectionSize;
+        auto inserted = impl_->dxilCache.insert_or_assign(cacheKey, std::move(fresh));
+        if (inserted.second) {
+            impl_->dxilCacheOrder.push_back(cacheKey);
+        }
+    }
+
     RecordOutcome(stage, true, nullptr, nullptr);
     return true;
 }
@@ -715,6 +939,100 @@ bool DxcRuntime::ReflectBindings(const std::vector<uint8_t>& dxil,
                 return false;
             }
         }
+    }
+    return true;
+}
+
+bool DxcRuntime::ReflectSignature(
+    const std::vector<uint8_t>& dxil,
+    std::vector<SignatureParameter>& inputs,
+    std::vector<SignatureParameter>& outputs,
+    std::string& error) const {
+    inputs.clear();
+    outputs.clear();
+    error.clear();
+
+    if (!impl_ || !impl_->utils || !loaded_) {
+        error = "DxcRuntime not loaded";
+        return false;
+    }
+
+    ComPtr<ID3D12ShaderReflection> reflection;
+    const uint64_t key = DxcHashBytes(dxil.data(), dxil.size());
+    if (impl_->lastReflection && impl_->lastReflectionKey != 0 &&
+        impl_->lastReflectionKey == key && !dxil.empty()) {
+        DxcBuffer reflectionBuffer{};
+        reflectionBuffer.Ptr = impl_->lastReflection->GetBufferPointer();
+        reflectionBuffer.Size = impl_->lastReflection->GetBufferSize();
+        const HRESULT reflectionHr = impl_->utils->CreateReflection(
+            &reflectionBuffer, __uuidof(ID3D12ShaderReflection),
+            reinterpret_cast<void**>(reflection.GetAddressOf()));
+        if (FAILED(reflectionHr)) reflection.Reset();
+    }
+
+    if (!reflection) {
+        ComPtr<IDxcBlobEncoding> dxilBlob;
+        HRESULT hr = impl_->utils->CreateBlobFromPinned(
+            dxil.data(), static_cast<uint32_t>(dxil.size()), DXC_CP_UTF8,
+            dxilBlob.GetAddressOf());
+        if (FAILED(hr) || !dxilBlob) {
+            error = "CreateBlobFromPinned failed " + HexHr(hr);
+            return false;
+        }
+
+        DxcBuffer dxilBuffer{};
+        dxilBuffer.Ptr = dxilBlob->GetBufferPointer();
+        dxilBuffer.Size = dxilBlob->GetBufferSize();
+        hr = impl_->utils->CreateReflection(
+            &dxilBuffer, __uuidof(ID3D12ShaderReflection),
+            reinterpret_cast<void**>(reflection.GetAddressOf()));
+        if (FAILED(hr) || !reflection) {
+            error = "CreateReflection failed " + HexHr(hr);
+            return false;
+        }
+    }
+
+    D3D12_SHADER_DESC shaderDesc = {};
+    HRESULT hr = reflection->GetDesc(&shaderDesc);
+    if (FAILED(hr)) {
+        error = "ID3D12ShaderReflection::GetDesc failed " + HexHr(hr);
+        return false;
+    }
+
+    auto readParameters = [&](UINT count, bool isInput,
+                              std::vector<SignatureParameter>& destination) {
+        destination.reserve(count);
+        for (UINT i = 0; i < count; ++i) {
+            D3D12_SIGNATURE_PARAMETER_DESC desc = {};
+            const HRESULT parameterHr =
+                isInput ? reflection->GetInputParameterDesc(i, &desc)
+                        : reflection->GetOutputParameterDesc(i, &desc);
+            if (FAILED(parameterHr)) {
+                error = std::string(isInput ? "GetInputParameterDesc"
+                                            : "GetOutputParameterDesc") +
+                        " failed " + HexHr(parameterHr);
+                return false;
+            }
+            SignatureParameter parameter;
+            parameter.semanticName = desc.SemanticName ? desc.SemanticName : "";
+            parameter.semanticIndex = desc.SemanticIndex;
+            parameter.systemValueType =
+                static_cast<uint32_t>(desc.SystemValueType);
+            parameter.componentType = static_cast<uint32_t>(desc.ComponentType);
+            parameter.register_ = desc.Register;
+            parameter.mask = desc.Mask;
+            parameter.readWriteMask = desc.ReadWriteMask;
+            parameter.stream = desc.Stream;
+            destination.push_back(std::move(parameter));
+        }
+        return true;
+    };
+
+    if (!readParameters(shaderDesc.InputParameters, true, inputs) ||
+        !readParameters(shaderDesc.OutputParameters, false, outputs)) {
+        inputs.clear();
+        outputs.clear();
+        return false;
     }
     return true;
 }

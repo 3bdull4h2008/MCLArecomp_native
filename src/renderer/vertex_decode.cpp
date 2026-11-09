@@ -47,6 +47,38 @@ static VertexFormatDesc MakeDesc(bool valid, VertexType type, uint8_t comps,
     return d;
 }
 
+// vf table <-> stride mapping (long-term record, measured 2026-11-09):
+// The switch below covers EXACTLY the 15 defined Xenos codes
+// (.research/xenia/src/xenia/gpu/xenos.h:602-619 VertexFormat); every
+// other 6-bit value (incl. 0) is Undefined and takes the fetch-constant /
+// unsupported path. totalBytes is the FULL-format size = words*4 from
+// GetVertexFormatNeededWords (xenos.h:648-683), i.e. the PER-ELEMENT
+// contribution -- it is NOT the whole-vertex stride. The whole stride
+// is the VFETCH instruction's 8-bit stride byte
+// (xenos_microcode.h:136 stride; xenos_microcode.cpp:170) and the guest
+// element stride echoed in capture (fmtX, st36). Summing totalBytes
+// therefore does NOT give the stride whenever element offsets gap.
+// Stride-36 triple used by the star AND the R/logo quads (same format,
+// different counts/topologies):
+//   e0 fmt57 (32_32_32_FLOAT) @off0  st36  -> 12B position
+//   e1 fmt6  (8_8_8_8)       @off24 st36  ->  4B colour
+//   e2 fmt37 (32_32_FLOAT)   @off28 st36  ->  8B UV
+//   off12..23 (12B) = UNFETCHED PADDING (zero in every sample below),
+//   not a semantic lane; never invent it (Golden Rule 5).
+//   Evidence: H1n.log:5278 (TEMP-T75-FIRST #2/23) elems
+//   [e0:off0,st36,fmt57;e1:off24,st36,fmt6;e2:off28,st36,fmt37] size=216
+//   = 6*36; d3d12_backend.cpp:5647-5670 (STAR probe reads pos @+0/+4,
+//   colour @+24, UV @+28/+32 -- the same offsets); H1n.log:4595
+//   TEMP-STAR #1 verts=39 stride=36; H1n.log:858 TEMP-G3 stride36
+//   verts=4 v0=6866AA43... unpacks (LE) as (340.8,280.2,0,0,0,0,
+//   colour 77777717, 0.977, 0.039), confirming off8..23 zero.
+//   Counts/topologies of this one layout: star prim4/topo4 verts=39
+//   (13 triangles, H1n.log:4595), logo quad prim4/topo4 verts=6
+//   (2 triangles, H1n.log:818), R/rect quad prim6/topo5 verts=4
+//   (1 quad, H1n.log:820), all indexed=0, size = count*36.
+// Controls proving padding is a descriptor fact, not a vf fact:
+// stride28 (H1n.log:5277) fmt57@0 + fmt38@12 fills exactly (12+16=28,
+// size=84=3*28); stride8 (T75 #23) fmt37@0 fills exactly (8, size=24).
 VertexFormatDesc DecodeVertexFormat(uint32_t vfCode) {
     switch (vfCode) {
         case 6:   return MakeDesc(true, VertexType::Unorm8x4,       4, 1, 4,  kDxgiR8G8B8A8Unorm,     false, true,  false); // 8_8_8_8

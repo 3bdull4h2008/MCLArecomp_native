@@ -42,6 +42,9 @@
 #include <user/config.h>
 #include <os/logger.h>
 
+extern std::atomic<uint32_t> g_step1Tag;
+extern std::atomic<uint32_t> g_step1Handle;
+
 // ---------------------------------------------------------------------------
 // T43.28 (2026-10-21): THE CONSOLE'S OWN XTL ALLOC/FREE DISPATCHERS -- CALLED,
 // NOT HOOKED.
@@ -1449,6 +1452,20 @@ uint32_t XamContentGetDeviceState(uint32_t deviceId, void *overlapped) {
   (void)overlapped;
   static std::atomic<uint64_t> s_seen{0};
   const uint64_t n = s_seen.fetch_add(1, std::memory_order_relaxed) + 1;
+  // Census for the startup-script question (brief F-923): exact totals per
+  // device, at ERROR every 1000th call, so a poll loop's count is visible
+  // at the default level without flooding the log.
+  static std::atomic<uint64_t> s_dev1{0}, s_dev2{0}, s_devOther{0};
+  (deviceId == 1 ? s_dev1 : deviceId == 2 ? s_dev2 : s_devOther)
+      .fetch_add(1, std::memory_order_relaxed);
+  if (n <= 16 || n % 1000 == 0) {
+    MCLA_LOG_ERROR("XAM-DEVICE-STATE total={} dev1={} dev2={} other={} "
+                   "lastDev={:08X} lastLr={:08X}",
+                   n, s_dev1.load(std::memory_order_relaxed),
+                   s_dev2.load(std::memory_order_relaxed),
+                   s_devOther.load(std::memory_order_relaxed), deviceId,
+                   g_ppcContext ? static_cast<uint32_t>(g_ppcContext->lr) : 0u);
+  }
   if (n <= 8 || (n % 200) == 0) {
     MCLA_LOG_WARN("XAM-CONTENT-DEVICE #{} deviceId={:08X} -> "
                   "X_ERROR_DEVICE_NOT_CONNECTED (0x0000048F): no content device "
@@ -1588,6 +1605,8 @@ uint32_t XamShowSigninUI() {
   return 0; // X_ERROR_SUCCESS, xam_user.cc:528 (was: void, r3 left leaked)
 }
 
+uint32_t NtSetEvent(uint32_t handle, uint32_t *previousState);
+
 uint32_t XamShowDeviceSelectorUI(uint32_t userIndex, uint32_t contentType,
                                  uint32_t contentFlags, uint64_t totalRequested,
                                  be<uint32_t> *deviceId,
@@ -1595,6 +1614,13 @@ uint32_t XamShowDeviceSelectorUI(uint32_t userIndex, uint32_t contentType,
   XamNotifyEnqueueEvent(9, true);
   if (deviceId) *deviceId = 1;
   XamNotifyEnqueueEvent(9, false);
+  if (overlapped) {
+    overlapped->InternalLow = 0;
+    overlapped->InternalHigh = 0;
+    if (overlapped->hEvent != 0) {
+      NtSetEvent(overlapped->hEvent, nullptr);
+    }
+  }
   return 0;
 }
 
@@ -2413,11 +2439,19 @@ void SemCntSnapshot(KernelObject *obj, uint32_t *cnt, uint32_t *max,
     *waiters = 0;
     if (obj == nullptr)
         return;
-    if (auto *s = dynamic_cast<Semaphore *>(obj))
-    {
-        *cnt = s->LiveCount();
-        *max = s->maximumCount;
-        *waiters = s->BlockedWaiters();
+    __try {
+        if (!obj->IsValid())
+            return;
+        if (obj->header.Type == 5)
+        {
+            auto *s = static_cast<Semaphore *>(obj);
+            *cnt = s->LiveCount();
+            *max = s->maximumCount;
+            *waiters = s->BlockedWaiters();
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        MCLA_LOG_ERROR("STEP6 SemCntSnapshot FAULTED on obj={:p}!", (void*)obj);
+        *cnt = 0xFFFFFFFFu;
     }
 }
 
@@ -2437,9 +2471,9 @@ bool SemCntRow(const char *op, uint32_t handle, KernelObject *obj,
     uint32_t shown = liveCount;
     if (obj != nullptr)
     {
-        if (dynamic_cast<Semaphore *>(obj) != nullptr)
+        if (SafeDynamicCast<Semaphore>(obj) != nullptr)
             cls = "sema";
-        else if (dynamic_cast<Event *>(obj) != nullptr)
+        else if (SafeDynamicCast<Event>(obj) != nullptr)
             cls = "event";
     }
     if (std::strcmp(cls, "sema") != 0)
@@ -2583,6 +2617,46 @@ uint32_t NtWaitForSingleObjectEx(uint32_t Handle, uint32_t WaitMode,
                     Handle, Alertable,
                     static_cast<uint32_t>(g_ppcContext ? g_ppcContext->lr : 0), t);
     }
+    // F-914 c-1 (no-progression.md blocker c): the flat 200-row cap above is a
+    // CADENCE artifact that hid the very rows that matter -- MEASURED in ga062:
+    // [main-park] exhausted its 200 rows at 21:12:06 (passes=560), 3 minutes
+    // BEFORE the legals park handle B72CC048 first appeared at 21:15:55, so the
+    // park that blocker c names printed ZERO rows. This printer fires on
+    // HANDLE CHANGE (one row per distinct handle the main thread parks on,
+    // plus a repeat row after kMainWaitRepeatMs), so a new park handle is
+    // never sampled away. It also carries the timeout class (inf/finite/poll)
+    // that decides whether c-3 (bounded INFINITE) even applies: ga062's
+    // WAIT[NTWFSO] rows for B72CC048 read to=0ms alertable=0, i.e. the guest
+    // POLLING with a ~0ms finite timeout, not an INFINITE park -- so c-3 is
+    // env-gated OFF by default and this row is what measures whether the
+    // intermittent ga059/ga060 INFINITE park is present in a given soak.
+    if (mainId != 0 && GetCurrentThreadId() == mainId) {
+      static std::atomic<uint32_t> s_lastParkHandle{0};
+      static std::atomic<uint64_t> s_lastParkNs{0};
+      const uint64_t nowNs = static_cast<uint64_t>(
+          std::chrono::duration_cast<std::chrono::nanoseconds>(
+              std::chrono::steady_clock::now().time_since_epoch()).count());
+      constexpr uint64_t kMainWaitRepeatMs = 30000;  // re-report a persistent park after 30 s
+      const uint32_t prev = s_lastParkHandle.load(std::memory_order_relaxed);
+      const uint64_t prevNs = s_lastParkNs.load(std::memory_order_relaxed);
+      const bool changed = (prev != Handle);
+      const bool stale = (nowNs - prevNs) > (kMainWaitRepeatMs * 1000000ull);
+      if (changed || stale) {
+        s_lastParkHandle.store(Handle, std::memory_order_relaxed);
+        s_lastParkNs.store(nowNs, std::memory_order_relaxed);
+        const uint32_t timeout = GuestTimeoutToMilliseconds(Timeout);
+        const char* tclass = (timeout == 0) ? "poll"
+                            : (timeout == INFINITE) ? "inf" : "finite";
+        static std::atomic<uint64_t> s_mainWaitRows{0};
+        const uint64_t mw = s_mainWaitRows.fetch_add(1, std::memory_order_relaxed) + 1;
+        MCLA_LOG_WARN(
+            "MAINWAIT-PARK #{} tid={:08X} h={:08X} class={} to={}ms alertable={} "
+            "lr={:08X} changed={} passes={}",
+            mw, GetCurrentThreadId(), Handle, tclass, timeout, Alertable,
+            static_cast<uint32_t>(g_ppcContext ? g_ppcContext->lr : 0),
+            changed ? 1 : 0, t);
+      }
+    }
   }
   uint32_t timeout = GuestTimeoutToMilliseconds(Timeout);
 
@@ -2715,7 +2789,50 @@ uint32_t NtWaitForSingleObjectEx(uint32_t Handle, uint32_t WaitMode,
         }
     }
 
-    const uint32_t st = obj->Wait(timeout);
+    // F-914 c-3 (no-progression.md blocker c): MAIN-WAIT BOUND. Default OFF --
+    // set MCLA_MAINWAIT_BOUND_MS=<N> to bound the MAIN THREAD's INFINITE waits
+    // to N ms, returning STATUS_TIMEOUT (257) on expiry. Rationale + the
+    // measured precondition: the intermittent ga059/ga060 park (20:06:32 /
+    // 20:43:19) is the main thread's INFINITE wait on the legals semaphore
+    // B72CC048 whose producer thread had already died (BCTR-STUCK), so nothing
+    // ever released it and the frontend tick never ran again. ga062 measured
+    // the SAME handle at to=0ms alertable=0 (a poll, NOT a park) with 3,702
+    // RETURNED rows -- so the park is a RACE, not a certainty, which is why
+    // this is env-gated and default OFF rather than unconditional. With
+    // alertable=0 (MEASURED on every B72CC048 row) the guest's DC0 retry loop
+    // (ppc_recomp.0.cpp:18729-18754) returns a 257 to its caller instead of
+    // retrying, so a bounded wait hands control back to the main loop rather
+    // than spinning internally. FALSIFIER for enabling it: a soak with this
+    // env set shows MAINWAIT-BOUND rows but the legals screen still never
+    // advances -- the park was a symptom, not the cause.
+    uint32_t waitTimeout = timeout;
+    if (timeout == INFINITE) {
+      // (mainId from the probe block above is out of scope here -- reload it.)
+      const uint32_t c3MainId = g_mainGuestThreadId.load();
+      if (c3MainId != 0 && GetCurrentThreadId() == c3MainId) {
+        static int s_boundMs = -2;  // -2 = unread, -1 = unset/off, >=0 = bound
+        if (s_boundMs == -2) {
+          const char* env = std::getenv("MCLA_MAINWAIT_BOUND_MS");
+          s_boundMs = env ? std::atoi(env) : -1;
+          if (s_boundMs >= 0)
+            MCLA_LOG_WARN("MAINWAIT-BOUND ON -- main-thread INFINITE waits bounded to "
+                          "{} ms (MCLA_MAINWAIT_BOUND_MS); returns STATUS_TIMEOUT on "
+                          "expiry (alertable=0 measured, so the guest retry loop "
+                          "surfaces 257 to its caller)",
+                          s_boundMs);
+        }
+        if (s_boundMs >= 0) {
+          waitTimeout = static_cast<uint32_t>(s_boundMs);
+          static std::atomic<uint64_t> s_boundRows{0};
+          const uint64_t bn = s_boundRows.fetch_add(1, std::memory_order_relaxed) + 1;
+          if (bn <= 16 || (bn % 200u) == 0u)
+            MCLA_LOG_WARN("MAINWAIT-BOUND #{} h={:08X} INFINITE->{}ms tid={:08X} lr={:08X}",
+                          bn, Handle, waitTimeout, GetCurrentThreadId(),
+                          static_cast<uint32_t>(g_ppcContext ? g_ppcContext->lr : 0));
+        }
+      }
+    }
+    const uint32_t st = obj->Wait(waitTimeout);
     LogDwellHistogramNT(st);
     {
         // The RETURNED row is printed when the WAIT row was printed, and
@@ -4976,6 +5093,15 @@ uint32_t NtReadFile(uint32_t handle, uint32_t event, uint32_t apcRoutine,
     hostErr = ::GetLastError();  // captured immediately, before any other call
     MCLA_LOG_DEBUG("NtReadFile: h={:08X} off={:#x} len={} -> {} bytes", handle,
                    offset, length, bytesRead);
+    // TEMP-C6: reads touching boot.sco/careersetup*.sco (TOC 0x12D0000..0x12D217F).
+    if (offset < 0x12D2180ull && offset + length > 0x12D0000ull) {
+      const uint8_t *hb = static_cast<const uint8_t *>(hostPtr);
+      MCLA_LOG_ERROR("TEMP-C6-READ path='{}' off={:#x} len={} got={} ok={} "
+                     "b0={:02X}{:02X}{:02X}{:02X} lr={:08X}",
+                     pathDbg ? pathDbg : "?", offset, length, bytesRead, ok ? 1 : 0,
+                     hb[0], hb[1], hb[2], hb[3],
+                     static_cast<uint32_t>(g_ppcContext ? g_ppcContext->lr : 0));
+    }
   } else {
     // Non-VFS handles (device opens etc): zero-fill keeps legacy behavior.
     if (length >= sizeof(preFill))
@@ -7038,7 +7164,7 @@ static void SignalSchedulerTick() {
   // none yet, create the one the console would have: an EVENT, because the
   // object's own guest-visible Type byte says 0x00 (EventNotification).
   KernelObject *canonical = LookupKernelObjectByDispatcher(*header);
-  Event *ev = canonical ? dynamic_cast<Event *>(canonical) : nullptr;
+  Event *ev = canonical ? SafeDynamicCast<Event>(canonical) : nullptr;
   if (!ev && !canonical) {
     ev = QueryKernelObject<Event>(*header);
   }
@@ -7050,7 +7176,7 @@ static void SignalSchedulerTick() {
   // A canonical wrapper of another class exists (the legacy semaphore model):
   // release it rather than type-confusing it.
   if (canonical) {
-    if (auto *sem = dynamic_cast<Semaphore *>(canonical)) {
+    if (auto *sem = SafeDynamicCast<Semaphore>(canonical)) {
       logPath("release-semaphore");
       sem->Release(1, nullptr);
       return;
@@ -7163,7 +7289,7 @@ void StartGpuContextPoller() {
     MCLA_LOG_INFO(
         "GpuContextPoller: Started polling for GPU context at 0x82839254");
     while (!s_gpuInitDone.load()) {
-      std::this_thread::sleep_for(std::chrono::milliseconds(500));
+      std::this_thread::sleep_for(std::chrono::milliseconds(50));
 
       constexpr uint32_t gpuCtxPtrAddr = 0x82839254;
       uint32_t gpuCtxPtr = 0;
@@ -7703,7 +7829,7 @@ uint32_t KeWaitForSingleObject(XDISPATCHER_HEADER *Object, uint32_t WaitReason,
                      false);
   };
   if (KernelObject *canonical = LookupKernelObjectByDispatcher(*Object)) {
-    if (auto *sem = dynamic_cast<Semaphore *>(canonical)) {
+    if (auto *sem = SafeDynamicCast<Semaphore>(canonical)) {
       waitResolution = "identity(sem)";
       const bool kePrinted = keCntWait(sem, "KE-WAIT");
       waitStatus = sem->Wait(timeout);
@@ -7715,7 +7841,7 @@ uint32_t KeWaitForSingleObject(XDISPATCHER_HEADER *Object, uint32_t WaitReason,
                   kePrinted || g_semWaitBlocked);
       }
       resolvedByIdentity = true;
-    } else if (auto *ev = dynamic_cast<Event *>(canonical)) {
+    } else if (auto *ev = SafeDynamicCast<Event>(canonical)) {
       waitResolution = "identity(event)";
       waitStatus = ev->Wait(timeout);
       resolvedByIdentity = true;
@@ -8789,7 +8915,7 @@ uint32_t NtClearEvent(uint32_t handle, uint32_t *previousState) {
 
 uint32_t NtResumeThread(uint32_t hThread, uint32_t *suspendCount) {
   if (auto* obj = GetKernelObject(hThread)) {
-    if (auto* th = dynamic_cast<GuestThreadHandle*>(obj)) {
+    if (auto* th = SafeDynamicCast<GuestThreadHandle>(obj)) {
       assert(th != GetKernelObject(CURRENT_THREAD_HANDLE));
 
       th->suspended = false;
@@ -8811,7 +8937,7 @@ uint32_t NtSetEvent(uint32_t handle, uint32_t *previousState) {
   // unchecked static_cast<Event*> on a Semaphore entry wrote the event's
   // state over the semaphore's count (audit C20).
   if (auto *id = LookupIdentityKernelObject(handle)) {
-    if (auto *evt = dynamic_cast<Event *>(id)) {
+    if (auto *evt = SafeDynamicCast<Event>(id)) {
       evt->Set();
       if (previousState) *previousState = 0;
       return 0;
@@ -8899,221 +9025,156 @@ uint32_t NtCreateSemaphore(be<uint32_t> *Handle,
   return STATUS_SUCCESS;
 }
 
+static bool SafeSemaphoreRelease(Semaphore *sem, uint32_t count, uint32_t *previousCount) {
+  if (!sem) return false;
+  t_inSafeExcept = true;
+  __try {
+    sem->Release(count, previousCount);
+  } __except (1) {
+    t_inSafeExcept = false;
+    return false;
+  }
+  t_inSafeExcept = false;
+  return true;
+}
+
 uint32_t NtReleaseSemaphore(XKSEMAPHORE *Handle, uint32_t ReleaseCount,
                             int32_t *PreviousCount) {
-  // SIGNAL CENSUS (session 12): Ghidra proved completers use
-  // NtReleaseSemaphore (NOT KeReleaseSemaphore) - prior census watched
-  // the wrong twin and reported zero signals.
-  {
-    static std::atomic<uint32_t> s_ntRelLogs{0};
-    const uint32_t n = s_ntRelLogs.fetch_add(1) + 1;
-    if (n <= 40 || (n % 2000) == 0) {
-      // Guest VA of the caller's XKSEMAPHORE* + the address our typed
-      // Header field resolves to - session 15 showed census/probe
-      // disagreeing across runs; measure both in one place.
-      const uint32_t guestHandle =
-          static_cast<uint32_t>(reinterpret_cast<const uint8_t *>(Handle) -
-                                mcla::kernel::g_memory.base);
-      MCLA_LOG_INFO(
-          "SIGNAL NtReleaseSemaphore guest={:08X} hdrOff={} count={} lr={:08X}",
-          guestHandle,
-          reinterpret_cast<uintptr_t>(&Handle->Header) -
-              reinterpret_cast<uintptr_t>(Handle),
-          ReleaseCount,
-          static_cast<uint32_t>(g_ppcContext ? g_ppcContext->lr : 0));
-    }
+  if (Handle == nullptr) {
+    if (PreviousCount != nullptr)
+      *PreviousCount = 0;
+    return STATUS_SUCCESS;
   }
 
-  // TYPE CENSUS (release side): obj VA | header Type | site=release | resolution
-  {
-    static std::atomic<uint32_t> s_typeRelLogs{0};
-    const uint32_t n = s_typeRelLogs.fetch_add(1) + 1;
-    if (n <= 60 || (n % 5000) == 0) {
-      const uint32_t hdrAddr = static_cast<uint32_t>(
-          reinterpret_cast<const uint8_t *>(&Handle->Header) -
-          mcla::kernel::g_memory.base);
-      const uint8_t hdrType = Handle->Header.Type;
-      MCLA_LOG_INFO("TYPE-CENSUS[REL] #{:04} obj={:08X} type={:02X} site=release res=QueryKernelObject(Semaphore) lr={:08X}",
-                    n, hdrAddr, hdrType,
-                    static_cast<uint32_t>(g_ppcContext ? g_ppcContext->lr : 0));
-    }
+  const uint32_t guestHandle =
+      static_cast<uint32_t>(reinterpret_cast<const uint8_t *>(Handle) -
+                            mcla::kernel::g_memory.base);
+  const uint32_t callerLr =
+      static_cast<uint32_t>(g_ppcContext ? g_ppcContext->lr : 0);
+  const uint32_t targetHnd = g_step1Handle.load(std::memory_order_relaxed);
+
+  static std::atomic<uint32_t> s_ntRelLogs{0};
+  const uint32_t n = s_ntRelLogs.fetch_add(1) + 1;
+  // F-XXX: the target-match clause was UNBOUNDED -- once guestHandle ==
+  // targetHnd, EVERY call printed (measured: 357,627 STEP5-ENTRY rows in
+  // build/w8.log, 355,969 of them guest=B72CB048, in 46 s). Match rows now
+  // get their own first-N/every-Nth counter, so the gate matches still show
+  // (13 in w12) without owning the log.
+  static std::atomic<uint32_t> s_ntRelMatchLogs{0};
+  bool matchLog = false;
+  if (targetHnd != 0 && guestHandle == targetHnd) {
+    const uint32_t mn = s_ntRelMatchLogs.fetch_add(1) + 1;
+    if (mn <= 40 || (mn % 2000) == 0) matchLog = true;
+  }
+  if (n <= 40 || (n % 2000) == 0 || matchLog) {
+    MCLA_LOG_ERROR("STEP5-ENTRY NtReleaseSemaphore guest={:08X} count={} lr={:08X} target={:08X}",
+                   guestHandle, ReleaseCount, callerLr, targetHnd);
   }
 
   Semaphore *sem = nullptr;
-  // F-588: which branch of the resolution ladder below actually produced `sem`.
-  // The TYPE-CENSUS[REL] "res=QueryKernelObject(Semaphore)" text is a hardcoded
-  // literal emitted ABOVE the ladder, so it never proved which object the
-  // release landed on - and the whole wake-loss question is exactly that.
   const char *resBranch = "none";
 
-  // SESSION 72 WAKE-LOSS + F-039 (p2o): NtCreateSemaphore mints an identity
-  // handle = MapVirtual(host Semaphore*). Wait (NtWaitForSingleObjectEx)
-  // resolves via GetKernelObject → that same host object. Release used to
-  // fall through to QueryKernelObject, which MINTED A FRESH wrapper (create
-  // never registered in WrapperIdentityMap) — Release landed on a different
-  // Semaphore and the waiter slept forever. Ring-B consumers parked on
-  // C5000280 after PUSH "released" it; preload never ran (INLINE-EXEC=0).
-  //
-  // Resolve Release the same way Wait does for identity handles:
-  //  1. type-agnostic identity map hit (NtCreate* registration)
-  //  2. TryQueryKernelObject on the header (guest-owned lazy wraps)
-  //  3. physical-arena host object (legacy creates not yet in the map)
-  // Never QueryKernelObject-mint over an identity handle.
-  {
-    const uint32_t guestHandle =
-        static_cast<uint32_t>(reinterpret_cast<const uint8_t *>(Handle) -
-                              mcla::kernel::g_memory.base);
-    if (IsKernelObject(guestHandle)) {
-      if (auto *id = LookupIdentityKernelObject(guestHandle)) {
-        // 2026-10-21 (fix_dpc): CHECKED cast. The identity map holds one
-        // wrapper per dispatcher address; its class is fixed at creation, so
-        // an unchecked static_cast<Semaphore*> on an Event entry wrote the
-        // semaphore's count over the event's state (audit C20).
-        sem = dynamic_cast<Semaphore *>(id);
-        if (sem)
-          resBranch = "identity-map";
-        else
-          resBranch = "identity-map-not-a-semaphore";
-      } else {
-        void *raw = mcla::kernel::GuestMemoryHeap::Instance().Translate(
-            guestHandle);
-        if (raw) {
-          auto *hdr = reinterpret_cast<XDISPATCHER_HEADER *>(raw);
-          sem = TryQueryKernelObject<Semaphore>(*hdr);
-          if (sem) {
-            resBranch = "try-query-header";
-          } else if (g_userHeap.IsPhysicalArenaPtr(raw)) {
-            // CreateKernelObject product living in the physical arena - the
-            // same pointer Wait's GetKernelObject raw-fallback returns.
-            //
-            // CONSOLE-CORRECT HANDLE (2026-10-21, fix_typebyte): the handle
-            // IS the dispatcher header (GetKernelHandle ->
-            // MapVirtual(&obj->header)), so `raw` is the HEADER, not a
-            // Semaphore wrapper: casting it and calling Release() on it is a
-            // wild virtual call through a garbage vtable.  The KernelObject
-            // wrapper sits KernelObjectHeaderOffset() BELOW the header (the
-            // C++ vptr is at the wrapper's base), so recover it by
-            // subtracting that offset.  MEASURED: this branch IS reached -
-            // build/w842.log "RELSEMA-RES #27 guest=B98EE040
-            // branch=physical-arena-reinterpret live=1".
-            auto *host = reinterpret_cast<Semaphore *>(
-                reinterpret_cast<uint8_t *>(raw) - KernelObjectHeaderOffset());
+  if (IsKernelObject(guestHandle)) {
+    if (auto *id = LookupIdentityKernelObject(guestHandle)) {
+      sem = SafeDynamicCast<Semaphore>(id);
+      if (sem)
+        resBranch = "identity-map";
+      else
+        resBranch = "identity-map-not-a-semaphore";
+    } else {
+      void *raw = mcla::kernel::GuestMemoryHeap::Instance().Translate(guestHandle);
+      if (raw) {
+        auto *hdr = reinterpret_cast<XDISPATCHER_HEADER *>(raw);
+        sem = TryQueryKernelObject<Semaphore>(*hdr);
+        if (sem) {
+          resBranch = "try-query-header";
+        } else if (g_userHeap.IsPhysicalArenaPtr(raw)) {
+          auto *host = reinterpret_cast<Semaphore *>(
+              reinterpret_cast<uint8_t *>(raw) - KernelObjectHeaderOffset());
+          __try {
             if (host->IsValid()) {
               sem = host;
               resBranch = "physical-arena-reinterpret";
             } else {
               resBranch = "physical-arena-invalid";
             }
-          } else {
-            resBranch = "raw-unusable";
+          } __except (1) {
+            resBranch = "physical-arena-fault";
           }
         } else {
-          resBranch = "translate-null";
+          resBranch = "raw-unusable";
         }
+      } else {
+        resBranch = "translate-null";
       }
-    } else {
-      resBranch = "not-kernel-object";
     }
+  } else {
+    resBranch = "not-kernel-object";
   }
-  // Guest-owned XKSEMAPHORE headers (KeInitializeSemaphore path). Only mint
-  // a wrapper when we did NOT resolve an identity object above.
-  //
-  // 2026-10-21 (fix_dpc): ONE REGISTRY. The canonical wrapper for this
-  // dispatcher address wins, whatever its class. If it is an EVENT (the
-  // guest's own dispatcher headers are type 0/1 - see the SEMA-FALLBACK row
-  // in w838.log) then the waiter is parked on THAT event, so the release is
-  // delivered as a set on it: that is the only action that can wake the
-  // waiter, and minting a phantom semaphore here would guarantee the loss
-  // (audit C17/C19).
+
   if (!sem) {
-    if (auto *ev = TryQueryKernelObject<Event>(Handle->Header)) {
-      ev->Set();
-      resBranch = "canonical-event-set";
-      MCLA_LOG_WARN("RELSEMA-EVENTSET guest={:08X} rel={} lr={:08X} "
-                    "(canonical wrapper is an EVENT - set, not released)",
-                    static_cast<uint32_t>(reinterpret_cast<const uint8_t *>(Handle) -
-                                          mcla::kernel::g_memory.base),
-                    ReleaseCount,
-                    static_cast<uint32_t>(g_ppcContext ? g_ppcContext->lr : 0));
-    } else {
-      sem = QueryKernelObject<Semaphore>(Handle->Header);
-      resBranch = "MINT-QueryKernelObject";
+    void *raw = mcla::kernel::GuestMemoryHeap::Instance().Translate(guestHandle);
+    if (raw) {
+      auto *hdr = reinterpret_cast<XDISPATCHER_HEADER *>(raw);
+      if (auto *ev = TryQueryKernelObject<Event>(*hdr)) {
+        __try {
+          ev->Set();
+          resBranch = "canonical-event-set";
+        } __except (1) {
+          resBranch = "canonical-event-fault";
+        }
+        MCLA_LOG_WARN("RELSEMA-EVENTSET guest={:08X} rel={} lr={:08X} "
+                      "(canonical wrapper is an EVENT - set, not released)",
+                      guestHandle, ReleaseCount, callerLr);
+      } else {
+        sem = QueryKernelObject<Semaphore>(*hdr);
+        resBranch = "MINT-QueryKernelObject";
+      }
     }
   }
 
-  // F-588: report the branch that actually won, per handle, bounded. This is
-  // the measurement the hardcoded res= text was pretending to be.
-  // F-589: also print the RESOLVED POINTER and the CURRENT COUNT. handle =
-  // hostPtr - 0x100000000, so handle 0xC5400280 must resolve to 0x1C5400280.
-  // The SEMA-wait/SEMA-release probe rows at this=0x1c6420280 belong to a
-  // DIFFERENT handle (0xC6420280) - one handle resolving to two pointers, or a
-  // count that never leaves 0, is the wake-loss; this line shows which.
-  {
-    static std::atomic<uint32_t> s_resLogs{0};
-    const uint32_t rn = s_resLogs.fetch_add(1) + 1;
-    if (rn <= 60 || (rn % 500) == 0) {
-      const uint32_t gh =
-          static_cast<uint32_t>(reinterpret_cast<const uint8_t *>(Handle) -
-                                mcla::kernel::g_memory.base);
-      const bool live = (sem != nullptr) && sem->IsValid();
-      const uint32_t sc =
-          live ? sem->count.load(std::memory_order_relaxed) : 0xFFFFFFFFu;
-      MCLA_LOG_WARN("RELSEMA-RES #{} guest={:08X} branch={} live={} rel={} "
-                    "sem={} cnt={} lr={:08X}",
-                    rn, gh, resBranch, live ? 1 : 0, ReleaseCount,
-                    static_cast<const void *>(live ? sem : nullptr), sc,
-                    static_cast<uint32_t>(g_ppcContext ? g_ppcContext->lr : 0));
-    }
-  }
-
-  // p2f crash-2 guard: the preload completion releases C9B36F00 after the
-  // worker ran its build pass; lazy-wrap can hand back a stale/destroyed
-  // wrapper whose vptr is garbage (observed __RTDynamicCast AV with
-  // Param[1]=-8: vtable read of a null/freed host object right after
-  // NtReleaseSemaphore+0x2A9). A semaphore release that cannot resolve a
-  // live object is a no-op wake — never a host crash. Log and succeed.
-  if (!sem || !sem->IsValid()) {
-    static std::atomic<uint32_t> s_relDead{0};
-    const uint32_t dn = s_relDead.fetch_add(1) + 1;
-    if (dn <= 20 || (dn % 500) == 0) {
-      const uint32_t guestHandle =
-          static_cast<uint32_t>(reinterpret_cast<const uint8_t *>(Handle) -
-                                mcla::kernel::g_memory.base);
-      MCLA_LOG_WARN("RELSEMA-DEAD #{:03} guest={:08X} count={} lr={:08X} "
-                    "(no live wrapper — no-op release)",
-                    dn, guestHandle, ReleaseCount,
-                    static_cast<uint32_t>(g_ppcContext ? g_ppcContext->lr : 0));
+  if (std::string_view(resBranch) == "canonical-event-set") {
+    if (targetHnd != 0 && guestHandle == targetHnd) {
+      MCLA_LOG_ERROR("STEP5-MATCH NtReleaseSemaphore SUCCEEDED (event): handle={:08X} lr={:08X}",
+                     guestHandle, callerLr);
     }
     if (PreviousCount != nullptr)
       *PreviousCount = 0;
     return STATUS_SUCCESS;
   }
 
-  uint32_t previousCount;
-  // F-852 (fix_sema): the LIVE-count census on the RELEASE side, so the
-  // release and the wait can be compared by OBJECT POINTER and by COUNT.  A
-  // release that lands on a different wrapper than the one a waiter is
-  // parked on is the wake-loss, and it is invisible in every row that only
-  // prints a handle (the F-370 row) or a count taken at a different moment.
-  {
-      const uint32_t relHandle = static_cast<uint32_t>(
-          reinterpret_cast<const uint8_t *>(Handle) - mcla::kernel::g_memory.base);
-      uint32_t c = 0, mx = 0, w = 0;
-      SemCntSnapshot(sem, &c, &mx, &w);
-      g_semCntReleases.fetch_add(1, std::memory_order_relaxed);
-      SemCntRow("RELEASE-BEFORE", relHandle, sem, c, mx, w, ReleaseCount,
-                static_cast<uint32_t>(g_ppcContext ? g_ppcContext->lr : 0),
-                false);
+  if (!sem || !sem->IsValid()) {
+    MCLA_LOG_ERROR("STEP5-DEAD NtReleaseSemaphore FAILED: handle={:08X} count={} lr={:08X} target={:08X} match={} branch={}",
+                   guestHandle, ReleaseCount, callerLr, targetHnd, (targetHnd != 0 && guestHandle == targetHnd), resBranch);
+    static std::atomic<uint32_t> s_relDead{0};
+    s_relDead.fetch_add(1);
+    if (PreviousCount != nullptr)
+      *PreviousCount = 0;
+    return STATUS_SUCCESS;
   }
-  sem->Release(ReleaseCount, &previousCount);
+
+  if (targetHnd != 0 && guestHandle == targetHnd) {
+    MCLA_LOG_ERROR("STEP5-MATCH NtReleaseSemaphore SUCCEEDED (sema): handle={:08X} count={} lr={:08X}",
+                   guestHandle, ReleaseCount, callerLr);
+  }
+
+  uint32_t previousCount = 0;
   {
-      const uint32_t relHandle = static_cast<uint32_t>(
-          reinterpret_cast<const uint8_t *>(Handle) - mcla::kernel::g_memory.base);
-      uint32_t c = 0, mx = 0, w = 0;
-      SemCntSnapshot(sem, &c, &mx, &w);
-      SemCntRow("RELEASE-AFTER", relHandle, sem, c, mx, w, ReleaseCount,
-                static_cast<uint32_t>(g_ppcContext ? g_ppcContext->lr : 0),
-                false);
+    uint32_t c = 0, mx = 0, w = 0;
+    SemCntSnapshot(sem, &c, &mx, &w);
+    g_semCntReleases.fetch_add(1, std::memory_order_relaxed);
+    SemCntRow("RELEASE-BEFORE", guestHandle, sem, c, mx, w, ReleaseCount, callerLr, false);
+  }
+
+  if (!SafeSemaphoreRelease(sem, ReleaseCount, &previousCount)) {
+    MCLA_LOG_ERROR("STEP5-DEAD NtReleaseSemaphore SafeSemaphoreRelease FAULTED: handle={:08X} lr={:08X}",
+                   guestHandle, callerLr);
+  }
+
+  {
+    uint32_t c = 0, mx = 0, w = 0;
+    SemCntSnapshot(sem, &c, &mx, &w);
+    SemCntRow("RELEASE-AFTER", guestHandle, sem, c, mx, w, ReleaseCount, callerLr, false);
   }
 
   if (PreviousCount != nullptr)
@@ -9356,8 +9417,11 @@ void sub_821BD618(PPCContext &ctx, uint8_t *base) {
     const uint32_t lr32 = static_cast<uint32_t>(ctx.lr);
     const bool resourceFatal =
         lr32 == 0x8260A8B0u || lr32 == 0x82184514u ||
-        lr32 == 0x821D2378u ||
+        lr32 == 0x821D2378u || lr32 == 0x821BC820u ||
         std::strstr(msgBuf, "Resource") != nullptr ||
+        std::strstr(msgBuf, "resource") != nullptr ||
+        std::strstr(msgBuf, "bad handle") != nullptr ||
+        std::strstr(msgBuf, "GetResourceInfo") != nullptr ||
         std::strstr(msgBuf, "unknown type") != nullptr ||
         std::strstr(msgBuf, "Fixup") != nullptr ||
         lr32 == 0x825EF1FCu || lr32 == 0x825EF1A4u || lr32 == 0x825EF1DCu;
@@ -9652,6 +9716,10 @@ uint32_t ExCreateThread(be<uint32_t> *handle, uint32_t stackSize,
 
   GuestThreadHandle *hThread = GuestThread::Start(
       {startAddress, startContext, creationFlags}, &hostThreadId);
+  if (!hThread) {
+    MCLA_LOG_ERROR("ExCreateThread: GuestThread::Start returned null (physical pool OOM)");
+    return 0x80000000; // E_FAIL / STATUS_UNSUCCESSFUL
+  }
   // F-799 (2026-10-17, w791): register the thread object in the identity
   // map -- the same two steps NtCreateFile already performs for file
   // objects (imports.cpp, the "Publish the object in the identity map"
@@ -10217,12 +10285,24 @@ uint32_t XMACreateContext(be<uint32_t> *outContext) {
 //   samples = be<float> [6 ch * 256], channel-major.
 uint32_t XAudioRegisterRenderDriverClient(be<uint32_t> *callback,
                                           be<uint32_t> *driver) {
+  MCLA_LOG_INFO("[AUDIO-TRACE] XAudioRegisterRenderDriverClient called: callbackPtr={} driverPtr={}", 
+                (void*)callback, (void*)driver);
+  if (callback) {
+    MCLA_LOG_INFO("[AUDIO-TRACE]   callback[0]=0x{:08X} callback[1]=0x{:08X}", 
+                  (uint32_t)callback[0], (uint32_t)callback[1]);
+  } else {
+    MCLA_LOG_INFO("[AUDIO-TRACE]   callback is null");
+  }
   if (driver) {
     if (callback) {
       *driver = apu::RegisterClient(callback[0], callback[1]);
+      MCLA_LOG_INFO("[AUDIO-TRACE]   registered, driver handle set to 0x{:08X}", (uint32_t)*driver);
     } else {
       *driver = apu::RegisterClient(0, 0);
+      MCLA_LOG_INFO("[AUDIO-TRACE]   registered with null callback, driver handle set to 0x{:08X}", (uint32_t)*driver);
     }
+  } else {
+    MCLA_LOG_INFO("[AUDIO-TRACE]   driver ptr is null, cannot return handle");
   }
   return 0;
 }
@@ -10759,3 +10839,6 @@ GUEST_FUNCTION_HOOK(__imp__XAudioUnregisterRenderDriverClient,
                     XAudioUnregisterRenderDriverClient);
 GUEST_FUNCTION_HOOK(__imp__XAudioSubmitRenderDriverFrame,
                     XAudioSubmitRenderDriverFrame);
+
+
+

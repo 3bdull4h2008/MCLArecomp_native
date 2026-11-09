@@ -25,6 +25,10 @@ inline void Initialize(const char* appName = "mcla", Level level = Level::Info, 
     static std::once_flag initFlag;
     std::call_once(initFlag, [&]() {
         auto consoleSink = std::make_shared<spdlog::sinks::stdout_color_sink_mt>();
+        const char* quietEnv = std::getenv("MCLA_QUIET");
+        if (quietEnv && quietEnv[0] == '1') {
+            consoleSink->set_level(spdlog::level::critical);
+        }
         consoleSink->set_pattern("[%H:%M:%S.%e] [%^%l%$] %v");
 
         std::vector<spdlog::sink_ptr> sinks = {consoleSink};
@@ -41,7 +45,7 @@ inline void Initialize(const char* appName = "mcla", Level level = Level::Info, 
 
         auto logger = std::make_shared<spdlog::logger>("mcla", sinks.begin(), sinks.end());
         logger->set_level(static_cast<spdlog::level::level_enum>(static_cast<int>(level)));
-        logger->flush_on(spdlog::level::warn);
+        logger->flush_on(spdlog::level::err);
         spdlog::set_default_logger(logger);
         spdlog::set_pattern("[%H:%M:%S.%e] [%^%l%$] %v");
     });

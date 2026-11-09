@@ -294,6 +294,28 @@ inline KernelObject* LookupKernelObjectByDispatcher(XDISPATCHER_HEADER& header)
     return it->second.obj;
 }
 
+inline thread_local bool t_inSafeExcept = false;
+
+template<typename T, typename Base>
+inline T* SafeDynamicCast(Base* obj)
+{
+    if (!obj) return nullptr;
+#if defined(_WIN32)
+    t_inSafeExcept = true;
+    T* res = nullptr;
+    __try {
+        res = dynamic_cast<T*>(obj);
+    } __except (1) {
+        t_inSafeExcept = false;
+        return nullptr;
+    }
+    t_inSafeExcept = false;
+    return res;
+#else
+    return dynamic_cast<T*>(obj);
+#endif
+}
+
 // Resolve the canonical wrapper for a dispatcher address AS a given class.
 // Identity (dynamic_cast), never the guest-visible Type byte.
 template<typename T = KernelObject>
@@ -304,11 +326,7 @@ inline T* TryQueryKernelObject(XDISPATCHER_HEADER& header)
     auto it = WrapperIdentityMap().find(hdrAddr);
     if (it == WrapperIdentityMap().end())
         return nullptr;
-    // dynamic_cast, NOT static_cast: the stored wrapper's class is decided
-    // once, at creation, and must never be type-confused by a caller that
-    // asks for a different class (audit C20: the release path cast an Event
-    // to Semaphore* and wrote a semaphore count over the event's state).
-    return dynamic_cast<T*>(it->second.obj);
+    return SafeDynamicCast<T>(it->second.obj);
 }
 
 template<typename T = KernelObject>
@@ -322,7 +340,7 @@ inline T* QueryKernelObject(XDISPATCHER_HEADER& header)
     {
         // The canonical wrapper for this dispatcher address. Resolve by
         // IDENTITY: the guest-visible Type byte cannot choose the object.
-        if (auto* typed = dynamic_cast<T*>(it->second.obj))
+        if (auto* typed = SafeDynamicCast<T>(it->second.obj))
             return typed;
 
         // CLASS MISMATCH: this address already owns a wrapper of a different

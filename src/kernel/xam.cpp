@@ -9,6 +9,9 @@
 #include <functional>
 #include <tuple>
 #include <vector>
+#include <deque>
+#include <cstdlib>
+#include <chrono>
 #include <array>
 #include <algorithm>
 #include <atomic>
@@ -197,11 +200,23 @@ uint32_t XamContentCreateEx(
     uint64_t qwMaxSize,
     XXOVERLAPPED* pOverlapped)
 {
+    if (g_ppcContext) {
+        const auto& c = *g_ppcContext;
+        MCLA_LOG_ERROR("TEMP-XCONTENT {} r3={:08X} r4={:08X} r5={:08X} r6={:08X} r7={:08X} r8={:08X} r9={:08X} r10={:08X} lr={:08X}",
+                       "CreateEx", c.r3.u32, c.r4.u32, c.r5.u32, c.r6.u32, c.r7.u32, c.r8.u32, c.r9.u32, c.r10.u32,
+                       static_cast<uint32_t>(c.lr));
+    }
     return 0;
 }
 
 uint32_t XamContentClose(const char* szRootName, XXOVERLAPPED* pOverlapped)
 {
+    if (g_ppcContext) {
+        const auto& c = *g_ppcContext;
+        MCLA_LOG_ERROR("TEMP-XCONTENT {} r3={:08X} r4={:08X} r5={:08X} r6={:08X} r7={:08X} r8={:08X} r9={:08X} r10={:08X} lr={:08X}",
+                       "Close", c.r3.u32, c.r4.u32, c.r5.u32, c.r6.u32, c.r7.u32, c.r8.u32, c.r9.u32, c.r10.u32,
+                       static_cast<uint32_t>(c.lr));
+    }
     return 0;
 }
 
@@ -210,7 +225,7 @@ uint32_t XamContentGetDeviceData(uint32_t DeviceID, XDEVICE_DATA* pDeviceData)
     static std::atomic<uint32_t> s_cdd{0};
     const uint32_t n = s_cdd.fetch_add(1) + 1;
     if (n <= 8 || (n % 500) == 0)
-        MCLA_LOG_WARN("XamContentGetDeviceData[{}] DeviceID={:08X} out={:08X} "
+        MCLA_LOG_ERROR("XamContentGetDeviceData[{}] DeviceID={:08X} out={:08X} "
                       "(fills nothing — guest sees zeros)",
                       n, DeviceID, reinterpret_cast<uintptr_t>(pDeviceData));
     return 0;
@@ -227,7 +242,7 @@ uint32_t XamContentCreateEnumerator(
 {
     static std::atomic<uint32_t> s_cce{0};
     const uint32_t n = s_cce.fetch_add(1) + 1;
-    MCLA_LOG_WARN("XamContentCreateEnumerator[{}] user={} dev={:08X} "
+    MCLA_LOG_ERROR("XamContentCreateEnumerator[{}] user={} dev={:08X} "
                   "type={:08X} flags={:08X} cItem={}",
                   n, dwUserIndex, DeviceID, dwContentType, dwContentFlags,
                   cItem);
@@ -244,10 +259,16 @@ uint32_t XamEnumerate(
 {
     static std::atomic<uint32_t> s_cen{0};
     const uint32_t n = s_cen.fetch_add(1) + 1;
-    MCLA_LOG_WARN("XamEnumerate[{}] hEnum={:08X} flags={:08X} cb={} "
-                  "(returns 0 items)",
-                  n, hEnum, dwFlags, cbBuffer);
-    return 0;
+    // No host enumerator object exists, so every handle is unknown. Xenia
+    // (xam_enum.cc XamEnumerate_entry) answers an unknown handle with
+    // X_ERROR_INVALID_HANDLE synchronously; the old "return 0" claimed success
+    // and never completed pOverlapped, so an overlapped caller waited forever.
+    if (n <= 16 || (n % 500) == 0)
+        MCLA_LOG_ERROR("XamEnumerate[{}] hEnum={:08X} flags={:08X} cb={} ovl={} lr={:08X} "
+                       "-> X_ERROR_INVALID_HANDLE (no enumerator objects on this host)",
+                       n, hEnum, dwFlags, cbBuffer, pOverlapped ? 1 : 0,
+                       static_cast<uint32_t>(g_ppcContext ? g_ppcContext->lr : 0));
+    return 6; // X_ERROR_INVALID_HANDLE
 }
 
 // ===========================================================================
@@ -381,6 +402,31 @@ PortSnapshot        g_ports[kNumPorts];   // guarded by g_portLock
 Pad                 g_pads[kNumPorts];    // MAIN THREAD ONLY
 std::atomic<uint32_t> g_rumbleReq[kNumPorts];      // lo | hi<<16, guest -> main
 std::atomic<bool>     g_rumblePending[kNumPorts];
+
+// Host keystroke queue (b-3). Main thread enqueues edges from SampleKeyboard;
+// guest thread dequeues one per XamInputGetKeystrokeEx. Guarded by mutex.
+std::mutex                          g_ksLock;
+std::deque<XAMINPUT_KEYSTROKE_HOST> g_ksQueue;
+constexpr size_t                    kKsQueueCap = 256;
+
+struct KeyMapping {
+    SDL_Scancode scancode;
+    uint16_t     vk;
+};
+static const KeyMapping kKeyMappings[] = {
+    { SDL_SCANCODE_SPACE,  0x0020 },
+    { SDL_SCANCODE_RETURN, 0x000D },
+    { SDL_SCANCODE_ESCAPE, 0x001B },
+    { SDL_SCANCODE_UP,     0x0026 },
+    { SDL_SCANCODE_DOWN,   0x0028 },
+    { SDL_SCANCODE_LEFT,   0x0025 },
+    { SDL_SCANCODE_RIGHT,  0x0027 },
+    { SDL_SCANCODE_A,      0x0041 },
+    { SDL_SCANCODE_S,      0x0053 },
+    { SDL_SCANCODE_D,      0x0044 },
+    { SDL_SCANCODE_W,      0x0057 },
+};
+static bool s_prevKeyState[sizeof(kKeyMappings)/sizeof(kKeyMappings[0])] = {};
 
 // True when `p` and the `size` bytes after it are both inside the 4 GiB guest
 // window. Every out-parameter arriving through GUEST_FUNCTION_HOOK is a
@@ -526,7 +572,7 @@ PortSnapshot ReadPort(uint32_t port)
     return g_ports[port];
 }
 
-Sample SampleGamepad(const Pad& p)
+Sample SampleGamepad(const Pad& p, uint32_t port)
 {
     Sample s;
     s.source   = PadSource::Gamepad;
@@ -562,54 +608,63 @@ Sample SampleGamepad(const Pad& p)
 // (tools/soak_census.py) can never mistake it for a real pad. It never claims
 // rumble - there are no motors.
 //
-// The pre-F-609 key map is kept byte-for-byte so existing logs and muscle
-// memory still apply. X, Y, BACK and both thumb buttons were absent because
-// the guest-visible bits were never written before; they are C, V, B, 1, 2 -
-// A/S/D/W already own the dpad-aliases and Q/E/I/J/K/L/U/O the rest.
+// The verified key map below (SampleKeyboard, :633-654) is authoritative;
+// docs/INPUT_DEEP_DIVE.md and docs/AUDIO_INPUT_3D_ANALYSIS.md describe it
+// correctly except for two stale auto-press claims (see below). X, Y, BACK
+// and both thumb buttons were absent pre-F-609 because the guest-visible
+// bits were never written; they are C, V, B, 1, 2. A/S/D/W own the dpad +
+// left-stick aliases and Q/E/I/J/K/L/U/O the rest. W/S are triple aliases
+// (DPAD + stick + trigger: W = UP + ly + RT, S = DOWN + ly + LT); arrows are
+// DPAD + stick only. The keystroke queue map (kKeyMappings :416-428) is much
+// narrower by design and is NOT the gamepad map.
+//
+// PRESS-ENTER decision for the title PRESS START screen: RETURN (Enter)
+// deliberately sets BOTH A (0x1000) and START (0x0010) (:639/:646); TAB sets
+// START only and SPACE sets A only. The dual RETURN is intentional so Enter
+// advances whether the guest tests A or START. There is NO auto-presser in
+// this function: no timer, no env-gated pulse, no MCLA_AUTO_ADVANCE. A soak
+// must physically press a key; do not re-add an auto-press shim (F-609).
 // ---------------------------------------------------------------------------
 Sample SampleKeyboard()
 {
-    int nkeys = 0;
-    const bool* k = SDL_GetKeyboardState(&nkeys);
-    if (!k || nkeys <= 0)
-    {
-        Sample s;
-        s.source = PadSource::Keyboard;
-        s.name   = "host keyboard (labelled fallback)";
-        return s;
-    }
-
-    auto down = [&](SDL_Keycode sym) -> bool {
-        const SDL_Scancode sc = SDL_GetScancodeFromKey(sym, nullptr);
-        if (sc == SDL_SCANCODE_UNKNOWN || static_cast<int>(sc) >= nkeys)
-            return false;
-        return k[sc];
-    };
-
     Sample s;
     s.source = PadSource::Keyboard;
     s.name   = "host keyboard (labelled fallback)";
 
-    if (down(SDLK_UP)    || down(SDLK_W)) { s.buttons |= XAMINPUT_GAMEPAD_DPAD_UP;    s.ly = 32767;  }
-    if (down(SDLK_DOWN)  || down(SDLK_S)) { s.buttons |= XAMINPUT_GAMEPAD_DPAD_DOWN;  s.ly = -32768; }
-    if (down(SDLK_LEFT)  || down(SDLK_A)) { s.buttons |= XAMINPUT_GAMEPAD_DPAD_LEFT;  s.lx = -32768; }
-    if (down(SDLK_RIGHT) || down(SDLK_D)) { s.buttons |= XAMINPUT_GAMEPAD_DPAD_RIGHT; s.lx = 32767;  }
-    if (down(SDLK_RETURN)  || down(SDLK_SPACE))    s.buttons |= XAMINPUT_GAMEPAD_A;
-    if (down(SDLK_ESCAPE)  || down(SDLK_BACKSPACE)) s.buttons |= XAMINPUT_GAMEPAD_B;
-    if (down(SDLK_C)) s.buttons |= XAMINPUT_GAMEPAD_X;   // WEST on an Xbox pad
-    if (down(SDLK_V)) s.buttons |= XAMINPUT_GAMEPAD_Y;   // NORTH on an Xbox pad
-    if (down(SDLK_B)) s.buttons |= XAMINPUT_GAMEPAD_BACK;
-    if (down(SDLK_1)) s.buttons |= XAMINPUT_GAMEPAD_LEFT_THUMB;
-    if (down(SDLK_2)) s.buttons |= XAMINPUT_GAMEPAD_RIGHT_THUMB;
-    if (down(SDLK_TAB)) s.buttons |= XAMINPUT_GAMEPAD_START;
-    if (down(SDLK_Q)) s.buttons |= XAMINPUT_GAMEPAD_LEFT_SHOULDER;
-    if (down(SDLK_E)) s.buttons |= XAMINPUT_GAMEPAD_RIGHT_SHOULDER;
-    if (down(SDLK_I)) s.ry = 32767;
-    if (down(SDLK_K)) s.ry = -32768;
-    if (down(SDLK_J)) s.rx = -32768;
-    if (down(SDLK_L)) s.rx = 32767;
-    if (down(SDLK_U)) s.ltrigger = 255;
-    if (down(SDLK_O)) s.rtrigger = 255;
+    int nkeys = 0;
+    const bool* k = SDL_GetKeyboardState(&nkeys);
+    if (k && nkeys > 0)
+    {
+        auto down = [&](SDL_Keycode sym) -> bool {
+            const SDL_Scancode sc = SDL_GetScancodeFromKey(sym, nullptr);
+            if (sc == SDL_SCANCODE_UNKNOWN || static_cast<int>(sc) >= nkeys)
+                return false;
+            return k[sc];
+        };
+
+        if (down(SDLK_UP))    { s.buttons |= XAMINPUT_GAMEPAD_DPAD_UP;    s.ly = 32767;  }
+        if (down(SDLK_DOWN))  { s.buttons |= XAMINPUT_GAMEPAD_DPAD_DOWN;  s.ly = -32768; }
+        if (down(SDLK_W))     { s.buttons |= XAMINPUT_GAMEPAD_DPAD_UP;    s.ly = 32767;  s.rtrigger = 255; }
+        if (down(SDLK_S))     { s.buttons |= XAMINPUT_GAMEPAD_DPAD_DOWN;  s.ly = -32768; s.ltrigger = 255; }
+        if (down(SDLK_LEFT)  || down(SDLK_A)) { s.buttons |= XAMINPUT_GAMEPAD_DPAD_LEFT;  s.lx = -32768; }
+        if (down(SDLK_RIGHT) || down(SDLK_D)) { s.buttons |= XAMINPUT_GAMEPAD_DPAD_RIGHT; s.lx = 32767;  }
+        if (down(SDLK_RETURN)  || down(SDLK_SPACE))    s.buttons |= XAMINPUT_GAMEPAD_A;
+        if (down(SDLK_ESCAPE)  || down(SDLK_BACKSPACE)) s.buttons |= XAMINPUT_GAMEPAD_B;
+        if (down(SDLK_C)) s.buttons |= XAMINPUT_GAMEPAD_X;   // WEST on an Xbox pad
+        if (down(SDLK_V)) s.buttons |= XAMINPUT_GAMEPAD_Y;   // NORTH on an Xbox pad
+        if (down(SDLK_B)) s.buttons |= XAMINPUT_GAMEPAD_BACK;
+        if (down(SDLK_1)) s.buttons |= XAMINPUT_GAMEPAD_LEFT_THUMB;
+        if (down(SDLK_2)) s.buttons |= XAMINPUT_GAMEPAD_RIGHT_THUMB;
+        if (down(SDLK_TAB) || down(SDLK_RETURN)) s.buttons |= XAMINPUT_GAMEPAD_START;
+        if (down(SDLK_Q)) s.buttons |= XAMINPUT_GAMEPAD_LEFT_SHOULDER;
+        if (down(SDLK_E)) s.buttons |= XAMINPUT_GAMEPAD_RIGHT_SHOULDER;
+        if (down(SDLK_I)) s.ry = 32767;
+        if (down(SDLK_K)) s.ry = -32768;
+        if (down(SDLK_J)) s.rx = -32768;
+        if (down(SDLK_L)) s.rx = 32767;
+        if (down(SDLK_U)) s.ltrigger = 255;
+        if (down(SDLK_O)) s.rtrigger = 255;
+    }
 
     return s;
 }
@@ -820,7 +875,7 @@ void XamInputPoll()
         if (g_pads[port].pad)
         {
             ApplyPendingRumble(port, g_pads[port]);
-            Publish(port, SampleGamepad(g_pads[port]));
+            Publish(port, SampleGamepad(g_pads[port], port));
         }
         else if (port != kKeyboardFallbackPort)
         {
@@ -833,7 +888,39 @@ void XamInputPoll()
     // sample would cross the None boundary twice per frame, and each crossing
     // is a dwPacketNumber increment the guest never earned.
     if (!g_pads[kKeyboardFallbackPort].pad)
+    {
+        // b-3: feed keystroke edges from the host keyboard path into the keystroke queue.
+        static int s_ksEnabled = -2;
+        if (s_ksEnabled == -2) {
+            const char* e = std::getenv("MCLA_KEYSTROKE_QUEUE");
+            s_ksEnabled = (e && *e && std::atoi(e) == 0) ? 0 : 1;
+            if (s_ksEnabled) MCLA_LOG_INFO("KEYSTROKE-QUEUE ON (MCLA_KEYSTROKE_QUEUE!=0)");
+        }
+        if (s_ksEnabled) {
+            int nkeys = 0;
+            const bool* k = SDL_GetKeyboardState(&nkeys);
+            if (k) {
+                constexpr size_t kNumKeys = sizeof(kKeyMappings)/sizeof(kKeyMappings[0]);
+                for (size_t i = 0; i < kNumKeys; ++i) {
+                    if (static_cast<int>(kKeyMappings[i].scancode) < nkeys) {
+                        const bool down = k[kKeyMappings[i].scancode];
+                        if (down != s_prevKeyState[i]) {
+                            s_prevKeyState[i] = down;
+                            XAMINPUT_KEYSTROKE_HOST ks{};
+                            ks.vk = kKeyMappings[i].vk;
+                            ks.unicode = 0;
+                            ks.flags = down ? 0x0001u : 0x0002u; // KEYDOWN / KEYUP
+                            ks.user_index = 0;
+                            ks.hid_code = 0;
+                            XamInputKeystrokeEnqueue(ks);
+                            MCLA_LOG_INFO("KEYSTROKE-ENQ vk=0x{:04X} {}", ks.vk, down ? "DOWN" : "UP");
+                        }
+                    }
+                }
+            }
+        }
         Publish(kKeyboardFallbackPort, SampleKeyboard());
+    }
 }
 
 uint32_t XamInputPortCount()
@@ -942,6 +1029,15 @@ uint32_t XamInputGetState(uint32_t userIndex, uint32_t flags, XAMINPUT_STATE* st
 {
     static std::atomic<uint32_t> s_calls{0};
     const uint32_t callCount = s_calls.fetch_add(1) + 1;
+    if (callCount == 1)
+        MCLA_LOG_ERROR("XINPUT-FIRST-POLL ui={:08X} flags={:08X}", userIndex, flags);
+    // TEMP-EC9C: post-load frame loop reads global 0x8286EC9C (object made by
+    // sub_822C7930) without a null check; print it ~every 150 polls.
+    if (callCount == 1 || (callCount % 150) == 0) {
+        uint32_t g = 0xFFFFFFFFu;
+        const bool okg = mcla::kernel::GuestMemoryHeap::Instance().ReadU32BE(0x8286EC9Cu, &g);
+        MCLA_LOG_ERROR("TEMP-EC9C poll={} u32[8286EC9C]={:08X} ok={}", callCount, g, okg ? 1 : 0);
+    }
 
     // A NULL state pointer is upstream's documented probe case: "Games call
     // this with a NULL state ptr, probably as a query"
@@ -951,8 +1047,10 @@ uint32_t XamInputGetState(uint32_t userIndex, uint32_t flags, XAMINPUT_STATE* st
     // whether the subsystem exists, not whether a pad is plugged in.
     // X_ERROR_EMPTY is 0x10D2 and X_ERROR_DEVICE_NOT_CONNECTED is 0x48F
     // (.research/xenia/src/xenia/xbox.h:86,100,106).
-    if (!state)
+    if (!state) {
+        MCLA_LOG_INFO("XINPUT-DEBUG: XamInputGetState probe (NULL state) ui={:08X} flags={:08X}", userIndex, flags);
         return 0;
+    }
 
     if (!GuestRangeOk(state, sizeof(XAMINPUT_STATE)))
     {
@@ -997,6 +1095,17 @@ uint32_t XamInputGetState(uint32_t userIndex, uint32_t flags, XAMINPUT_STATE* st
     state->Gamepad.sThumbLY        = Bswap16s(s.ly);
     state->Gamepad.sThumbRX        = Bswap16s(s.rx);
     state->Gamepad.sThumbRY        = Bswap16s(s.ry);
+
+    if (s.buttons != 0)
+    {
+        static std::atomic<uint32_t> s_btnDelivered{0};
+        const uint32_t bCount = s_btnDelivered.fetch_add(1) + 1;
+        if (bCount <= 8)
+        {
+            MCLA_LOG_ERROR("XINPUT-BUTTON-DELIVERED[{}] port={} packet={} buttons=0x{:04X}",
+                           bCount, port, s.packet, s.buttons);
+        }
+    }
 
     if (callCount <= 8 || (callCount % 2000) == 0)
     {
@@ -1079,4 +1188,22 @@ uint32_t XamInputSetState(uint32_t userIndex, uint32_t flags, XAMINPUT_VIBRATION
                       n, port, s.name, left, right);
 
     return 0;
+}
+
+void XamInputKeystrokeEnqueue(const XAMINPUT_KEYSTROKE_HOST& ks)
+{
+    std::lock_guard<std::mutex> lock(g_ksLock);
+    if (g_ksQueue.size() >= kKsQueueCap)
+        g_ksQueue.pop_front();
+    g_ksQueue.push_back(ks);
+}
+
+bool XamInputKeystrokeDequeue(XAMINPUT_KEYSTROKE_HOST* out)
+{
+    if (!out) return false;
+    std::lock_guard<std::mutex> lock(g_ksLock);
+    if (g_ksQueue.empty()) return false;
+    *out = g_ksQueue.front();
+    g_ksQueue.pop_front();
+    return true;
 }

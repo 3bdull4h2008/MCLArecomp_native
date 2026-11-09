@@ -149,10 +149,13 @@ DecodedInstruction DecodeInstruction(uint32_t word0, uint32_t word1,
             //          format:6(16-21), reserved2:2(22-23), expAdjust:6(24-29),
             //          isMiniFetch:1(30), isPredicated:1(31)
             //   word2: stride:8, offset:23, predCondition:1
-            // Below, isIndexRounded and vertexFormat match this layout;
-            // isSigned/isNormalized land on formatCompAll/numFormatAll
-            // (signedRfModeAll at bit 14 is not read), and expAdjust is
-            // still extracted two bits low (reserved2 is skipped).
+            // Below, all fields match this layout: isSigned/isNormalized
+            // are formatCompAll/numFormatAll (signedRfModeAll at bit 14
+            // has no DecodedInstruction field and is not read), and
+            // expAdjust is bits 24-29, AFTER the 2 reserved2 bits at
+            // 22-23. Reading it two bits low (>>22) folds reserved2 into
+            // the low end of the value, i.e. reports 4x the true
+            // adjustment on any word where expAdjust != 0.
             instr.constIndexSelect = (word0 >> 25) & 0x3;
             instr.prefetchCount = (word0 >> 27) & 0x7;
             instr.srcSwizzle = (word0 >> 30) & 0x3;
@@ -162,7 +165,7 @@ DecodedInstruction DecodeInstruction(uint32_t word0, uint32_t word1,
             instr.isNormalized = ((word1 >> 13) & 0x1) == 0;
             instr.isIndexRounded = ((word1 >> 15) & 0x1) != 0;
             instr.vertexFormat = (word1 >> 16) & 0x3F;
-            instr.expAdjust = static_cast<int32_t>((word1 >> 22) & 0x3F);
+            instr.expAdjust = static_cast<int32_t>((word1 >> 24) & 0x3F);
             if (instr.expAdjust >= 32) instr.expAdjust -= 64;
             instr.isMiniFetch = ((word1 >> 30) & 0x1) != 0;
             instr.isPredicated = ((word1 >> 31) & 0x1) != 0;
@@ -179,11 +182,29 @@ DecodedInstruction DecodeInstruction(uint32_t word0, uint32_t word1,
             //          useCompLod, useRegLod, unk, isPredicated (bit 31)
             //   word2: useRegGradients:1, sampleLocation:1, lodBias:7, :5,
             //          dimension:2 (bits 14-15), offsetX/Y/Z:5 each,
-            //          predCondition:1 -- the read below takes bits 13-14
+            //          predCondition:1
+            //
+            // F-900 (2026-10-27): THE dimension SHIFT IS 14, NOT 13 -- MEASURED,
+            // settling F-898(h). The old read took bits 13-14 (the comment above
+            // even admitted the discrepancy against its own bitfield line). Raw
+            // word from the live psB=48 program's tfetch (CP-SHADER-BODY in
+            // build/g944.log and g945.log, body
+            // [00000000 2001c400 22000009 10080001 1f1ff688 00004000 ...],
+            // fetch instr at dwords 3-5): word2 = 0x00004000.
+            //   (0x4000 >> 13) & 3 = 2  -> translator chose tCube (t3)
+            //   (0x4000 >> 14) & 3 = 1  -> t2D (t1)
+            // The descriptor for the SAME texture decodes dimension = 1 (2D,
+            // TEX-SLOT-DECIDE rows: dim=1 fmt=19 256x256) and the bind lands at
+            // heap slot 1 (t1), so the CORRECT shader resource is t2D/t1 -- the
+            // reference read agrees with both independent facts, and the old read
+            // made the shader sample tCube/t3 (a NULL SRV) while the real texture
+            // sat at t1: the black screen. ucode.h:868-874 places dimension:2 at
+            // bits 14-15 (fields: use_reg_gradients:1, sample_location:1,
+            // lod_bias:7, unused:5, dimension:2) -- the reference layout holds.
             instr.srcSwizzle = (word0 >> 26) & 0x3F;
             instr.dstSwizzle = word1 & 0xFFF;
             instr.isPredicated = ((word1 >> 31) & 0x1) != 0;
-            instr.dimension = (word2 >> 13) & 0x3;
+            instr.dimension = (word2 >> 14) & 0x3;
             instr.predicateCondition = ((word2 >> 31) & 0x1) != 0;
         }
         // Known fetch opcodes are the sparse FetchOpcode enum members

@@ -41,9 +41,14 @@ public:
     HWND GetHwnd() const { return m_hwnd; }
     uint32_t GetWidth() const { return m_width; }
     uint32_t GetHeight() const { return m_height; }
+    bool IsMinimized() const { return m_isMinimized; }
 
     // D3D12 backend access
     native::D3D12Backend* GetD3D12Backend() { return native::GetD3D12Backend(); }
+
+    // Graphics settings access
+    const native::GraphicsSettings& GetGraphicsSettings() const;
+    void SetGraphicsSettings(const native::GraphicsSettings& s);
 
     // Guest memory access
     native::GuestMemoryView& GetGuestMemoryView() { return m_guestMemoryView; }
@@ -78,6 +83,7 @@ private:
     HWND m_hwnd = nullptr;
     uint32_t m_width = 1280;
     uint32_t m_height = 720;
+    bool m_isMinimized = false;
     bool m_running = false;
 
     std::filesystem::path m_gameDataRoot;

@@ -1,6 +1,7 @@
-﻿#include "gpu_device.h"
+#include "gpu_device.h"
 #include "raw_inflate.h"  // F-130: expand a member the page-window hook can't
-#include "xmem_lzx.h"     // F-295: Path A host XMem/raw-LZX decoder (offline-proven)
+#include "xmem_lzx.h"     // F-295: Path A host XMem/raw-LZX decoder (
+#include "asset_cache.h"  // 2026-10-31: ready-file cache for decoded RSC5 bodiesoffline-proven)
 #include "gpu_cp.h"
 #include "render_queue.h"
 #include "renderer_mode.h"
@@ -474,7 +475,7 @@ static constexpr bool kPathBEnqueueUI = true;
 // and `RELSEMA ... lr=821BC538` fires ONCE per boot, for job #1 only.
 // true  = skip only the join-clear (the FENCE-SC semaphore pre-release stays armed),
 // false = the session-72 behaviour, byte-identical to every recent soak.
-static constexpr bool kF474NoPrematureJoinClear = false;
+static constexpr bool kF474NoPrematureJoinClear = true;
 
 // F-468 (T42.11 / task #74): mirror a UI container's streamer record onto the queue
 // TAG index its own job object will be read at, because F-467 measured the guest placing
@@ -594,9 +595,17 @@ static constexpr bool kF506ForceLength = false;
 
 // F-247 dynamic serve-framing predicate: defined after g_mclaRebaseMap (~:3945).
 static bool MclaIsCurrentJob2Pbase(uint32_t outPtr);
+// Request binding: true only on the streamer thread while it is inside sub_821BC140 for a record
+// whose own +24 file offset is readable. Then THAT record is the authority for dest -> package
+// and a stale job2 pbase/cache entry for the same address (recycled by the allocator) must not win.
+static thread_local bool t_inStreamerRequest = false;
+static uint32_t GetActiveStreamerRecordOffset();
+static bool StreamerRequestOwnsDest() { return t_inStreamerRequest && GetActiveStreamerRecordOffset() != 0u; }
 // w18: job #2 dests are the UI/swfC set only. Shared by package assigner
 // (file-scope) and the inflate host-serve paths.
 static bool IsJob2UiDest(uint32_t outPtr) {
+  if (StreamerRequestOwnsDest())
+    return false;
   // F-247 serve-framing (route 1, gated by kPathBEnqueueUI so OFF == exact
   // baseline). Root cause PROVEN across w245/w246: the hardcoded allowlist below
   // is a snapshot that OMITS most job2 PSTREAM children. Every omitted pbase dest
@@ -984,10 +993,56 @@ static constexpr bool kF524ServeUiStackDests = false;  // F-540: outLeft froze a
 // identity. Any retry must give the job its own descriptor instead of mutating st for these dests.
 // The capability finding stands regardless: see F-525 Â§1 and F-526.
 
+static std::atomic<uint32_t> s_activeStreamerTag{0};
+static std::atomic<uint32_t> s_activeStreamerSlotAddr{0};
+static thread_local const char *t_tempSrc = "none"; // TEMP-INFL probe: last leg that wrote st+4
+
+static bool GetActiveStreamerRecordInfo(uint32_t *outTag, uint32_t *outLen, uint32_t *outPkgOff) {
+  const uint32_t tag = s_activeStreamerTag.load(std::memory_order_relaxed);
+  if (tag == 0 || tag == 0xFFFFFFFFu)
+    return false;
+  auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
+  uint32_t arb = 0, cap = 0;
+  if (!mem.ReadU32BE(0x8283D190u + 52u, &arb) || !mem.ReadU32BE(0x8283D190u + 24u, &cap) ||
+      arb == 0 || cap == 0)
+    return false;
+  const uint32_t rec = arb + (tag & (cap - 1u)) * 28u;
+  uint32_t recTag = 0;
+  if (!mem.ReadU32BE(rec + 0u, &recTag) || recTag != tag)
+    return false;
+  if (outTag) *outTag = tag;
+  if (outLen) (void)mem.ReadU32BE(rec + 4u, outLen);
+  if (outPkgOff) (void)mem.ReadU32BE(rec + 24u, outPkgOff);
+  return true;
+}
+
+static uint32_t GetActiveStreamerRecordOffset() {
+  uint32_t off = 0;
+  if (GetActiveStreamerRecordInfo(nullptr, nullptr, &off))
+    return off;
+  return 0;
+}
+
 static uint32_t AssignPackageForDest(uint32_t outPtr) {
   BuildRscPackageTable();
   std::lock_guard<std::mutex> lk(g_destPkgMtx);
   auto it = g_destPkgOff.find(outPtr);
+  if (StreamerRequestOwnsDest()) {
+    // The active streamer record's +24 is the authority. A binding left by an earlier request that
+    // used the same address (allocator recycled it) is stale: rebind and start the walk at 0.
+    const uint32_t ownOff = GetActiveStreamerRecordOffset();
+    if (it == g_destPkgOff.end() || it->second != ownOff) {
+      static std::atomic<uint32_t> s_rebindN{0};
+      const uint32_t rn = s_rebindN.fetch_add(1) + 1;
+      MCLA_LOG_ERROR("TEMP-REBIND #{} dest={:08X} old={:08X} -> recOff={:08X} tag={:08X}", rn, outPtr,
+                     it == g_destPkgOff.end() ? 0u : it->second, ownOff,
+                     s_activeStreamerTag.load(std::memory_order_relaxed));
+      g_destPkgOff[outPtr] = ownOff;
+      g_destPkgWalk[outPtr] = 0;
+      g_pkgUsed[ownOff] = outPtr;
+      return ownOff;
+    }
+  }
   if (it != g_destPkgOff.end())
     return it->second;
   // F-510: this destination has never been bound, so decide it from the job that is
@@ -1065,8 +1120,11 @@ static uint32_t AssignPackageForDest(uint32_t outPtr) {
       return rp;
     }
   }
+  const uint32_t reqPkg = GetActiveStreamerRecordOffset();
   uint32_t chosen = 0;
-  if (IsJob2UiDest(outPtr)) {
+  if (reqPkg != 0) {
+    chosen = reqPkg;
+  } else if (IsJob2UiDest(outPtr)) {
     chosen = 0xA0000u;
   } else {
     // Prefer an unclaimed table entry; fall back to 0x60000.
@@ -1119,6 +1177,10 @@ static bool IsUiXsfPkg(uint32_t off) {
 // DEST-PKG out of order, changing which dest a pending UI package lands on.
 // Caller must not hold g_destPkgMtx.
 static uint32_t PeekPackageForDest(uint32_t outPtr) {
+  const uint32_t reqPkg = GetActiveStreamerRecordOffset();
+  if (reqPkg != 0) {
+    return reqPkg;
+  }
   std::lock_guard<std::mutex> lk(g_destPkgMtx);
   const auto it = g_destPkgOff.find(outPtr);
   return it == g_destPkgOff.end() ? 0u : it->second;
@@ -3368,6 +3430,7 @@ static uint32_t HostServeUiBody(const char *path, uint32_t &outSize,
   // and the gate cannot mistake "not this class" for "proved".
   uint32_t rsc5Declared = 0;  // RSC5+0x10, MclaRsc5DeclaredSize
   uint32_t rsc5Decoded = 0;   // bytes the host decode actually reproduced
+  uint32_t anchorOff = 0;     // .xspm page-base container offset (0 = not anchored)
   // F-876: XSF/XTD containers (legals.xsf, raceeditor.xsf, etc.) are served
   // as stored (no decompression) when storedLen != logicalLen. They are not
   // .list/.lst and not RSC5, so they need their own proved path.
@@ -3393,6 +3456,42 @@ static uint32_t HostServeUiBody(const char *path, uint32_t &outSize,
     // and dict bodies ARE those families; the old reject starved preload.
     if (be == 0xCDCDCDCDu || be == 0 || be == 0xFFFFFFFFu)
       continue;
+    // 2026-10-31 (.xspm): TOC word[2] is NOT an offset for this family.
+    // Re-anchor to the page base when the record and container agree on three
+    // facts (RSC5 magic, record's own w3 at +0x08, declared+20 == record's
+    // own w1). Offset only; never touches tmp/be, so wantsPkg still runs.
+    if (pass == 0 && anchorOff == 0 && (off & 0xFFFu) != 0 &&
+        std::strstr(path, ".xspm") != nullptr &&
+        be != kHeadRgxa && be != kHeadRsc5 && be != kHeadXcmp &&
+        be != kHeadRpf3) {
+      const uint32_t base = MclaPkgOffFromTocW2(off);
+      std::vector<uint8_t> head(20);
+      uint64_t got20 = 0;
+      const bool probeOk =
+          base != 0 && base != off &&
+          static_cast<uint64_t>(base) + readLen <= packSz;
+      // 2026-10-31: the VFS substitutes expanded (decompressed) spans for reads
+      // at member offsets, so a plain ReadFileAt(base) returns the SERVED body
+      // (head 0x22505245), not the raw RSC5 container. Set raw_positional so
+      // ApplyExpandedSpans is skipped and we see the real container bytes.
+      bool savedRaw = fh.raw_positional;
+      fh.raw_positional = true;
+      uint64_t got20b = 0;
+      const bool readOk = vfs.ReadFileAt(fh, base, head.data(), 20, got20b) && got20b >= 20;
+      fh.raw_positional = savedRaw;
+      const bool probeOk2 = probeOk && readOk;
+      if (probeOk2 && MclaBE(head.data()) == kHeadRsc5 &&
+          MclaBE(head.data() + 8) == w[3] &&
+          MclaBE(head.data() + 16) != 0 &&
+          MclaBE(head.data() + 16) + 20u == logicalLen) {
+        anchorOff = base;
+        be = kHeadRsc5;
+        MCLA_LOG_WARN("XSPM-REANCHOR path='{}' w1={} w2={:08X} w3={:08X} "
+                      "off={:08X} -> base={:08X} declared={}",
+                      path, logicalLen, w[2], w[3], off, base,
+                      MclaBE(head.data() + 16));
+      }
+    }
     // F-130 + F-632: the window may be the member still DEFLATE-compressed --
     // either because the archive layer has no expanded span for it, or because a
     // member straddling a read-window boundary (exactly the TOC's own
@@ -3553,7 +3652,7 @@ static uint32_t HostServeUiBody(const char *path, uint32_t &outSize,
     // Prefer the plaintext RSC5+XCompress package from the host table
     // (0x60000 meshtextures, 0xA0000 UI) when the candidate head is not
     // parseable. Lists keep their own plaintext name bodies.
-    uint32_t serveOff = off;
+    uint32_t serveOff = anchorOff ? anchorOff : off;
     std::vector<uint8_t> serveBytes = tmp;
     uint32_t pkgSubst = 0;
     {
@@ -3566,9 +3665,10 @@ static uint32_t HostServeUiBody(const char *path, uint32_t &outSize,
       // MclaPkgOffFromTocW2(w2) is non-zero for a member offset (0x3F0000 ->
       // 0x3F0000) and a member address is not a package address.
       const bool wantsPkg =
-          (pathPkg != 0 || tocPkg != 0) &&
-          !MclaHeadIsRscOrXc(tmp.data(), static_cast<uint32_t>(got)) &&
-          !(got >= 4 && MclaBE(tmp.data()) == kHeadRpf3);
+          anchorOff != 0 ||
+          ((pathPkg != 0 || tocPkg != 0) &&
+           !MclaHeadIsRscOrXc(tmp.data(), static_cast<uint32_t>(got)) &&
+           !(got >= 4 && MclaBE(tmp.data()) == kHeadRpf3));
       // Lists never take a package substitute (their name bodies work).
       // ".lst" is NOT a substring of ".list" -- the two are disjoint, so the
       // tune family fell through this guard. MEASURED in build/w679.log: all 8
@@ -3610,7 +3710,73 @@ static uint32_t HostServeUiBody(const char *path, uint32_t &outSize,
           else if (pathPkg != 0)
             pkgOff = pathPkg;  // MITIGATION fallback (pre-F-171 substring map)
         }
-        if (pkgOff != 0) {
+        if (anchorOff != 0) {
+          std::vector<uint8_t> cont(readLen);
+          uint64_t cgot = 0;
+          bool savedRaw2 = fh.raw_positional;
+          fh.raw_positional = true;
+          const bool cread = vfs.ReadFileAt(fh, anchorOff, cont.data(), readLen, cgot);
+          fh.raw_positional = savedRaw2;
+          if (cread && cgot >= readLen) {
+            const uint32_t cbe = MclaBE(cont.data());
+            if (cbe == 0x05435352u || cbe == 0x0FF512EFu) {
+              serveOff = anchorOff;
+              serveBytes.swap(cont);
+              pkgSubst = anchorOff;
+              MCLA_LOG_WARN("PKG-SUBST path='{}' tocOff={:08X} tocHead={:08X} "
+                            "-> pkg={:08X} head={:08X} n={} (anchored .xspm, "
+                            "read through the vfs)",
+                            path, off, be, anchorOff, cbe, serveBytes.size());
+              // 2026-10-31: decode the anchored (raw) container too, so the
+              // ready-file cache and the proved gate see it. Without this the
+              // decode block (below, gated on pkgOff) is skipped for anchored
+              // members and rsc5Declared stays 0 -> UNPROVED-BODY.
+              rsc5Declared = MclaRsc5DeclaredSize(
+                  serveBytes.data(), static_cast<uint32_t>(serveBytes.size()));
+              bool cacheBad = false;
+              std::vector<uint8_t> cached;
+              if (rsc5Declared != 0 &&
+                  mcla_asset_cache::Load(path, rsc5Declared, cached, &cacheBad)) {
+                serveBytes.swap(cached);
+                rsc5Decoded = rsc5Declared;
+                MCLA_LOG_WARN("ASSET-CACHE-HIT path='{}' off={:08X} declared={}",
+                              path, serveOff, rsc5Declared);
+              } else {
+                if (cacheBad)
+                  MCLA_LOG_WARN("ASSET-CACHE-BAD path='{}' off={:08X} declared={}",
+                                path, serveOff, rsc5Declared);
+                std::vector<uint8_t> decoded;
+                const int lzxPath = mcla_lzx::host_decode_ui_xsf(
+                    serveBytes.data(), static_cast<size_t>(serveBytes.size()),
+                    decoded, kXcWindowBits,
+                    std::strstr(path, ".xsf") != nullptr);
+                if (lzxPath != 0 && rsc5Declared != 0 &&
+                    decoded.size() == static_cast<size_t>(rsc5Declared)) {
+                  rsc5Decoded = static_cast<uint32_t>(decoded.size());
+                  serveBytes.swap(decoded);
+                  MCLA_LOG_WARN(
+                      "RSC5-XMEM-DECODE path='{}' off={:08X} lzxPath={} "
+                      "declared={} decoded={} w1={} w1delta={} -- container and "
+                      "decode AGREE, w1 does not (see SERVE-PROOF)",
+                      path, serveOff, lzxPath, rsc5Declared, rsc5Decoded,
+                      logicalLen,
+                      static_cast<int32_t>(logicalLen) -
+                          static_cast<int32_t>(rsc5Declared));
+                  if (!mcla_asset_cache::Store(path, serveBytes))
+                    MCLA_LOG_WARN("ASSET-CACHE-STORE-FAIL path='{}' off={:08X}",
+                                  path, serveOff);
+                } else {
+                  MCLA_LOG_WARN(
+                      "RSC5-XMEM-DECODE-FAIL path='{}' off={:08X} lzxPath={} "
+                      "declared={} decoded={} -- served as the container stands",
+                      path, serveOff, lzxPath, rsc5Declared,
+                      static_cast<uint32_t>(decoded.size()));
+                }
+              }
+            }
+          }
+        }
+        if (pkgOff != 0 && anchorOff == 0) {
         // F-169: ask the package how big it is before deciding the window. The
         // table-derived size below was floored at 32 KB and capped at 256 KB, and
         // MclaLoadPkgWindow clamped every read to 32 KB as well, so a 196 KB UI
@@ -3689,29 +3855,50 @@ static uint32_t HostServeUiBody(const char *path, uint32_t &outSize,
             if constexpr (kRsc5XmemDecode) {
               rsc5Declared = MclaRsc5DeclaredSize(
                   serveBytes.data(), static_cast<uint32_t>(serveBytes.size()));
-              std::vector<uint8_t> decoded;
-              const int lzxPath = mcla_lzx::host_decode_ui_xsf(
-                  serveBytes.data(), static_cast<size_t>(serveBytes.size()),
-                  decoded, kXcWindowBits);
-              if (lzxPath != 0 && rsc5Declared != 0 &&
-                  decoded.size() == static_cast<size_t>(rsc5Declared)) {
-                rsc5Decoded = static_cast<uint32_t>(decoded.size());
-                serveBytes.swap(decoded);
-                MCLA_LOG_WARN(
-                    "RSC5-XMEM-DECODE path='{}' off={:08X} lzxPath={} "
-                    "declared={} decoded={} w1={} w1delta={} -- container and "
-                    "decode AGREE, w1 does not (see SERVE-PROOF)",
-                    path, serveOff, lzxPath, rsc5Declared, rsc5Decoded,
-                    logicalLen,
-                    static_cast<int32_t>(logicalLen) -
-                        static_cast<int32_t>(rsc5Declared));
+              // 2026-10-31: path-keyed ready-file cache (see src/asset_cache.h).
+              bool cacheHit = false;
+              bool cacheBad = false;
+              std::vector<uint8_t> cached;
+              if (rsc5Declared != 0 &&
+                  mcla_asset_cache::Load(path, rsc5Declared, cached, &cacheBad)) {
+                cacheHit = true;
+                serveBytes.swap(cached);
+                rsc5Decoded = rsc5Declared;
+                MCLA_LOG_WARN("ASSET-CACHE-HIT path='{}' off={:08X} declared={}",
+                              path, serveOff, rsc5Declared);
               } else {
-                MCLA_LOG_WARN(
-                    "RSC5-XMEM-DECODE-FAIL path='{}' off={:08X} lzxPath={} "
-                    "declared={} decoded={} -- served as the container stands",
-                    path, serveOff, lzxPath, rsc5Declared,
-                    static_cast<uint32_t>(decoded.size()));
+                if (cacheBad)
+                  MCLA_LOG_WARN("ASSET-CACHE-BAD path='{}' off={:08X} declared={}",
+                                path, serveOff, rsc5Declared);
+                std::vector<uint8_t> decoded;
+                const int lzxPath = mcla_lzx::host_decode_ui_xsf(
+                    serveBytes.data(), static_cast<size_t>(serveBytes.size()),
+                    decoded, kXcWindowBits,
+                    std::strstr(path, ".xsf") != nullptr);
+                if (lzxPath != 0 && rsc5Declared != 0 &&
+                    decoded.size() == static_cast<size_t>(rsc5Declared)) {
+                  rsc5Decoded = static_cast<uint32_t>(decoded.size());
+                  serveBytes.swap(decoded);
+                  MCLA_LOG_WARN(
+                      "RSC5-XMEM-DECODE path='{}' off={:08X} lzxPath={} "
+                      "declared={} decoded={} w1={} w1delta={} -- container and "
+                      "decode AGREE, w1 does not (see SERVE-PROOF)",
+                      path, serveOff, lzxPath, rsc5Declared, rsc5Decoded,
+                      logicalLen,
+                      static_cast<int32_t>(logicalLen) -
+                          static_cast<int32_t>(rsc5Declared));
+                  if (!mcla_asset_cache::Store(path, serveBytes))
+                    MCLA_LOG_WARN("ASSET-CACHE-STORE-FAIL path='{}' off={:08X}",
+                                  path, serveOff);
+                } else {
+                  MCLA_LOG_WARN(
+                      "RSC5-XMEM-DECODE-FAIL path='{}' off={:08X} lzxPath={} "
+                      "declared={} decoded={} -- served as the container stands",
+                      path, serveOff, lzxPath, rsc5Declared,
+                      static_cast<uint32_t>(decoded.size()));
+                }
               }
+              (void)cacheHit;
             }
           }
         }
@@ -4021,7 +4208,7 @@ static uint32_t HostServeUiBody(const char *path, uint32_t &outSize,
       }
     }
     if (!reused) {
-      dst = mem.Alloc(static_cast<uint32_t>(serveBytes.size()), 16);
+      dst = mem.AllocHostBody(serveBytes.size());
       if (!dst)
         continue;
       if (!mem.WriteBytes(dst, serveBytes.data(),
@@ -4810,6 +4997,18 @@ PPC_FUNC(sub_821873E8) {
 // ROOT CAUSE is the unsignaled sync object (host defect), and the guest is correct
 // to wait. Falsifier: `MSGBISECT 5-822FBAF8 RETURN` goes 0 -> 1 and
 // `W35-BOOT-GATE` goes 0 -> >=1 in the next soak.
+// TEMP-UNSKIP: runs the guest function instead of a skip mitigation.
+// Default ON (true) so the real guest bodies (82185368 CreateTexture, 82189438,
+// 822EA1C0, 822FBAF8, 8260C560) execute as verified in g110e/g110f.
+// Set MCLA_UNSKIP=0 or MCLA_UNSKIP=none to disable.
+static bool MclaUnskip(const char *name) {
+  const char *e = std::getenv("MCLA_UNSKIP");
+  if (!e || !*e)
+    return true;
+  if (std::strcmp(e, "0") == 0 || std::strcmp(e, "none") == 0)
+    return false;
+  return std::strstr(e, name) || std::strstr(e, "all");
+}
 PPC_FUNC_IMPL(__imp__sub_82189438);
 static std::atomic<uint32_t> s_82189438_hits{0};
 PPC_FUNC(sub_82189438) {
@@ -4818,6 +5017,20 @@ PPC_FUNC(sub_82189438) {
     MCLA_LOG_WARN("FIX-82189438 #{} lr={:08X} r3={:08X} r4={:08X} "
                   "enter (returning 0, skipping wait)",
                   n, static_cast<uint32_t>(ctx.lr), ctx.r3.u32, ctx.r4.u32);
+  {  // TEMP-C7: name what each call loads (r3/r4 as C strings when readable).
+    auto &m7 = mcla::kernel::GuestMemoryHeap::Instance();
+    char a[49] = {}, b[49] = {};
+    unsigned char t[48] = {};
+    if (m7.ReadBytes(ctx.r3.u32, t, 48)) for (int k = 0; k < 48 && t[k]; ++k) a[k] = (t[k] >= 32 && t[k] < 127) ? char(t[k]) : '?';
+    if (m7.ReadBytes(ctx.r4.u32, t, 48)) for (int k = 0; k < 48 && t[k]; ++k) b[k] = (t[k] >= 32 && t[k] < 127) ? char(t[k]) : '?';
+    MCLA_LOG_ERROR("TEMP-C7-ENTER-82189438 #{} lr={:08X} r3={:08X}'{}' r4={:08X}'{}' r5={:08X}",
+                   n, static_cast<uint32_t>(ctx.lr), ctx.r3.u32, a, ctx.r4.u32, b, ctx.r5.u32);
+  }
+  if (MclaUnskip("82189438")) {
+    __imp__sub_82189438(ctx, base);
+    MCLA_LOG_ERROR("UNSKIP-82189438 lr={:08X} ret={:08X}", static_cast<uint32_t>(ctx.lr), ctx.r3.u32);
+    return;
+  }
   // Skip the original: it would KeWaitForSingleObject on 0x40004D7C forever.
   ctx.r3.u32 = 0;
   return;
@@ -6331,6 +6544,7 @@ PPC_FUNC(sub_8218BF20) {
 // Session 75l: stream slot allocator (fixed 40-byte slot array @0x82860C18,
 // per-slot 4KB buffers @0x82860DF8+i*0x1000). Args r4/r5 identify the data
 // source feeding the dict deserialization streams.
+static std::string MclaFdSlotPath(uint32_t fd);  // TEMP-C8, defined by g_slotPath
 PPC_FUNC_IMPL(__imp__sub_821BDDE8);
 static std::atomic<uint32_t> s_h1BDDE8{0};
 PPC_FUNC(sub_821BDDE8) {
@@ -6400,6 +6614,18 @@ PPC_FUNC(sub_821BDDE8) {
                     [&]{ uint32_t v=0; mem3.ReadU32BE(kTblBase+80,&v); return v; }(),
                     [&]{ uint32_t v=0; mem3.ReadU32BE(kTblBase+440,&v); return v; }(),
                     static_cast<uint32_t>(ctx.lr));
+    }
+    if (freeSlots == 0) {  // TEMP-C8: who holds the 12 stream slots
+      static std::atomic<uint32_t> s_c8full{0};
+      if (s_c8full.fetch_add(1) < 3) {
+        for (uint32_t s2 = 0; s2 < kTblSlots; ++s2) {
+          uint32_t w[10] = {};
+          for (int k = 0; k < 10; ++k) (void)mem3.ReadU32BE(kTblBase + s2 * kTblStride + k * 4u, &w[k]);
+          MCLA_LOG_ERROR("TEMP-C8-SLOTS slot={} w=[{:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X}] fdPath='{}' lr={:08X}",
+                         s2, w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7], w[8], w[9],
+                         MclaFdSlotPath(w[1]), static_cast<uint32_t>(ctx.lr));
+        }
+      }
     }
     if (freeSlots == 0 && bestSlot != 0xFFFFFFFF) {
       // Table full AND we found an occupied slot. Free the one with the
@@ -7633,7 +7859,7 @@ static const F501Body *F501Find(uint32_t h) {
 // F-503 also restores the three address/geometry words the walk reads at
 // ppc_recomp.14.cpp:18904 (record+24), :18931 and :18957 (record+16). Set false to get
 // back F-502's exact single-word behaviour.
-static constexpr bool kF503KeepFieldsOnRelease = true;
+static constexpr bool kF503KeepFieldsOnRelease = false;
 
 // F-502 (T42.31): WHERE that zero actually lands. w501 measured `F500-DEVREAD #1`
 // reading record C9E2491C's +4 as 143,069 at our dispatch-entry probe, and the walk's
@@ -7646,15 +7872,17 @@ static constexpr bool kF503KeepFieldsOnRelease = true;
 // we hand back only the byte count, and only while that record's job is still in
 // flight (pushed and not yet returned from sub_821BC140) so a long-dead record can
 // never be resurrected. Set false for the exact pre-change behaviour.
-static constexpr bool kF502KeepLenOnRelease = true;
+static constexpr bool kF502KeepLenOnRelease = false;
 static std::atomic<uint32_t> g_f483Retired[kF483Ring]{};
 static std::atomic<uint32_t> g_f483RetN{0};
 static void F502Keep(uint32_t tag, uint32_t rec) {
   if (!kF502KeepLenOnRelease || rec == 0) return;
+  auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
+  uint32_t recOwner = 0;
+  if (!mem.ReadU32BE(rec, &recOwner) || recOwner != tag) return;
   if (!F483In(g_f483Pushed, tag) || F483In(g_f483Retired, tag)) return;
   const F501Body *b = F501Find(tag);
   if (b == nullptr) return;
-  auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
   uint32_t now = 0;
   if (mem.ReadU32BE(rec + 4u, &now) && now == 0) {
     const uint32_t saved = b->w4.load(std::memory_order_relaxed);
@@ -7725,6 +7953,8 @@ static bool ClearTaskJoinBusy(uint32_t tag) {
 // is parked on its own semaphore and never runs. Pre-releasing lets the
 // original WaitForObject return immediately; the original cleanup
 // (close handle, zero fields, optional release-flag work) runs normally.
+// F-922: faking this completion closes records with reads queued, but off stalls in the sub_821D5E10 host hook (g80a).
+static constexpr bool kFenceShortCircuit = false;
 PPC_FUNC_IMPL(__imp__sub_821E5640);
 PPC_FUNC_IMPL(__imp__sub_8244ED10);
 static std::atomic<uint32_t> s_h5640{0};
@@ -7759,7 +7989,7 @@ PPC_FUNC(sub_821E5640) {
   // task_entry+12 for this tag. Probe soak proved main then entered
   // sub_821BD220's 10ms join on a busy flag the reinitialized CP never
   // publishes. Same "work IS done" honesty as E98/KDELAY-SC.
-  if (blocking == 1 && evt != 0) {
+  if (kFenceShortCircuit && blocking == 1 && evt != 0) {
     MCLA_LOG_INFO("FENCE-SC #{} obj={:08X} tag={:08X} ev={:08X} rel={} lr={:08X}",
                   n, obj, tag, evt, releaseFlag, ctx.lr);
     const uint32_t sr3 = ctx.r3.u32, sr4 = ctx.r4.u32, sr5 = ctx.r5.u32;
@@ -13012,7 +13242,7 @@ static bool MclaForceServePkgForDest(uint32_t outPtr, uint32_t st,
   // Fresh package window â†’ consumed=0 so the decoder sees the head.
   if (st && st != 0xCDCDCDCDu) {
     (void)mem.WriteU32BE(st + 0, n);
-    (void)mem.WriteU32BE(st + 4, bounce);
+    (void)(t_tempSrc = "L13177", mem.WriteU32BE(st + 4, bounce)); MCLA_LOG_ERROR("TEMP-PRIME dest={:08X} base={:08X} walk={:08X} n={} bounce={:08X} w4={:08X} declUnc={:08X} st={:08X} tag={:08X} job2={}", outPtr, baseOff, walkPos, n, bounce, MclaBE(pkgWin.data() + 16), declaredUnc, st, s_activeStreamerTag.load(std::memory_order_relaxed), job2 ? 1 : 0);
     (void)mem.WriteU32BE(st + 8, 0);
     // F-646: the THIRD field. `exp` = the container's own declared
     // uncompressed size (RSC5 +0x10), which the guest subtracts st+8 from to
@@ -13427,7 +13657,7 @@ static bool MclaUiXsfAppendServe(uint32_t n, uint32_t st, uint32_t pkg,
   const uint32_t pos = inside ? (inPtr - w.buf) : have;
   const uint32_t room = w.fill > pos ? w.fill - pos : 0u;
   if (!inside)
-    (void)mem.WriteU32BE(st + 4, w.buf + have);
+    (void)(t_tempSrc = "L13592", mem.WriteU32BE(st + 4, w.buf + have));
   (void)mem.WriteU32BE(st + 0, room);
   MCLA_LOG_WARN("UIXSF-APPEND #{} st={:08X} pkg={:08X} walk={:08X} pos={} "
                 "appended={} filled={} inLeft={} st0={} re-pointed={}",
@@ -14797,6 +15027,89 @@ static std::atomic<uint32_t> s_h5E10{0};
 static std::atomic<uint32_t> s_h5E10pt{0};
 static std::atomic<uint32_t> s_h5E10empty{0};
 
+static std::atomic<uint64_t> s_lastStep2LogMs{0};
+static std::atomic<uint32_t> s_step2RowCount{0};
+
+static void LogStep2Probe(uint32_t st, const char* branch, uint32_t ret, uint32_t lr) {
+  const uint32_t activeTag = s_activeStreamerTag.load(std::memory_order_relaxed);
+  if (activeTag == 0)
+    return;
+  const uint64_t nowMs = static_cast<uint64_t>(
+      std::chrono::duration_cast<std::chrono::milliseconds>(
+          std::chrono::steady_clock::now().time_since_epoch()).count());
+  uint64_t lastMs = s_lastStep2LogMs.load(std::memory_order_relaxed);
+  if (nowMs - lastMs >= 1000 && s_lastStep2LogMs.compare_exchange_strong(lastMs, nowMs)) {
+    const uint32_t cnt = s_step2RowCount.fetch_add(1) + 1;
+    if (cnt <= 30) {
+      auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
+      uint32_t inL = 0, inP = 0, cons = 0, exp = 0, outL = 0, outP = 0, prod = 0;
+      if (st && st != 0xCDCDCDCDu) {
+        (void)mem.ReadU32BE(st + 0, &inL);
+        (void)mem.ReadU32BE(st + 4, &inP);
+        (void)mem.ReadU32BE(st + 8, &cons);
+        (void)mem.ReadU32BE(st + 12, &exp);
+        (void)mem.ReadU32BE(st + 16, &outL);
+        (void)mem.ReadU32BE(st + 20, &outP);
+        (void)mem.ReadU32BE(st + 24, &prod);
+      }
+      MCLA_LOG_ERROR("STEP2-5E10 #{} tag={:08X} inPtr={:08X} inLeft={} outPtr={:08X} outLeft={} state=[c={} e={} p={}] branch='{}' ret={:08X} lr={:08X}",
+                     cnt, activeTag, inP, inL, outP, outL, cons, exp, prod, branch, ret, lr);
+    }
+  }
+}
+
+struct Step2ScopeLogger {
+  uint32_t st;
+  uint32_t lr;
+  const char* branch;
+  PPCContext& ctx;
+  Step2ScopeLogger(uint32_t s, uint32_t l, PPCContext& c) : st(s), lr(l), branch("imp_fallthrough"), ctx(c) {}
+  ~Step2ScopeLogger() {
+    auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
+    uint32_t cExit = 0, eExit = 0, outP = 0;
+    if (st && st != 0xCDCDCDCDu) {
+      (void)mem.ReadU32BE(st + 8, &cExit);
+      (void)mem.ReadU32BE(st + 12, &eExit);
+      (void)mem.ReadU32BE(st + 20, &outP);
+    }
+    const uint32_t activeTag = s_activeStreamerTag.load(std::memory_order_relaxed);
+    if (activeTag == 0x00008004u || activeTag == 0x00010004u || activeTag == 0x00020004u) {
+      static std::unordered_map<uint32_t, uint32_t> s_tagExits;
+      static std::mutex s_tagExitMtx;
+      uint32_t me = 0;
+      {
+        std::lock_guard<std::mutex> lk(s_tagExitMtx);
+        me = ++s_tagExits[activeTag];
+      }
+      if (me <= 30) {
+        MCLA_LOG_ERROR("STREAMER-5E10-EXIT #{} tag={:08X} st={:08X} c(+8)={} e(+12)={:08X} branch='{}' ret={:08X}",
+                       me, activeTag, st, cExit, eExit, branch, ctx.r3.u32);
+      }
+    }
+    LogStep2Probe(st, branch, ctx.r3.u32, lr);
+  }
+};
+
+static std::atomic<uint64_t> s_lastStep3LogMs{0};
+static std::atomic<uint32_t> s_step3RowCount{0};
+
+static void LogStep3Probe(uint32_t r3, uint32_t r5, uint32_t req, uint32_t ret, uint32_t lr, bool have, uint32_t pos, uint32_t ssz) {
+  const uint32_t activeTag = s_activeStreamerTag.load(std::memory_order_relaxed);
+  if (activeTag == 0)
+    return;
+  const uint64_t nowMs = static_cast<uint64_t>(
+      std::chrono::duration_cast<std::chrono::milliseconds>(
+          std::chrono::steady_clock::now().time_since_epoch()).count());
+  uint64_t lastMs = s_lastStep3LogMs.load(std::memory_order_relaxed);
+  if (nowMs - lastMs >= 1000 && s_lastStep3LogMs.compare_exchange_strong(lastMs, nowMs)) {
+    const uint32_t cnt = s_step3RowCount.fetch_add(1) + 1;
+    if (cnt <= 30) {
+      MCLA_LOG_ERROR("STEP3-CC6F0 #{} tag={:08X} req={} ret={} dev={:08X} off={:08X} lr={:08X} have={} pos={} ssz={}",
+                     cnt, activeTag, req, ret, r3, r5, lr, have ? 1 : 0, pos, ssz);
+    }
+  }
+};
+
 // F-325: does the placement SURVIVE, or did F-324 only prove it landed? The
 // reverify fired once, immediately after the fill, so it could not see a later
 // guest write over any of these slots. The inflate hook is the natural sampler:
@@ -14904,6 +15217,7 @@ static void MclaUiXsfLateReverify(uint32_t n) {
 }
 
 PPC_FUNC(sub_821D5E10) {
+  Step2ScopeLogger step2Scope(ctx.r4.u32, static_cast<uint32_t>(ctx.lr), ctx);
   // F-337: the caller passes the codec *object* in r3 and the inflate reads
   // *obj as the context; r3 is the return value by the time the refill runs, so
   // capture it here.
@@ -15119,6 +15433,20 @@ PPC_FUNC(sub_821D5E10) {
   (void)mem.ReadU32BE(st + 16, &outLeft);
   (void)mem.ReadU32BE(st + 20, &outPtr);
   (void)mem.ReadU32BE(st + 24, &produced);
+  const uint32_t activeTag = s_activeStreamerTag.load(std::memory_order_relaxed);
+  if (activeTag == 0x00008004u || activeTag == 0x00010004u || activeTag == 0x00020004u) {
+    static std::unordered_map<uint32_t, uint32_t> s_tagEntries;
+    static std::mutex s_tagEntryMtx;
+    uint32_t me = 0;
+    {
+      std::lock_guard<std::mutex> lk(s_tagEntryMtx);
+      me = ++s_tagEntries[activeTag];
+    }
+    if (me <= 30) {
+      MCLA_LOG_ERROR("STREAMER-5E10-ENTRY #{} tag={:08X} st={:08X} c(+8)={} e(+12)={:08X} inLeft={} inPtr={:08X} outLeft={} outPtr={:08X}",
+                     me, activeTag, st, consumed, expected, inLeft, inPtr, outLeft, outPtr);
+    }
+  }
   // w20/w21 census so INFLATE entry is never silent on job #2 / stack walks.
   {
     const bool j2Ent = IsJob2UiDest(outPtr);
@@ -15235,8 +15563,11 @@ PPC_FUNC(sub_821D5E10) {
                     kCadHead, kInflateStride);
   }
 
-  MclaUiXsfLateReverify(n);  // F-325 persistence sampler (read-only)
+  MclaUiXsfLateReverify(n); t_tempSrc = "entry"; const uint32_t tempEntryIn = inLeft, tempEntryPtr = inPtr;  // F-325 persistence sampler (read-only) + TEMP-INFL
   uint32_t magic = 0;
+  if (inPtr != 0 && inLeft >= 4) {
+    (void)mem.ReadU32BE(inPtr, &magic);
+  }
   // F-295 Path A (unified): host XMem/raw-LZX decode of the UI .xsf dests,
   // fired once per dest at the very top of the inflate handler so it covers
   // BOTH the corrupt-serve leg (raceeditor, inLeft<0) and the normal
@@ -15498,19 +15829,29 @@ PPC_FUNC(sub_821D5E10) {
     return;
   }
 
+  uint32_t xcCtx = 0, xcLeftover = 0;
+  if (ctx.r3.u32 != 0 && ctx.r3.u32 != 0xCDCDCDCDu) {
+    (void)mem.ReadU32BE(ctx.r3.u32, &xcCtx);
+    if (xcCtx != 0 && xcCtx != 0xCDCDCDCDu)
+      (void)mem.ReadU32BE(xcCtx + 12292u, &xcLeftover);
+  }
+  const bool hasValidStreamInput =
+      (inLeft > 0 && (magic == kXCompressMagic || magic == 0x05435352u ||
+                      (consumed > 0 && magic != 0u && magic != 0xCDCDCDCDu))) ||
+      (inLeft == 0 && xcLeftover > 0);
+
   // w20/w21: guest re-points inPtr at stack (006D8F4C / 006D9840) after
   // CC6F0 primes st. REFORCE when magic is bad OR when consumed>0 walking
   // stack â€” do NOT require consumed==0. Re-point st+0/st+4 at remaining
   // guest-heap package bytes; job #2 UI dests pin to package 0xA0000.
   if (st != 0 && st != 0xCDCDCDCDu) {
-    const bool badMagic =
+    const bool badMagic = !hasValidStreamInput && (
         (magic == 0u) || (magic == 0xCDCDCDCDu) ||
         (magic != kXCompressMagic && magic != 0x05435352u &&
-         inPtr != 0 && inPtr < 0xA0000000u);
-    const bool stackWalk =
+         inPtr != 0 && inPtr < 0xA0000000u));
+    const bool stackWalk = !hasValidStreamInput &&
         (consumed > 0 && inPtr != 0 && inPtr < 0xA0000000u &&
-         (magic == 0u || magic == 0xCDCDCDCDu ||
-          (magic != kXCompressMagic && magic != 0x05435352u)));
+         (magic == 0u || magic == 0xCDCDCDCDu));
     // w22: also enter re-point when job2 dest has non-XC magic even if
     // inPtr looks like heap and inLeft!=0 (spin at #9+ magic=9960BB82).
     // Only while produced==0 â€” once __imp__ lands XC output, job1-style
@@ -15525,11 +15866,9 @@ PPC_FUNC(sub_821D5E10) {
     // package to heap C9C36F00 and XMem produced 44365500. Always
     // re-point at the guest-heap package bounce when the inflate source
     // is a stack head with package magic.
-    const bool stackPkgHead =
-        (inPtr != 0 && inPtr < 0xA0000000u && consumed < 16u &&
-         (magic == kXCompressMagic || magic == 0x05435352u));
-    if (badMagic || inLeft == 0 || stackWalk || j2NeedRepoint ||
-        stackPkgHead) {
+    const bool stackPkgHead = false;
+    if (!hasValidStreamInput &&
+        (badMagic || inLeft == 0 || stackWalk || j2NeedRepoint)) {
       bool served = false;
       // w22: job #2 InflateStep entries must re-point at the LastServe bounce
       // (RSC5 head @ walk=0 for that dest). ForceServe uses g_job2SharedWalk
@@ -15593,7 +15932,7 @@ PPC_FUNC(sub_821D5E10) {
               (ls0.size > ls0.pos) ? (ls0.size - ls0.pos) : 0u;
           const uint32_t give0 = (rem0 > 0x8000u) ? 0x8000u : rem0;
           (void)mem.WriteU32BE(st + 0, give0);
-          (void)mem.WriteU32BE(st + 4, ls0.sbuf + ls0.pos);
+          (void)(t_tempSrc = "L15859", mem.WriteU32BE(st + 4, ls0.sbuf + ls0.pos));
           (void)mem.WriteU32BE(st + 8, 0);
           uint32_t stOut0 = 0, stOl0 = 0;
           (void)mem.ReadU32BE(st + 20, &stOut0);
@@ -15692,7 +16031,7 @@ PPC_FUNC(sub_821D5E10) {
                 give = 0x8000u;
               // Re-point inflate state at remaining guest-heap package bytes.
               (void)mem.WriteU32BE(st + 0, give);
-              (void)mem.WriteU32BE(st + 4, srcBuf + srcOff);
+              (void)(t_tempSrc = "L15958", mem.WriteU32BE(st + 4, srcBuf + srcOff));
               inLeft = give;
               inPtr = srcBuf + srcOff;
               if (shead == 0x05435352u || shead == 0x0FF512EFu) {
@@ -15947,7 +16286,7 @@ PPC_FUNC(sub_821D5E10) {
             g_destPkgWalk[outPtr] = newWalk;
           }
           (void)mem.WriteU32BE(st + 0, static_cast<uint32_t>(got));
-          (void)mem.WriteU32BE(st + 4, s_tailBuf);
+          (void)(t_tempSrc = "L16213", mem.WriteU32BE(st + 4, s_tailBuf));
           static std::atomic<uint32_t> s_tailN{0};
           const uint32_t tn = s_tailN.fetch_add(1) + 1;
           MCLA_LOG_WARN("UIXSF-TAIL-TOPUP #{} dest={:08X} pkg={:08X} "
@@ -16109,7 +16448,7 @@ PPC_FUNC(sub_821D5E10) {
                                        ? 0x8000u
                                        : (ls0.size - ls0.pos);
             (void)mem.WriteU32BE(st + 0, give0);
-            (void)mem.WriteU32BE(st + 4, ls0.sbuf + ls0.pos);
+            (void)(t_tempSrc = "L16375", mem.WriteU32BE(st + 4, ls0.sbuf + ls0.pos));
             (void)mem.WriteU32BE(st + 8, isPkgHead ? 0u : 1u);
             (void)mem.WriteU32BE(st + 20, outPtr);
             (void)mem.WriteU32BE(st + 16, MclaDestCapFromPstream(outPtr));
@@ -16154,7 +16493,7 @@ PPC_FUNC(sub_821D5E10) {
                 const uint32_t give0 = static_cast<uint32_t>(pkgWin.size());
                 const uint32_t destCap = MclaDestCapFromPstream(outPtr);
                 (void)mem.WriteU32BE(st + 0, give0);
-                (void)mem.WriteU32BE(st + 4, bounce);
+                (void)(t_tempSrc = "L16420", mem.WriteU32BE(st + 4, bounce));
                 (void)mem.WriteU32BE(st + 8, 0);
                 (void)mem.WriteU32BE(st + 20, outPtr);
                 (void)mem.WriteU32BE(st + 16, destCap);
@@ -16215,7 +16554,7 @@ PPC_FUNC(sub_821D5E10) {
               const uint32_t give0 = static_cast<uint32_t>(pkgWin.size());
               const uint32_t destCap = MclaDestCapFromPstream(outPtr);
               (void)mem.WriteU32BE(st + 0, give0);
-              (void)mem.WriteU32BE(st + 4, bounce);
+              (void)(t_tempSrc = "L16481", mem.WriteU32BE(st + 4, bounce));
               (void)mem.WriteU32BE(st + 8, 0);
               (void)mem.WriteU32BE(st + 20, outPtr);
               (void)mem.WriteU32BE(st + 16, destCap);
@@ -16336,7 +16675,7 @@ PPC_FUNC(sub_821D5E10) {
   // is dead/empty. Zeroing outLeft is the caller's own "stream complete"
   // key (same path a descriptor with expected==0 takes); without it the
   // guest spins on the loop forever (INFLATE-EMPTY x1663).
-  if (inLeft == 0) {
+  if (inLeft == 0 && xcLeftover == 0) {
     // F-393: `inLeft == 0` is precisely the state in which `sub_821BC140` sends
     // the stream to its OWN async read (ppc_recomp.14.cpp:19047 falls through to
     // loc_821BC2F0/310). Handing such a record a package we invented hijacks it
@@ -16731,7 +17070,7 @@ PPC_FUNC(sub_821D5E10) {
             (void)mem.WriteBytes(hsBuf, tmp.data(),
                                  static_cast<uint32_t>(got));
             (void)mem.WriteU32BE(st + 0, static_cast<uint32_t>(got));
-            (void)mem.WriteU32BE(st + 4, hsBuf);
+            (void)(t_tempSrc = "L16997", mem.WriteU32BE(st + 4, hsBuf));
             // F-347: the preamble check only runs when this record reports a
             // fresh stream. `st` is the shared stack record 0x6D8F20, so it
             // arrives here carrying the PREVIOUS container's `consumed`
@@ -17180,7 +17519,7 @@ PPC_FUNC(sub_821D5E10) {
           // full-decompress from this hook regardless of stack/ctx isolation.
           // Engine still proven offline (produced=143069). Raw serve restored.
           (void)mem.WriteU32BE(st + 0, static_cast<uint32_t>(gotu)); // inLeft
-          (void)mem.WriteU32BE(st + 4, s_uiBig);                      // inPtr
+          (void)(t_tempSrc = "L17446", mem.WriteU32BE(st + 4, s_uiBig));                      // inPtr
           (void)mem.WriteU32BE(st + 8, 0);                            // consumed
           {
             std::lock_guard<std::mutex> wl(g_destPkgMtx);
@@ -17235,7 +17574,7 @@ PPC_FUNC(sub_821D5E10) {
         (void)mem.WriteBytes(s_hostInBuf, tmp.data(),
                              static_cast<uint32_t>(got));
         (void)mem.WriteU32BE(st + 0, static_cast<uint32_t>(got)); // inLeft
-        (void)mem.WriteU32BE(st + 4, s_hostInBuf);                // inPtr
+        (void)(t_tempSrc = "L17501", mem.WriteU32BE(st + 4, s_hostInBuf));                // inPtr
         if (!isPkgHead) {
           uint32_t consumedNow = 0;
           (void)mem.ReadU32BE(st + 8, &consumedNow);
@@ -17261,9 +17600,20 @@ PPC_FUNC(sub_821D5E10) {
   // host-serve feeds the raw file, so strip the header here and fall
   // through to XCompress with the payload.
   constexpr uint32_t kRsc5Magic = 0x05435352u; // 05 'C' 'S' 'R'
-  if (consumed == 0 && magic == kRsc5Magic && inLeft > 12 && inPtr != 0) {
+  if (magic == 0 && inPtr != 0 && inLeft >= 4) {
+    (void)mem.ReadU32BE(inPtr, &magic);
+  }
+  if (magic == kRsc5Magic && inLeft > 12 && inPtr != 0) {
     uint32_t xc = 0;
     (void)mem.ReadU32BE(inPtr + 12, &xc);
+    uint32_t xc_exp = 0;
+    (void)mem.ReadU32BE(inPtr + 16, &xc_exp);
+    if (xc_exp >= 0x100u && xc_exp <= 0x800000u) {
+      (void)mem.WriteU32BE(st + 12, xc_exp);
+      expected = xc_exp;
+    }
+    consumed = 0;
+    (void)mem.WriteU32BE(st + 8, 0);
     // w29: cap job2 / B7001000 RSC5 spin. Same dest+inPtr re-fed without
     // produced progress â†’ drain outLeft (caller-loop complete key) after
     // 6 hits so later streams advance. Never plant entropy; never r3=0.
@@ -17307,9 +17657,10 @@ PPC_FUNC(sub_821D5E10) {
                       "produced={} outLeft={}",
                       outPtr, inPtr, cnt, produced, outLeft);
     }
-    MCLA_LOG_WARN("INFLATE-RSC5 #{} in={} xc@+12={:08X} inPtr={:08X} "
-                  "out={} outPtr={:08X} â€” skip 12B header",
-                  n, inLeft, xc, inPtr, outLeft, outPtr);
+    MCLA_LOG_ERROR("INFLATE-RSC5 #{} in={} xc@+12={:08X} inPtr={:08X} xc_exp@+16={:08X} "
+                   "out={} outPtr={:08X} - skip 12B header",
+                   n, inLeft, xc, inPtr, xc_exp, outLeft, outPtr);
+    MCLA_LOG_ERROR("TEMP-INFL #{} tag={:08X} writer={} entryIn={} entryPtr={:08X} destPkg={:08X} recOff={:08X} lr={:08X}", n, s_activeStreamerTag.load(std::memory_order_relaxed), t_tempSrc, tempEntryIn, tempEntryPtr, PeekPackageForDest(outPtr), GetActiveStreamerRecordOffset(), static_cast<uint32_t>(ctx.lr));
     (void)mem.WriteU32BE(st + 0, inLeft - 12); // inLeft
     (void)mem.WriteU32BE(st + 4, inPtr + 12);  // inPtr
     magic = xc;
@@ -17357,6 +17708,66 @@ PPC_FUNC(sub_821D5E10) {
     return;
   }
   __imp__sub_821D5E10(ctx, base);
+  uint32_t cAfter = 0, eAfter = 0, outLAfter = 0, prodAfter = 0, inLAfter = 0;
+  if (st && st != 0xCDCDCDCDu) {
+    (void)mem.ReadU32BE(st + 0, &inLAfter);
+    (void)mem.ReadU32BE(st + 8, &cAfter);
+    (void)mem.ReadU32BE(st + 12, &eAfter);
+    (void)mem.ReadU32BE(st + 16, &outLAfter);
+    (void)mem.ReadU32BE(st + 24, &prodAfter);
+    const uint32_t activeTag = s_activeStreamerTag.load(std::memory_order_relaxed);
+    if (activeTag != 0) {
+      uint32_t recLen = 0, recOff = 0;
+      GetActiveStreamerRecordInfo(nullptr, &recLen, &recOff);
+      static std::unordered_map<uint32_t, uint32_t> s_drainLogs;
+      static std::mutex s_drainMtx;
+      uint32_t dn = 0;
+      {
+        std::lock_guard<std::mutex> lk(s_drainMtx);
+        dn = ++s_drainLogs[activeTag];
+      }
+      if (dn <= 15 || (eAfter > 0 && cAfter >= eAfter)) {
+        MCLA_LOG_WARN("STREAMER-DRAIN tag={:08X} c={} e={} prod={} inL={} outL={} recLen={} recOff={:08X}",
+                      activeTag, cAfter, eAfter, prodAfter, inLAfter, outLAfter, recLen, recOff);
+      }
+    }
+    uint32_t xcLeftAfter = 0;
+    if (xcCtx != 0 && xcCtx != 0xCDCDCDCDu)
+      (void)mem.ReadU32BE(xcCtx + 12292u, &xcLeftAfter);
+    if (activeTag != 0 && outLAfter == 0) {
+      uint32_t declUnc = 0;
+      uint32_t slotAddrCur = s_activeStreamerSlotAddr.load(std::memory_order_relaxed);
+      if (slotAddrCur != 0 && slotAddrCur != 0xCDCDCDCDu) {
+        uint32_t nSl = 0;
+        (void)mem.ReadU32BE(slotAddrCur + 1540u, &nSl);
+        for (uint32_t si = 0; si < nSl && si < 128u; ++si) {
+          uint32_t slSz = 0;
+          (void)mem.ReadU32BE(slotAddrCur + 8u + si * 12u + 4u, &slSz);
+          declUnc += slSz;
+        }
+      }
+      // Only the ROW is gated (2026-11-08 audit of w12.log): 132 rows, all
+      // healthy produce steps (produced>0 in 132/132; completions match
+      // produced==declUnc). First 12 + every 25th keep first occurrences,
+      // `#tn` carries the total, and fault-shaped rows (no progress, no
+      // valid input, completed-but-short vs declUnc) always print. The
+      // declUnc reads and the st+16 completion write below are behaviour
+      // and stay unconditional.
+      static std::atomic<uint32_t> s_tagValidate{0};
+      const uint32_t tn = s_tagValidate.fetch_add(1) + 1;
+      const bool tagFault = (prodAfter == 0) || !hasValidStreamInput ||
+                            (declUnc != 0 && xcLeftAfter == 0 && eAfter > 0 &&
+                             cAfter >= eAfter && prodAfter != declUnc);
+      if (tn <= 12u || (tn % 25u) == 0u || tagFault) {
+        MCLA_LOG_ERROR("TEMP-TAG-VALIDATE #{} tag={:08X} outPtr={:08X} validInput={} produced={} declUnc={} exp={} c={} inL={} xcLeft={}",
+                       tn, activeTag, outPtr, hasValidStreamInput ? 1 : 0, prodAfter, declUnc, eAfter, cAfter, inLAfter, xcLeftAfter);
+      }
+    }
+    if (xcLeftAfter == 0 && eAfter > 0 && cAfter >= eAfter && prodAfter > 0) {
+      (void)mem.WriteU32BE(st + 16, 0); // outLeft = 0 (caller-loop complete key)
+      ctx.r3.u32 = 0;
+    }
+  }
 }
 
 // POST-INFLATE CACHE FLUSH census: sub_821D5510 (dcbf/dcbst loop).
@@ -17476,16 +17887,43 @@ PPC_FUNC(sub_8244EE00) {
 // ring full -> ret 0 = silent dead-end; else slot id). MINIMAL form:
 // registers only - a prior version that read guest memory here crashed the
 // first invocation (fault sub_821BCB10+0x7B, the vtable-dispatch region).
+std::atomic<uint32_t> g_step1Tag{0};
+std::atomic<uint32_t> g_step1Handle{0};
+
+static std::unordered_map<uint32_t, std::string> s_probeDevicePaths;
+static std::mutex s_probeDevicePathsMutex;
+
+static void ProbeRecordDevicePath(uint32_t dev, const char* path) {
+  if (dev != 0 && path && path[0] != '\0') {
+    std::lock_guard<std::mutex> lk(s_probeDevicePathsMutex);
+    s_probeDevicePaths[dev] = path;
+  }
+}
+
+static std::string ProbeGetDevicePath(uint32_t dev) {
+  if (dev == 0) return "";
+  std::lock_guard<std::mutex> lk(s_probeDevicePathsMutex);
+  auto it = s_probeDevicePaths.find(dev);
+  return (it != s_probeDevicePaths.end()) ? it->second : "";
+}
+
 PPC_FUNC_IMPL(__imp__sub_821BCB10);
 static std::atomic<uint32_t> s_hBCB10{0};
 PPC_FUNC(sub_821BCB10) {
   const uint32_t n = s_hBCB10.fetch_add(1) + 1;
   const uint32_t a0 = ctx.r3.u32;
   const uint32_t a6 = ctx.r7.u32;
+  const uint32_t r10 = ctx.r10.u32;
   __imp__sub_821BCB10(ctx, base);
+  const uint32_t ret = ctx.r3.u32;
+  const uint32_t step1Tag = g_step1Tag.load(std::memory_order_relaxed);
+  if (step1Tag != 0 && a0 == step1Tag) {
+    MCLA_LOG_ERROR("STEP2 sub_821BCB10 a0={:08X} cb={:08X} r10={:08X} ret={:08X}",
+                   a0, a6, r10, ret);
+  }
   if (n <= 16 || (n % 500) == 0)
     MCLA_LOG_WARN("ENQ sub_821BCB10 #{} a0={:08X} cb={:08X} -> r3={:08X}", n,
-                  a0, a6, ctx.r3.u32);
+                  a0, a6, ret);
 }
 
 // F-173/F-174: sub_821867A0 builds 28-byte streamer request records - but into
@@ -17601,6 +18039,11 @@ PPC_FUNC(sub_821BCE68) {
   const uint32_t n = s_hBCE68.fetch_add(1) + 1;
   const uint32_t r3 = ctx.r3.u32, r4 = ctx.r4.u32, r5 = ctx.r5.u32;
   const uint32_t lr = static_cast<uint32_t>(ctx.lr);
+  char openPath[kGuestPathBuf] = {0};
+  if (r4 != 0 && r4 != 0xCDCDCDCDu) {
+    MclaReadGuestPath(openPath, sizeof(openPath), r4);
+    MclaSanitizePath(openPath, sizeof(openPath));
+  }
   __imp__sub_821BCE68(ctx, base);
   // F-181: which Open leaves its record's byte count at 0 (F-180 measured the
   // legals generation at +4 = 0 with +12 = 4, while meshtextures and trash got
@@ -17628,6 +18071,9 @@ PPC_FUNC(sub_821BCE68) {
     // F-501/F-503: remember the body THIS handle's open wrote, so the release can hand
     // the walk-consumed words back before the job reads them.
     F501Note(rid, rec, rlen, rpkg, rent, rp24);
+    if (rdev != 0 && openPath[0] != '\0') {
+      ProbeRecordDevicePath(rdev, openPath);
+    }
   }
   if (n <= 24 || (n % 500) == 0)
     MCLA_LOG_INFO("STREAM-OPEN sub_821BCE68 #{} r3={:08X} r4={:08X} r5={:08X} "
@@ -17846,6 +18292,25 @@ PPC_FUNC(sub_821D22E8) {
                   n, name, buf, size, cls, node);
 }
 
+static std::mutex s_devPackMtx;
+static std::unordered_map<uint32_t, std::string> s_devToPack;
+static std::string GetPackNameForDev(uint32_t dev) {
+  if (dev == 0 || dev == 0xCDCDCDCDu)
+    return "xarchive_cache.rpf";
+  std::lock_guard<std::mutex> lk(s_devPackMtx);
+  auto it = s_devToPack.find(dev);
+  if (it != s_devToPack.end() && !it->second.empty())
+    return it->second;
+  auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
+  uint32_t inner = 0;
+  if (mem.ReadU32BE(dev + 32, &inner) && inner != 0 && inner != 0xCDCDCDCDu) {
+    auto it2 = s_devToPack.find(inner);
+    if (it2 != s_devToPack.end() && !it2->second.empty())
+      return it2->second;
+  }
+  return "xarchive_cache.rpf";
+}
+
 PPC_FUNC(sub_821BC140) {
   const uint32_t n = s_hBC140.fetch_add(1) + 1;
   // F-471 Â§3: the entry->post-exec bracket that produced the 35-1,662 ms per-job
@@ -17859,6 +18324,21 @@ PPC_FUNC(sub_821BC140) {
   // (w1: thread 0xC5C parked in VEH, job #2 never INLINE-EXEC'd).
   const uint32_t slotAddr = ctx.r3.u32;
   const uint32_t queueArg = ctx.r4.u32;
+  uint32_t f483Tag = 0;
+  (void)mcla::kernel::GuestMemoryHeap::Instance().ReadU32BE(slotAddr, &f483Tag);
+  struct StreamerReqScope {
+    uint32_t tag;
+    StreamerReqScope(uint32_t t, uint32_t sa) : tag(t) {
+      s_activeStreamerTag.store(tag, std::memory_order_relaxed);
+      s_activeStreamerSlotAddr.store(sa, std::memory_order_relaxed);
+      t_inStreamerRequest = true;
+    }
+    ~StreamerReqScope() {
+      t_inStreamerRequest = false;
+      s_activeStreamerSlotAddr.store(0, std::memory_order_relaxed);
+      s_activeStreamerTag.store(0, std::memory_order_relaxed);
+    }
+  } streamerReqScope(f483Tag, slotAddr);
   // F-179a: F-172 says the length BC140 uses is `[[0x8283D190+52] +
   // [slot+0]*28] + 4` and that it is 0; F-179 showed pgStreamer::Open resolving
   // all seven containers through vtable+84 -> +144 with non-null entry pointers
@@ -18112,9 +18592,66 @@ PPC_FUNC(sub_821BC140) {
       }
     }
   }
-  uint32_t f483Tag = 0;
   (void)mcla::kernel::GuestMemoryHeap::Instance().ReadU32BE(slotAddr, &f483Tag);
   F483Add(g_f483Dispatched, g_f483DispN, f483Tag);
+  static std::atomic<uint64_t> s_bc140Entries{0};
+  static std::atomic<uint64_t> s_bc140Exits{0};
+  static std::atomic<uint64_t> s_lastRateMs{0};
+  static std::atomic<uint64_t> s_firstMs{0};
+  static std::atomic<uint64_t> s_lastRateCount{0};
+  const uint64_t entryIdx = s_bc140Entries.fetch_add(1) + 1;
+  auto &gm3 = mcla::kernel::GuestMemoryHeap::Instance();
+  const auto nowMs = static_cast<uint64_t>(
+      std::chrono::duration_cast<std::chrono::milliseconds>(
+          std::chrono::steady_clock::now().time_since_epoch()).count());
+  uint64_t firstMs = s_firstMs.load(std::memory_order_relaxed);
+  if (firstMs == 0) {
+    s_firstMs.compare_exchange_strong(firstMs, nowMs);
+    if (firstMs == 0) firstMs = nowMs;
+  }
+  uint64_t lastMs = s_lastRateMs.load(std::memory_order_relaxed);
+  if (nowMs - lastMs >= 1000 && s_lastRateMs.compare_exchange_strong(lastMs, nowMs)) {
+    // 2026-11-08: the cadence stays 1 row/s on purpose -- this row is the ONLY
+    // direct readout of how fast the loader is advancing, so cutting it would
+    // hide the very thing it exists to show. `since` is wall-clock since the
+    // first entry and `drec` is records started since the previous row, so
+    // ms/record is since/drec with no post-processing. Host-side counters only;
+    // nothing here reads or writes guest memory.
+    const uint64_t prevCount =
+        s_lastRateCount.exchange(entryIdx, std::memory_order_relaxed);
+    const uint64_t since = nowMs - firstMs;
+    MCLA_LOG_ERROR("STEP3-RATE entries={} exits={} since={}ms drec={} ms_per_rec={}",
+                   entryIdx, s_bc140Exits.load(), since, entryIdx - prevCount,
+                   entryIdx ? (since / entryIdx) : 0u);
+  }
+  const uint32_t step1Tag = g_step1Tag.load(std::memory_order_relaxed);
+  const bool isStep1 = (step1Tag != 0 && f483Tag == step1Tag);
+  uint32_t arb = 0, cap = 0;
+  (void)gm3.ReadU32BE(0x8283D190u + 52u, &arb);
+  (void)gm3.ReadU32BE(0x8283D190u + 24u, &cap);
+  const uint32_t rec = (arb && cap) ? (arb + (f483Tag & (cap - 1u)) * 28u) : 0;
+  uint32_t rf[7] = {};
+  uint32_t devVt = 0;
+  if (rec) {
+    for (int i = 0; i < 7; ++i) (void)gm3.ReadU32BE(rec + i * 4u, &rf[i]);
+    if (rf[2] != 0 && rf[2] != 0xCDCDCDCDu) {
+      (void)gm3.ReadU32BE(rf[2], &devVt);
+    }
+  }
+  std::string devPath = ProbeGetDevicePath(rf[2]);
+  uint32_t t0 = 0, t1540 = 0, t1548 = 0;
+  (void)gm3.ReadU32BE(slotAddr + 0u, &t0);
+  (void)gm3.ReadU32BE(slotAddr + 1540u, &t1540);
+  (void)gm3.ReadU32BE(slotAddr + 1548u, &t1548);
+  const DWORD tid = GetCurrentThreadId();
+  if (entryIdx <= 20 || (entryIdx % 100) == 0 || isStep1) {
+    MCLA_LOG_ERROR("STEP3-ENTRY #{} tag={:08X} rec={:08X} +4={:08X} +8={:08X} +12={:08X} devVt={:08X} path='{}' "
+                   "recState=[{:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X}] "
+                   "task[+0]={:08X} task[+1540]={:08X} task[+1548]={:08X} tid={}",
+                   entryIdx, f483Tag, rec, rf[1], rf[2], rf[3], devVt, devPath,
+                   rf[0], rf[1], rf[2], rf[3], rf[4], rf[5], rf[6],
+                   t0, t1540, t1548, tid);
+  }
   g_f481Calls.store(0, std::memory_order_relaxed);
   g_f481Moves.store(0, std::memory_order_relaxed);
   g_f481NonZeroLen.store(0, std::memory_order_relaxed);
@@ -18140,8 +18677,14 @@ PPC_FUNC(sub_821BC140) {
   // call: every serve instrument is on sub_821CC6F0/sub_821CCD58, which is the reason
   // F-482 counted 14,365 read calls but only two requested bytes. Resolve the reader's
   // guest VA here so the next soak can name the function Path B must actually serve.
-  // Also samples the walk's own outstanding-IO credit at 0x827374E0, the gate that
-  // sleeps 100 ms at ppc_recomp.14.cpp:19064-19070 (`li r3,100; bl sub_821C91B8`).
+  // Also samples the walk's own outstanding-IO credit at 0x827D74E0, the gate that
+  // sleeps 100 ms at ppc_recomp.14.cpp:19064-19075 (`li r3,100; bl sub_821C91B8`).
+  // 2026-11-08: this probe used to read 0x827374E0, which is 0xA0000 away from the
+  // gate. Settled from the guest, not from the old comment: ppc_recomp.14.cpp:19028
+  // loads r22 = 0x827D0000 and :19058-19059 is `lwz r11,29920(r22)`, i.e.
+  // 0x827D0000 + 0x74E0 = 0x827D74E0. The write side (gpu_device.cpp:21760/21789)
+  // already used that address; only this probe was wrong, so `cred=` in
+  // F500-DEVREAD was sampling an unrelated word. Read-only fix; no guest write.
   {
     uint32_t arb = 0, cap = 0, cred = 0;
     auto &g5 = mcla::kernel::GuestMemoryHeap::Instance();
@@ -18180,7 +18723,7 @@ PPC_FUNC(sub_821BC140) {
       uint32_t recOwner = 0;
       (void)g5.ReadU32BE(rec, &recOwner);
       const bool f503Stale =
-          (recOwner != 0u) && ((recOwner & ~0x8000u) != (f483Tag & ~0x8000u));
+          (recOwner != 0u) && (recOwner != f483Tag);
       if (f503Stale)
         MCLA_LOG_WARN("F807-STALE tag={:08X} rec={:08X} recOwner={:08X} snapshot=F501Find({:08X}) "
                       "restored=0 (snapshot belongs to another handle that aliases this index)",
@@ -18220,7 +18763,7 @@ PPC_FUNC(sub_821BC140) {
         (void)g5.ReadU32BE(vtab + 52u, &fn52);
         (void)g5.ReadU32BE(vtab + 124u, &fn124);
       }
-      (void)g5.ReadU32BE(0x827374E0u, &cred);
+      (void)g5.ReadU32BE(0x827D74E0u, &cred);
       if (n <= 20)
         MCLA_LOG_WARN("F500-DEVREAD #{} tag={:08X} rec={:08X} len={} pkg={:08X} "
                       "dev={:08X} vtab={:08X} s28={:08X} s52={:08X} s124={:08X} "
@@ -18236,10 +18779,66 @@ PPC_FUNC(sub_821BC140) {
       }
     }
   }
+
+  if (f483Tag != 0 && f483Tag != 0xFFFFFFFFu) {
+    auto &smem = mcla::kernel::GuestMemoryHeap::Instance();
+    uint32_t arb = 0, cap = 0;
+    if (smem.ReadU32BE(0x8283D190u + 52u, &arb) && smem.ReadU32BE(0x8283D190u + 24u, &cap) &&
+        arb != 0 && cap != 0) {
+      const uint32_t recAddr = arb + (f483Tag & (cap - 1u)) * 28u;
+      uint32_t rlen = 0, roff = 0, rdev = 0;
+      (void)smem.ReadU32BE(recAddr + 4u, &rlen);
+      (void)smem.ReadU32BE(recAddr + 8u, &rdev);
+      (void)smem.ReadU32BE(recAddr + 24u, &roff);
+      if (roff != 0 && rlen > 0) {
+        const std::string packName = GetPackNameForDev(rdev);
+        auto &vfs = mcla::vfs::RpfVirtualFileSystem::Instance();
+        mcla::vfs::RpfVirtualFileSystem::OpenFileHandle fh;
+        if (vfs.OpenFile(packName, fh)) {
+          fh.raw_positional = true;
+          uint8_t hdr[20] = {0};
+          uint64_t gotHdr = 0;
+          if (vfs.ReadFileAt(fh, roff, hdr, 20, gotHdr) && gotHdr == 20) {
+            const uint32_t rscMagic = (uint32_t(hdr[0]) << 24) | (uint32_t(hdr[1]) << 16) | (uint32_t(hdr[2]) << 8) | uint32_t(hdr[3]);
+            const uint32_t xcMagic = (uint32_t(hdr[12]) << 24) | (uint32_t(hdr[13]) << 16) | (uint32_t(hdr[14]) << 8) | uint32_t(hdr[15]);
+            const uint32_t xcExp = (uint32_t(hdr[16]) << 24) | (uint32_t(hdr[17]) << 16) | (uint32_t(hdr[18]) << 8) | uint32_t(hdr[19]);
+            if (rscMagic == 0x05435352u && xcMagic == 0x0FF512EFu && rlen == xcExp) {
+              // The guest-visible WRITE below is behaviour and stays unconditional.
+              // Only the ROW is gated (2026-11-08): w12 emitted 71 rows that were 71
+              // copies of one fact -- delta is +20 in 71/71 -- so first 12 keep the
+              // early boot honest and every 25th proves the path is still firing.
+              // `#rn` carries the total, so a census can still reconcile.
+              smem.WriteU32BE(recAddr + 4u, rlen + 20u);
+              static std::atomic<uint32_t> s_fixReclen{0};
+              const uint32_t rn = s_fixReclen.fetch_add(1) + 1;
+              if (rn <= 12u || (rn % 25u) == 0u) {
+                MCLA_LOG_ERROR("TEMP-FIX-RECLEN #{} tag={:08X} rec={:08X} dev={:08X} pack='{}' off={:08X} oldLen={} -> newLen={}",
+                               rn, f483Tag, recAddr, rdev, packName, roff, rlen, rlen + 20u);
+              }
+            }
+          }
+          vfs.CloseFile(fh);
+        }
+      }
+    }
+  }
+
   g_f481Window.store(n, std::memory_order_relaxed);   // open the read window
   const auto tPreGuest = std::chrono::steady_clock::now();
   __imp__sub_821BC140(ctx, base);
   g_f481Window.store(0, std::memory_order_relaxed);   // close it
+  s_bc140Exits.fetch_add(1);
+  if (entryIdx <= 20 || (entryIdx % 100) == 0 || isStep1) {
+    uint32_t rfExit[7] = {};
+    if (rec) {
+      for (int i = 0; i < 7; ++i) (void)gm3.ReadU32BE(rec + i * 4u, &rfExit[i]);
+    }
+    MCLA_LOG_ERROR("STEP3-EXIT #{} tag={:08X} rec={:08X} +4={:08X} +8={:08X} +12={:08X} "
+                   "recState=[{:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X}] tid={}",
+                   entryIdx, f483Tag, rec, rfExit[1], rfExit[2], rfExit[3],
+                   rfExit[0], rfExit[1], rfExit[2], rfExit[3], rfExit[4], rfExit[5], rfExit[6],
+                   tid);
+  }
   F483Add(g_f483Retired, g_f483RetN, f483Tag);        // F-502: no longer in flight
   if (kF510BindToOpenWindow && n < 12u)
     g_f510WinPkg[n].store(0, std::memory_order_relaxed);   // F-510: window closed
@@ -20433,7 +21032,7 @@ PPC_FUNC(sub_823047D8) {
   // So: call the original. If it blocks, that is the next root cause and it
   // must NOT be re-papered with another skip.
   __imp__sub_823047D8(ctx, base);
-  MCLA_LOG_WARN("F363-47D8-RET #{} ret={:08X}", n, ctx.r3.u32);
+  MCLA_LOG_ERROR("TEMP-47D8-RET #{} ret={:08X}", n, ctx.r3.u32);
 }
 
 // F-828 MITIGATION: sub_8260C560 hangs in a memory-scan loop (ppc_recomp.123.cpp:2693-2728)
@@ -20445,6 +21044,11 @@ PPC_FUNC_IMPL(__imp__sub_8260C560);
 static std::atomic<uint32_t> s_h60C560{0};
 PPC_FUNC(sub_8260C560) {
   const uint32_t n = s_h60C560.fetch_add(1) + 1;
+  if (MclaUnskip("8260C560")) {
+    __imp__sub_8260C560(ctx, base);
+    MCLA_LOG_ERROR("UNSKIP-8260C560 lr={:08X} ret={:08X}", static_cast<uint32_t>(ctx.lr), ctx.r3.u32);
+    return;
+  }
   MCLA_LOG_WARN("FIX-8260C560 #{} lr={:08X} r3={:08X} (returning 0, skipping memory-scan loop)",
                 n, static_cast<uint32_t>(ctx.lr), ctx.r3.u32);
   ctx.r3.u32 = 0;
@@ -20611,12 +21215,6 @@ static std::atomic<uint32_t> s_hC2EA8{0};
 PPC_FUNC(sub_822C2EA8) {
   const uint32_t nC = s_hC2EA8.fetch_add(1) + 1;
   LogMsgChain("parent-822C2EA8", nC, ctx.r3.u32, ctx);
-  // F-363: F-362's probes showed the UI-load body reaches THIS call from 0x82131554 and
-  // then never issues the next one (ret 0x8213155C), while the window between them is
-  // straight-line in ppc_recomp.43.cpp -- so the stop is inside here, not a branch. Enter
-  // and return must therefore be distinguished, with the tid, because the earlier
-  // "thread survives" evidence came from a different census and has not been tied to this
-  // call. Cap first 8 (F-317).
   if (nC <= 8)
     MCLA_LOG_WARN("F363-C2EA8 #{} ENTER tid={:08X} r3={:08X} r4={:08X} [8287E26C]={:08X}",
                   nC, GetCurrentThreadId(), ctx.r3.u32, ctx.r4.u32,
@@ -20669,6 +21267,11 @@ PPC_FUNC_IMPL(__imp__sub_822EA1C0);
 static std::atomic<uint32_t> s_h822EA1C0{0};
 PPC_FUNC(sub_822EA1C0) {
   const uint32_t n = s_h822EA1C0.fetch_add(1) + 1;
+  if (MclaUnskip("822EA1C0")) {
+    __imp__sub_822EA1C0(ctx, base);
+    MCLA_LOG_ERROR("UNSKIP-822EA1C0 lr={:08X} ret={:08X}", static_cast<uint32_t>(ctx.lr), ctx.r3.u32);
+    return;
+  }
   MCLA_LOG_WARN("FIX-822EA1C0 #{} lr={:08X} r3={:08X} (returning 0, skipping invalid-ptr write)",
                 n, static_cast<uint32_t>(ctx.lr), ctx.r3.u32);
   ctx.r3.u32 = 0;
@@ -20776,6 +21379,11 @@ PPC_FUNC_IMPL(__imp__sub_82185368);
 static std::atomic<uint32_t> s_h82185368{0};
 PPC_FUNC(sub_82185368) {
   const uint32_t n = s_h82185368.fetch_add(1) + 1;
+  if (MclaUnskip("82185368")) {
+    __imp__sub_82185368(ctx, base);
+    MCLA_LOG_ERROR("UNSKIP-82185368 lr={:08X} ret={:08X}", static_cast<uint32_t>(ctx.lr), ctx.r3.u32);
+    return;
+  }
   MCLA_LOG_WARN("FIX-82185368 #{} lr={:08X} r3={:08X} r5={:08X} (returning 0, skipping null-deref path)",
                 n, static_cast<uint32_t>(ctx.lr), ctx.r3.u32, ctx.r5.u32);
   ctx.r3.u32 = 0;
@@ -20818,6 +21426,11 @@ PPC_FUNC(sub_822FBAF8) {
   // signals. Skip the entire function (return 0) so sub_823047D8 can continue.
   // Labelled MITIGATION, not ROOT CAUSE. Falsifier: MSGBISECT 5-822FBAF8 RETURN
   // goes 0 -> 1, and sub_823047D8-POST fires for the first time.
+  if (MclaUnskip("822FBAF8")) {
+    __imp__sub_822FBAF8(ctx, base);
+    MCLA_LOG_ERROR("UNSKIP-822FBAF8 lr={:08X} ret={:08X}", static_cast<uint32_t>(ctx.lr), ctx.r3.u32);
+    return;
+  }
   MCLA_LOG_WARN("FIX-822FBAF8 #{} lr={:08X} r3={:08X} (returning 0, skipping star_glow init)",
                 n, static_cast<uint32_t>(ctx.lr), ctx.r3.u32);
   ctx.r3.u32 = 0;
@@ -20896,6 +21509,38 @@ PPC_FUNC(sub_821CC570) {
 // has a body for that TOC family, host-complete the read from the served
 // guest-mem buffer so loaders/inflate consume real bytes (ret was always 0
 // because count/page-cache miss â€” guest never saw the host-served body).
+
+PPC_FUNC_IMPL(__imp__sub_821CD7A0);
+PPC_FUNC(sub_821CD7A0) {
+  const uint32_t dev = ctx.r3.u32;
+  const uint32_t pathPtr = ctx.r4.u32;
+  auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
+  char nameBuf[256] = {};
+  if (pathPtr) {
+    const char *p = static_cast<const char*>(mem.Translate(pathPtr));
+    if (p) {
+      strncpy(nameBuf, p, sizeof(nameBuf) - 1);
+    }
+  }
+  std::string s(nameBuf);
+  size_t lastSlash = s.find_last_of("/\\");
+  std::string fileName = (lastSlash != std::string::npos) ? s.substr(lastSlash + 1) : s;
+  if (!fileName.empty()) {
+    std::lock_guard<std::mutex> lk(s_devPackMtx);
+    s_devToPack[dev] = fileName;
+  }
+  MCLA_LOG_ERROR("TEMP-DEV-PACKFILE dev={:08X} path='{}' file='{}'", dev, nameBuf, fileName);
+  __imp__sub_821CD7A0(ctx, base);
+  if (dev && !fileName.empty()) {
+    uint32_t inner = 0;
+    mem.ReadU32BE(dev + 32, &inner);
+    if (inner && inner >= 0xA0000000u) {
+      std::lock_guard<std::mutex> lk(s_devPackMtx);
+      s_devToPack[inner] = fileName;
+    }
+  }
+}
+
 PPC_FUNC_IMPL(__imp__sub_821CC6F0);
 static std::atomic<uint32_t> s_hCC6F0{0};
 PPC_FUNC(sub_821CC6F0) {
@@ -21108,8 +21753,7 @@ PPC_FUNC(sub_821CC6F0) {
     // inflate caller at 821BC380 never runs (w20 soak: INFLATE=0).
     // Inflate input is carried by st+0/st+4 â†’ guest-heap sbuf, not dest.
     if (want != 0 && r6 != 0 && r6 != 0xCDCDCDCDu) {
-      const bool heapDest = r6 >= 0xA0000000u;
-      const uint32_t cap = heapDest ? want : ((want > 256u) ? 256u : want);
+      const uint32_t cap = want;
       uint8_t tmp[256];
       uint32_t done = 0;
       while (done < cap) {
@@ -21225,7 +21869,61 @@ PPC_FUNC(sub_821CC6F0) {
                   serveHead[0], serveHead[1], destHead[0], destHead[1], lrIn);
     // Return the guest's want (r7) so r3==r31 on the inflate refill path.
     ctx.r3.u32 = r7 ? r7 : want;
+    LogStep3Probe(r3, r5, r7, ctx.r3.u32, lrIn, true, pos, body.size);
     return;
+  }
+
+  // Direct uncompressed packfile read: when the body is not cached in guest memory
+  // and the destination is in the guest heap (r6 >= 0xA0000000u), read the real
+  // packfile bytes directly from xarchive_cache.rpf into the caller's buffer.
+  if (!have && r6 != 0 && r6 != 0xCDCDCDCDu && r7 > 0) {
+    std::string packName = "xarchive_cache.rpf";
+    {
+      std::lock_guard<std::mutex> lk(s_devPackMtx);
+      auto it = s_devToPack.find(r3);
+      if (it != s_devToPack.end() && !it->second.empty()) {
+        packName = it->second;
+      }
+    }
+    auto &vfs = mcla::vfs::RpfVirtualFileSystem::Instance();
+    mcla::vfs::RpfVirtualFileSystem::OpenFileHandle fh;
+    if (vfs.OpenFile(packName, fh)) {
+      fh.raw_positional = true;
+      const uint64_t packSz = fh.size ? fh.size : vfs.GetFileSize(packName);
+      if (static_cast<uint64_t>(r5) < packSz) {
+        uint64_t want = r7;
+        if (static_cast<uint64_t>(r5) + want > packSz) {
+          want = packSz - static_cast<uint64_t>(r5);
+        }
+        std::vector<uint8_t> readBuf(want);
+        uint64_t got = 0;
+        if (vfs.ReadFileAt(fh, r5, readBuf.data(), want, got) && got > 0) {
+          const bool wOk = mem.WriteBytes(r6, readBuf.data(), static_cast<uint32_t>(got));
+          uint32_t rHead[4] = {};
+          if (got >= 16) {
+            for (int i = 0; i < 4; ++i) {
+              rHead[i] = (uint32_t(readBuf[i*4]) << 24) | (uint32_t(readBuf[i*4+1]) << 16) |
+                         (uint32_t(readBuf[i*4+2]) << 8) | uint32_t(readBuf[i*4+3]);
+            }
+          }
+          static std::atomic<uint32_t> s_directDisk{0};
+          const uint32_t dn = s_directDisk.fetch_add(1) + 1;
+          // The serve above already happened and is unaffected; only the ROW is
+          // gated (2026-11-08). w12 emitted 152 rows, all of them 8/16/32 KiB
+          // staging reads with got==req -- a healthy path repeating itself.
+          // First 12 + every 25th keeps the first occurrence and the cadence.
+          if (dn <= 12u || (dn % 25u) == 0u) {
+            MCLA_LOG_ERROR("TEMP-CC6F0-DIRECTDISK #{} dev={:08X} pack='{}' r5={:08X} dest={:08X} req={} got={} lr={:08X} wOk={} h=[{:08X} {:08X} {:08X} {:08X}]",
+                           dn, r3, packName, r5, r6, r7, got, lrIn, wOk ? 1 : 0, rHead[0], rHead[1], rHead[2], rHead[3]);
+          }
+          vfs.CloseFile(fh);
+          ctx.r3.u32 = static_cast<uint32_t>(got);
+          LogStep3Probe(r3, r5, r7, ctx.r3.u32, lrIn, true, static_cast<uint32_t>(r5), static_cast<uint32_t>(got));
+          return;
+        }
+      }
+      vfs.CloseFile(fh);
+    }
   }
 
   if (n <= 32 || (n % 200) == 0 || r7 == 0) {
@@ -21238,6 +21936,7 @@ PPC_FUNC(sub_821CC6F0) {
   }
   __imp__sub_821CC6F0(ctx, base);
   const uint32_t ret = ctx.r3.u32;
+  LogStep3Probe(r3, r5, r7, ret, lrIn, false, 0, 0);
   if (g_f481Window.load(std::memory_order_relaxed) != 0) {
     if (ret == 0) g_f481RetZero.fetch_add(1, std::memory_order_relaxed);
     else if (ret >= 0x80000000u)
@@ -22359,6 +23058,7 @@ PPC_FUNC(sub_821CC1E0) {
               oStored < oLogical && oStored <= 0x1000000u &&
               oLogical <= 0x1000000u;
           bool servedOk = false;
+          bool oAllocFailed = false;
           uint64_t gotO = 0;
           if (geometryOk) {
             auto &vfsO = mcla::vfs::RpfVirtualFileSystem::Instance();
@@ -22429,7 +23129,12 @@ PPC_FUNC(sub_821CC1E0) {
                 // rule is a range, here it is an equality, so the slack is 0).
                 if (mcla::RawInflate(raw.data(), oStored, inf, oLogical) &&
                     inf.size() == oLogical) {
-                  const uint32_t oDst = memO.Alloc(oLogical, 16);
+                  // The guest is waiting on this read, so it may use the pool
+                  // when the arena is full; open-time staging may not.
+                  uint32_t oDst = memO.AllocHostBody(oLogical);
+                  if (oDst == 0u)
+                    oDst = memO.Alloc(oLogical, 16);
+                  oAllocFailed = (oDst == 0u);
                   if (oDst != 0u &&
                       memO.WriteBytes(oDst, inf.data(), oLogical)) {
                     const uint32_t ow[4] = {0u, ow1, ow2, ow3};
@@ -22469,7 +23174,7 @@ PPC_FUNC(sub_821CC1E0) {
             // or a momentary handle shortage would permanently starve a
             // member the next call could have served.
             const bool permanent =
-                !geometryOk || (gotO >= oStored && geometryOk);
+                !geometryOk || (gotO >= oStored && geometryOk && !oAllocFailed);
             if (permanent)
               s_ondemandRefused.insert(arRec);
             MCLA_LOG_WARN(
@@ -22641,14 +23346,28 @@ PPC_FUNC(sub_821CC1E0) {
       }
       const uint32_t pPosIn =
           (pBody.size != 0u && amPrePos < pBody.size) ? 1u : 0u;
+      // What the guest's tokenizer really receives: the head of the window and the
+      // bytes around the 32K block seam, as text (F-920 EOF probe; log only).
+      char winHead[49] = {}, winSeam[49] = {};
+      {
+        auto &memW = mcla::kernel::GuestMemoryHeap::Instance();
+        unsigned char rawW[48];
+        const auto printable = [&](uint32_t va, char *out) {
+          if (!memW.ReadBytes(va, rawW, 48)) return;
+          for (int i = 0; i < 48; ++i)
+            out[i] = (rawW[i] >= 32 && rawW[i] < 127) ? (char)rawW[i] : '.';
+        };
+        printable(amIn5, winHead);
+        printable(amIn5 + 1362u, winSeam);
+      }
       MCLA_LOG_WARN(
           "T4312-UNDELIVERED #{} gate={} ret={} req={} retEq={} rec={:08X} "
           "win={:08X} pos={} w1={:08X} bodySize={} posIn={} want={} done={} "
-          "tid={}",
+          "tid={} head='{}' at1362='{}'",
           n4, a4312Gate ? 1u : 0u, a4312Ret, amIn6,
           (a4312Ret == amIn6) ? 1u : 0u, amPreRec, amIn5, amPrePos, pW1,
           pBody.size, pPosIn, a4312Ar.want, a4312Ar.done,
-          GetCurrentThreadId());
+          GetCurrentThreadId(), winHead, winSeam);
     }
   }
 }
@@ -22787,10 +23506,152 @@ PPC_FUNC(sub_821CA490) {
 // 0x82187964, and r3==0 exits the loop at 0x821878F0. Four of the five lists
 // deliver plaintext bodies yet never produce a line, so dump the stream object
 // and the return for reads issued from inside the loader.
+// TEMP-C9: sub_826E5B30 faults reading [[[r3+104]+12]+48] (C8c/C8d, null +12).
+// Log-only: name the +104 object by its RTTI and show its +12 over time.
+static std::string MclaRttiName(uint32_t obj) {
+  auto &m = mcla::kernel::GuestMemoryHeap::Instance();
+  uint32_t vt = 0, col = 0, td = 0;
+  if (!m.ReadU32BE(obj, &vt) || !m.ReadU32BE(vt - 4u, &col) || !m.ReadU32BE(col + 12u, &td)) return "?";
+  char n[64] = {};
+  unsigned char b[63] = {};
+  if (!m.ReadBytes(td + 8u, b, 63)) return "?";
+  for (int k = 0; k < 63 && b[k]; ++k) n[k] = (b[k] >= 32 && b[k] < 127) ? char(b[k]) : '?';
+  return n;
+}
+PPC_FUNC_IMPL(__imp__sub_826E5B30);
+PPC_FUNC(sub_826E5B30) {
+  static std::atomic<uint32_t> s_c9{0};
+  const uint32_t c = s_c9.fetch_add(1) + 1;
+  auto &m = mcla::kernel::GuestMemoryHeap::Instance();
+  uint32_t o = 0, p12 = 0, vt = 0;
+  (void)m.ReadU32BE(ctx.r3.u32 + 104u, &o);
+  if (o) { (void)m.ReadU32BE(o + 12u, &p12); (void)m.ReadU32BE(o, &vt); }
+  if (c <= 12 || (c % 500u) == 0u || (o != 0 && p12 == 0))
+    MCLA_LOG_ERROR("TEMP-C9 #{} self={:08X}'{}' lr={:08X} obj104={:08X} vt={:08X}'{}' obj+12={:08X}",
+                   c, ctx.r3.u32, MclaRttiName(ctx.r3.u32), static_cast<uint32_t>(ctx.lr), o, vt,
+                   o ? MclaRttiName(o) : std::string("-"), p12);
+  __imp__sub_826E5B30(ctx, base);
+}
+
+// TEMP-C9b: the type's body.bnd loader (vtable slot 0x820C0FE4); name = [self+172].
+PPC_FUNC_IMPL(__imp__sub_826E6C50);
+PPC_FUNC(sub_826E6C50) {
+  static std::atomic<uint32_t> s_c9b{0};
+  const uint32_t c = s_c9b.fetch_add(1) + 1;
+  const uint32_t self = ctx.r3.u32, lr = static_cast<uint32_t>(ctx.lr);
+  auto &m = mcla::kernel::GuestMemoryHeap::Instance();
+  uint32_t np = 0; char nm[33] = {}; unsigned char b[32] = {};
+  (void)m.ReadU32BE(self + 172u, &np);
+  {  // TEMP-C9D: F-929 P1/P2 -- parsed fields at the gate (+108 bIsProxy, +12 iInstanceCount, +128 fMaxSpeed).
+    uint8_t px = 0xFF; uint32_t ic = 0, ms = 0;
+    (void)m.ReadU8(self + 108u, &px); (void)m.ReadU32BE(self + 12u, &ic); (void)m.ReadU32BE(self + 128u, &ms);
+    MCLA_LOG_ERROR("TEMP-C9D self={:08X} isProxy={} instCount={} maxSpeed={:08X}", self, px, ic, ms);
+  }
+  {  // TEMP-C9c: the model object the caller asked first ([self+168]->vt[16]).
+    uint32_t mo = 0, mvt = 0, f16 = 0;
+    (void)m.ReadU32BE(self + 168u, &mo);
+    if (mo) { (void)m.ReadU32BE(mo, &mvt); if (mvt) (void)m.ReadU32BE(mvt + 16u, &f16); }
+    uint32_t w[8] = {};
+    for (int k = 0; mo && k < 8; ++k) (void)m.ReadU32BE(mo + 4u * k, &w[k]);
+    MCLA_LOG_ERROR("TEMP-C9C self={:08X} model={:08X}'{}' vt16={:08X} w=[{:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X}]",
+                   self, mo, mo ? MclaRttiName(mo) : std::string("-"), f16, w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]);
+  }
+  if (np && m.ReadBytes(np, b, 32)) for (int k = 0; k < 32 && b[k]; ++k) nm[k] = (b[k] >= 32 && b[k] < 127) ? char(b[k]) : '?';
+  __imp__sub_826E6C50(ctx, base);
+  if (c <= 40 || ctx.r3.u32 == 0)
+    MCLA_LOG_ERROR("TEMP-C9B #{} self={:08X}'{}' name='{}' lr={:08X} bound={:08X}", c, self,
+                   MclaRttiName(self), nm, lr, ctx.r3.u32);
+}
+
+// F-931: kDiscChkForcedAck (sub_821CC1E0 hook) ORs bit31 into the guest TOC
+// record's w3 so the guest treats a compressed member as resident. The guest's
+// packfile close (sub_821CD298) frees the member's z_stream (inflateEnd,
+// sub_821E05E0 on fd+52) only when w3 has bit30 set and bit31 clear -- the same
+// test its open used for inflateInit2_. With the host's bit31 left in place,
+// every compressed open leaked its ~9.5 KiB inflate state into the title arena
+// (M1b TEMP-M1-TOP #1 lr=821DEC40: 13,251,840 bytes in 1,392 live blocks) and
+// the arena OOM'd. Before the guest's own close runs, set bit31 to reflect
+// whether THIS fd's stream really was initialised, so inflateEnd runs exactly
+// when inflateInit2_ did, only for the duration of the close call.
+static std::mutex g_f931Mtx;
+static std::unordered_set<uint32_t> g_f931Inited;  // z_stream VAs (fd+52)
+static void MclaNoteInflateInit(uint32_t zs) {
+  std::lock_guard<std::mutex> lk(g_f931Mtx);
+  g_f931Inited.insert(zs);
+}
+PPC_FUNC_IMPL(__imp__sub_821CD298);
+PPC_FUNC(sub_821CD298) {
+  const uint32_t dev = ctx.r3.u32, h = ctx.r4.u32;
+  auto &m = mcla::kernel::GuestMemoryHeap::Instance();
+  uint32_t entry = 0, flags = 0;
+  const bool inRange = static_cast<int32_t>(h) >= 0 && h < 16u;
+  const uint32_t fd = dev + h * 68u;
+  bool inited = false, touched = false;
+  if (inRange && m.ReadU32BE(fd + 40u, &entry) && entry != 0 && m.ReadU32BE(entry + 12u, &flags) &&
+      (flags & 0x40000000u)) {
+    {
+      std::lock_guard<std::mutex> lk(g_f931Mtx);
+      inited = g_f931Inited.erase(fd + 52u) != 0;
+    }
+    (void)m.WriteU32BE(entry + 12u, inited ? (flags & ~0x80000000u) : (flags | 0x80000000u));
+    touched = true;
+  }
+  __imp__sub_821CD298(ctx, base);
+  // The record is shared by every fd open on this member: put back exactly
+  // the word that was there (M1c: leaving bit31 clear made a sibling fd that
+  // never ran inflateInit2_ inflate through a null state, sub_821E39A0).
+  if (touched) (void)m.WriteU32BE(entry + 12u, flags);
+  static std::atomic<uint32_t> s_n{0};
+  const uint32_t n = s_n.fetch_add(1) + 1;
+  if (touched && (n <= 8 || (n % 500u) == 0u))
+    MCLA_LOG_ERROR("F931-CLOSE #{} fd={:08X} entry={:08X} flags={:08X} inflateEnd={}", n, fd, entry, flags, inited ? 1 : 0);
+}
+
+// TEMP-C8: guest inflateInit2_ (sub_821CCEA0 calls it with r4=-15 for members
+// whose TOC w3 has bit30 set and bit31 clear). Log-only.
+PPC_FUNC_IMPL(__imp__sub_821DEBA8);
+PPC_FUNC(sub_821DEBA8) {
+  static std::atomic<uint32_t> s_c8{0};
+  const uint32_t c = s_c8.fetch_add(1) + 1;
+  const uint32_t lr = static_cast<uint32_t>(ctx.lr), wb = ctx.r4.u32, zs = ctx.r3.u32;
+  __imp__sub_821DEBA8(ctx, base);
+  if (lr == 0x821CCFC4u && ctx.r3.u32 == 0u) MclaNoteInflateInit(zs);  // F-931
+  if (c <= 16 || (c % 200u) == 0u)
+    MCLA_LOG_ERROR("TEMP-C8-INFLATEINIT #{} lr={:08X} windowBits={} ret={}", c, lr,
+                   static_cast<int32_t>(wb), static_cast<int32_t>(ctx.r3.u32));
+}
+
 PPC_FUNC_IMPL(__imp__sub_821CFAA8);
 PPC_FUNC(sub_821CFAA8) {
   const uint32_t lr = static_cast<uint32_t>(ctx.lr);
   if (lr < 0x82187820u || lr >= 0x82187A00u) {
+    // TEMP-C7: the post-LoadCity stall spins here from inside sub_82194CB8.
+    if (lr >= 0x82194CB8u && lr < 0x82196CB8u) {
+      static std::atomic<uint32_t> s_c7{0};
+      const uint32_t c = s_c7.fetch_add(1) + 1;
+      if (c <= 8 || (c % 200000u) == 0u) {
+        auto &m7 = mcla::kernel::GuestMemoryHeap::Instance();
+        uint32_t w[8] = {};
+        for (int k = 0; k < 8; ++k) (void)m7.ReadU32BE(ctx.r3.u32 + k * 4u, &w[k]);
+        char tok[33] = {};
+        unsigned char tb[32] = {};
+        if (m7.ReadBytes(ctx.r4.u32, tb, 32))
+          for (int k = 0; k < 32 && tb[k]; ++k) tok[k] = (tb[k] >= 32 && tb[k] < 127) ? char(tb[k]) : '?';
+        MCLA_LOG_ERROR("TEMP-C7-TOKEN #{} lr={:08X} obj={:08X} w=[{:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X}] buf='{}'",
+                       c, lr, ctx.r3.u32, w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7], tok);
+        if (c == 200000u && w[3] >= 0x82860C18u && w[3] < 0x82860C18u + 12u * 40u) {
+          const uint32_t si = (w[3] - 0x82860C18u) / 40u;
+          uint32_t sl[10] = {};
+          for (int k = 0; k < 10; ++k) (void)m7.ReadU32BE(w[3] + k * 4u, &sl[k]);
+          std::string vis;
+          unsigned char bb[4096] = {};
+          if (m7.ReadBytes(0x82860DF8u + si * 0x1000u, bb, sizeof bb))
+            for (unsigned char ch : bb) vis += (ch >= 32 && ch < 127) ? char(ch) : (ch == 10 ? '|' : '.');
+          MCLA_LOG_ERROR("TEMP-C7-SLOT slot={} w=[{:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X}] buf4k='{}'",
+                         si, sl[0], sl[1], sl[2], sl[3], sl[4], sl[5], sl[6], sl[7], sl[8], sl[9], vis.substr(0, 1200));
+        }
+      }
+    }
     __imp__sub_821CFAA8(ctx, base);
     return;
   }
@@ -22922,12 +23783,23 @@ PPC_FUNC(sub_8226D638) {
                   n, ctx.r3.u32, static_cast<uint32_t>(ctx.lr));
   __imp__sub_8226D638(ctx, base);
 }
+// TEMP-LOADCITY: script native "LayerCity_LoadCity" wrapper (F-923 OPEN):
+// the only path that activates the city layer and creates mcPropManager.
+PPC_FUNC_IMPL(__imp__sub_822C9DD8);
+static std::atomic<uint32_t> s_h822C9DD8{0};
+PPC_FUNC(sub_822C9DD8) {
+  const uint32_t n = s_h822C9DD8.fetch_add(1) + 1;
+  if (n <= 8)
+    MCLA_LOG_ERROR("TEMP-LOADCITY #{} r3={:08X} lr={:08X}", n, ctx.r3.u32,
+                   static_cast<uint32_t>(ctx.lr));
+  __imp__sub_822C9DD8(ctx, base);
+}
 PPC_FUNC_IMPL(__imp__sub_822C79A0);
 static std::atomic<uint32_t> s_h822C79A0{0};
 PPC_FUNC(sub_822C79A0) {
   const uint32_t n = s_h822C79A0.fetch_add(1) + 1;
   if (n <= 2)
-    MCLA_LOG_INFO("PLUSER sub_822C79A0 #{} r3={:08X} lr={:08X}",
+    MCLA_LOG_ERROR("PLUSER sub_822C79A0 #{} r3={:08X} lr={:08X}",
                   n, ctx.r3.u32, static_cast<uint32_t>(ctx.lr));
   __imp__sub_822C79A0(ctx, base);
 }
@@ -23150,6 +24022,9 @@ PPC_FUNC(sub_821CB488) {
       MclaSanitizePath(path, sizeof(path));
     }
     const uint32_t ret = ctx.r3.u32;
+    if (ret != 0 && ret != 0xFFFFFFFFu && path[0] != '\0') {
+      ProbeRecordDevicePath(ret, path);
+    }
     uint32_t vt = 0;
     if (ret != 0 && ret != 0xFFFFFFFFu)
       (void)memR.ReadU32BE(ret, &vt);
@@ -24211,6 +25086,17 @@ static bool MclaTocIndexEnsure(uint32_t *outHashes = nullptr,
     // counter vs the pushes), so MISMATCH is a real cross-check, not a tautology.
     MclaTocDumpLeaves(g_tocWalkBase.load(std::memory_order_relaxed),
                       totalLeaves);
+    {   // F-926: hand the member starts to the VFS overlay veto.
+      std::vector<uint64_t> starts;
+      {
+        std::lock_guard<std::mutex> lk(g_tocIdxMtx);
+        for (const auto &kv : g_tocByHash)
+          for (const auto &rec : kv.second)
+            if (rec.off != 0) starts.push_back(rec.off);
+      }
+      MCLA_LOG_ERROR("F926-TOC-STARTS n={}", starts.size());
+      mcla::vfs::RegisterTocMemberStarts("xarchive_cache.rpf", std::move(starts));
+    }
     }
   }
   uint32_t hashes = 0, leaves = 0;
@@ -24603,6 +25489,11 @@ static std::atomic<uint32_t> s_hCCEA0{0};
 // reader is the window row in PPC_FUNC(sub_821BE250) below.
 static std::mutex g_slotPathMtx;
 static char g_slotPath[16][256] = {{0}};
+static std::string MclaFdSlotPath(uint32_t fd) {
+  if (fd >= 16) return "-";
+  std::lock_guard<std::mutex> lk(g_slotPathMtx);
+  return g_slotPath[fd];
+}
 // F-800b: per-slot last-use ordinal (the LRU clock for FD-RESCUE). Bumped on
 // every successful open; the rescue evicts the slot with the smallest value.
 static std::atomic<uint64_t> g_slotUseOrd[16] = {};
@@ -25709,7 +26600,9 @@ F618_TAIL_HOOK(sub_82371310, T371310)
     if (n <= 2 || (n % 200) == 0) \
       MCLA_LOG_WARN("F619-TAIL #{} " #tag " r3={:08X} lr={:08X}", n, \
                     ctx.r3.u32, ctx.lr); \
+    MCLA_LOG_ERROR("TEMP-TAIL " #tag " enter flag={:02X}", PPC_LOAD_U8(0x8286CF2Fu)); { static std::atomic<bool> d{false}; if (!d.exchange(true)) { std::vector<uint8_t> v(18432); for (size_t i = 0; i < v.size(); ++i) v[i] = PPC_LOAD_U8(0xA0480C40u + i); if (FILE* f = fopen("audlo_toc.bin", "wb")) { fwrite(v.data(), 1, v.size(), f); fclose(f); } } } \
     __imp__##sym(ctx, base); \
+    MCLA_LOG_ERROR("TEMP-TAIL " #tag " exit r3={:08X} sys={:08X} flag={:02X}", ctx.r3.u32, PPC_LOAD_U32(0x8286CEECu), PPC_LOAD_U8(0x8286CF2Fu)); \
   }
 F619_TAIL_HOOK(sub_821E7770, T1E7770)
 F619_TAIL_HOOK(sub_82328648, T328648)
@@ -26159,20 +27052,26 @@ static uint32_t MakeMemoryStream(uint32_t device, uint32_t handle,
   // Host-side shadow wrapper (BE250 Read() fields: +0 dev, +4 handle,
   // +8 buf, +16 counter, +24 readPos, +28 end, +32 cap). Kept so
   // MemoryStreamServeRead and the s_lastMemStream consumers still work.
-  const uint32_t s = kMemStreamSlot;
-  mem.WriteU32BE(s + 0, device);
-  mem.WriteU32BE(s + 4, handle);
-  mem.WriteU32BE(s + 8, size);
-  mem.WriteU32BE(s + 12, 0);
-  mem.WriteU32BE(s + 16, 0);
-  mem.WriteU32BE(s + 20, 0);
-  mem.WriteU32BE(s + 24, 0); // readPos  (BE250 field)
-  mem.WriteU32BE(s + 28, 0); // writePos (BE250 field)
-  s_lastMemStream = s;
+  const uint32_t s = mem.Alloc(64, 16);
+  const uint32_t obj = (s != 0) ? s : kMemStreamSlot;
+  for (uint32_t q = 0; q < 64; q += 4) (void)mem.WriteU32BE(obj + q, 0);
+  mem.WriteU32BE(obj + 0, device);
+  mem.WriteU32BE(obj + 4, handle);
+  mem.WriteU32BE(obj + 8, size);
+  mem.WriteU32BE(obj + 12, 0);
+  mem.WriteU32BE(obj + 16, 0);
+  mem.WriteU32BE(obj + 20, 0);
+  mem.WriteU32BE(obj + 24, 0); // readPos  (BE250 field)
+  mem.WriteU32BE(obj + 28, size); // writePos (BE250 field)
+  mem.WriteU32BE(obj + 32, size);
+  // Also keep kMemStreamSlot updated for legacy singleton consumers
+  mem.WriteU32BE(kMemStreamSlot + 0, device);
+  mem.WriteU32BE(kMemStreamSlot + 4, handle);
+  mem.WriteU32BE(kMemStreamSlot + 8, size);
+  s_lastMemStream = obj;
   // Phase 2 T3 fix: the guest treats an open handle as a slot index. Insert
   // {handle=buf, size} into the real 16-entry slot table and return the
-  // INDEX â€” the exact contract of sub_821CAE50's open path. The BE8D8
-  // vt+56 size fetch then returns the real buffer, alloc(size) succeeds,
+  // INDEX. The BE8D8 vt+56 size fetch then returns the real buffer, alloc(size) succeeds,
   // and Read() gets sane counts instead of 0xffffffff.
   const int slotIdx = GuestSlotTableInsert(handle, size);
   if (slotIdx >= 0) {
@@ -26184,8 +27083,8 @@ static uint32_t MakeMemoryStream(uint32_t device, uint32_t handle,
                     n, slotIdx, handle, size);
     return static_cast<uint32_t>(slotIdx);
   }
-  // Table full: legacy behavior (pointer handle) â€” logged above.
-  return s;
+  // Dedicated allocated stream object
+  return obj;
 }
 
 // Host-side read for a dead/legacy wrapper: obj+4=buf, obj+8=size, cursor at
@@ -26988,6 +27887,7 @@ PPC_FUNC(sub_821BDF20) {
   const size_t pathLen = std::strlen(path);
   __imp__sub_821BDF20(ctx, base);
   const int32_t ret = static_cast<int32_t>(ctx.r3.s32);
+  if (std::strstr(path, "ngineSettings") || std::strstr(path, "curves")) MCLA_LOG_ERROR("TEMP-BDF20 path='{}' flags={:x} ret={:d} lr={:08X} mounts857770={}", path, flags, ret, lr, (int)PPC_LOAD_U32(0x82857770u + 3076u));
   // F-144: 0x827D7770 is not a type registry, it is the resource *path* manager
   // (w152's MSGBISECT "3-821CA540 name-insert" shows it being fed
   // '$/resources/ui', '$/resources/ui/', '$/textures/global/cars', 'globaltex',
@@ -27332,6 +28232,30 @@ if (dev != 0 && dev != 0xCDCDCDCDu && dev != kMemDeviceObj &&
           done += chunk;
         }
         if (ok) {
+          // F-928: the guest's own BE8D8 closes its source stream
+          // (`mr r3,r31; bl 821BE610`) once the body is copied; this host
+          // path skipped that, so every source wrapper leaked its slot in the
+          // 12-entry table at 0x82860C18 (C8b TEMP-C8-SLOTS: 10 of 12 held by
+          // tune/lighting/* at pos=0) and DICTSLOT-RESCUE then tore live slots
+          // away (C7c: entity.type's slot handed to a .dds -> tokenizer EOF
+          // spin). Only for callers that replace their pointer with our return
+          // and never touch the source again (raw bytes at each lr): 821C025C,
+          // 821C0500, 82191070, 82177054. 8218C804/82187878 keep the source.
+          if (lr == 0x821C025Cu || lr == 0x821C0500u || lr == 0x82191070u ||
+              lr == 0x82177054u) {
+            const uint32_t r1In = ctx.r1.u32;
+            ctx.r1.u32 = r1In - 256u;  // borrowed frame, as F-160 does
+            ctx.r3.u32 = obj;
+            sub_821BE610(ctx, base);
+            ctx.r1.u32 = r1In;
+            static std::atomic<uint32_t> s_f928{0};
+            const uint32_t cn = s_f928.fetch_add(1) + 1;
+            uint32_t w0 = 0xFFFFFFFFu;
+            (void)mem.ReadU32BE(obj, &w0);
+            if (cn <= 16 || (cn % 200u) == 0u)
+              MCLA_LOG_ERROR("F928-PACK-CLOSE #{} lr={:08X} obj={:08X} h={} w0_after={:08X} path='{}'",
+                             cn, lr, obj, h, w0, body.path);
+          }
           const uint32_t st = MakeMemoryStream(kMemDeviceObj, dst, ssize);
           // T41.3t (F-107 follow-on): five of five list bodies are delivered but
           // only two groups yield lines, so print what the loader was actually
@@ -27346,6 +28270,27 @@ if (dev != 0 && dev != 0xCDCDCDCDu && dev != kMemDeviceObj &&
                         "dst={:08X} stream={:08X} head=[{:08X}] ascii='{}'",
                         n, obj, dev, vt, h, tocEntry, body.path, body.buf,
                         ssize, dst, st, MclaBE(raw), vis);
+          // Latched callers (82191070, 821C025C) use the return as a stream OBJECT, not a
+          // slot index; same layout as the BE0C8-OBJ branch (dev,+4 handle,+8 buf,+28/+32 size).
+          // F-930: 821C0500 (sub_821C04B0, the XML/tune loader) also uses the return
+          // as a stream OBJECT (passes it to 821C03F8 as r4, closes it with
+          // 821BE610); a bare slot index there made every such parse read junk,
+          // e.g. va_proxy's mcAmbientType.xml lost bIsProxy (F-929).
+          static const bool s_f930 = [] { const char* e = std::getenv("MCLA_F930"); return !(e && e[0] == '0'); }();
+          if ((lr == 0x82191070u || lr == 0x821C025Cu || (s_f930 && lr == 0x821C0500u)) &&
+              st >= 1u && st < kGuestSlotCount) {
+            const uint32_t o = mem.Alloc(64, 16);
+            if (o != 0) {
+              for (uint32_t q = 0; q < 64; q += 4) (void)mem.WriteU32BE(o + q, 0);
+              (void)mem.WriteU32BE(o + 0, kMemDeviceObj);
+              (void)mem.WriteU32BE(o + 4, st);
+              (void)mem.WriteU32BE(o + 8, dst);
+              (void)mem.WriteU32BE(o + 28, ssize);
+              (void)mem.WriteU32BE(o + 32, ssize);
+              ctx.r3.u32 = o;
+              return;
+            }
+          }
           ctx.r3.u32 = st;
           return;
         }
@@ -27411,7 +28356,12 @@ if (dev != 0 && dev != 0xCDCDCDCDu && dev != kMemDeviceObj &&
   // F-162: the ONE call whose caller dereferences the result - let the guest's
   // own tail run (it reaches sub_821BE0C8 from inside, w170: BE0C8 #179 with
   // lr=821BE988 right after this site) but ask that re-open for an object.
-  if (lr == 0x82191070u) {
+  // sub_821C0210+0x48 (bl at 821C0258) also hands this return to sub_821C00E8 as a stream
+  // object (engineSettings.xml / any '$/' xml via the path manager), so latch it too.
+  // F-930: 821C0500 (sub_821C04B0, XML/tune loader) consumes the return as a
+  // stream object too (r4 of 821C03F8, then 821BE610 close).
+  static const bool s_f930b = [] { const char* e = std::getenv("MCLA_F930"); return !(e && e[0] == '0'); }();
+  if (lr == 0x82191070u || lr == 0x821C025Cu || (s_f930b && lr == 0x821C0500u)) {
     s_reopenWantsObject = true;
     __imp__sub_821BE8D8(ctx, base);
     s_reopenWantsObject = false;
@@ -27733,7 +28683,9 @@ PPC_FUNC(sub_821C08F8) {
                   "tid={}",
                   k, self, size, align, static_cast<uint32_t>(ctx.lr), ctx.r1.u32,
                   GetCurrentThreadId());
+  const uint32_t m1lr = static_cast<uint32_t>(ctx.lr), m1sel = ctx.r6.u32;
   __imp__sub_821C08F8(ctx, base);
+  if (m1sel == 0) { void MclaArenaNoteAlloc(uint32_t, uint32_t, uint32_t); MclaArenaNoteAlloc(ctx.r3.u32, m1lr, size); }  // TEMP-M1
   const uint64_t o = s_396out.fetch_add(1) + 1;
   if (o <= 64 || (o % 64) == 0)
     MCLA_LOG_WARN("F396-ALLOC-EXIT #{} (enters={}) self={:08X} size={} ret={:08X} tid={}", o, k,
@@ -28504,9 +29456,11 @@ PPC_FUNC(sub_821CFE80) {
 // stays rare enough to read.
 PPC_FUNC_IMPL(__imp__sub_821BE568);
 static std::atomic<uint32_t> s_hSeekDead{0};
+extern std::atomic<int> g_tmpTrace;
 PPC_FUNC(sub_821BE568) {
   const uint32_t obj = ctx.r3.u32;
   const uint32_t pos = ctx.r4.u32;
+  if (g_tmpTrace.load() > 0 && obj >= 0xB0000000u && obj < 0xC0000000u) { g_tmpTrace--; MCLA_LOG_ERROR("TEMP-SEEK obj={:08X} pos={} lr={:08X}", obj, pos, (uint32_t)ctx.lr); }
   const uint32_t lrIn = static_cast<uint32_t>(ctx.lr);
   bool dead = false;
   uint32_t dev = 0, h = 0, cur = 0, en = 0, cap = 0;
@@ -28570,6 +29524,7 @@ PPC_FUNC(sub_821CB2A0) {
 // Stream read: [obj+0] must be a live device. Dead wrapper -> serve bytes from
 // the wrapper fields ourselves (MakeMemoryStream layout) so factory reads get
 // real data instead of -1 (which cascaded into AF68's cap=-1 AV).
+extern std::atomic<int> g_tmpTrace;
 PPC_FUNC_IMPL(__imp__sub_821BE250);
 static std::atomic<uint32_t> s_hBE250{0};
 static std::atomic<uint64_t> s_winRows{0};
@@ -28580,6 +29535,7 @@ PPC_FUNC(sub_821BE250) {
   const uint32_t obj = ctx.r3.u32;
   const uint32_t dst = ctx.r4.u32;
   const uint32_t count = ctx.r5.u32;
+  if (g_tmpTrace.load() > 0) { g_tmpTrace--; MCLA_LOG_ERROR("TEMP-READ obj={:08X} dst={:08X} count={} lr={:08X}", obj, dst, count, (uint32_t)ctx.lr); }
   // T43.11(2) (LONG_TODO Â§6 T43.11, :1629; F-786) -- THE LEN GUARD at the
   // sub_8218B0C8 / sub_821BE250 boundary, and it is LOG-ONLY as the task's own
   // bolded word demands: it prints and falls through, changing no control flow,
@@ -28628,6 +29584,17 @@ PPC_FUNC(sub_821BE250) {
   // fields (+8/+24/+28/+32) and serves wrong bytes ("Old version" fatal).
   if (dev == kMemDeviceObj && h != 0 && h < kGuestSlotCount) {
     const int64_t served = SlotTableServeRead(h, dst, count);
+    if (served > 0) {
+      // Synthetic stream objects (buffer at +8, end at +28; see the BE8D8-PACK object) are also
+      // read inline by the guest via +24: keep it in step, else a type peek (4 bytes) is
+      // replayed by the XML reader ('<aud' + '<audConfig>' -> root tag 'aud').
+      uint32_t ob = 0, oe = 0, op = 0;
+      (void)mem.ReadU32BE(obj + 8, &ob);
+      (void)mem.ReadU32BE(obj + 28, &oe);
+      (void)mem.ReadU32BE(obj + 24, &op);
+      if (ob != 0 && oe != 0)
+        (void)mem.WriteU32BE(obj + 24, op + static_cast<uint32_t>(served));
+    }
     if (served >= 0) {
       if (n <= 24 || (n % 200) == 0)
         MCLA_LOG_WARN("BE250-SLOT #{} obj={:08X} h={} served={} count={}",
@@ -28939,6 +29906,21 @@ PPC_FUNC(sub_821BE710) {
     if (served >= 0) {
       MCLA_LOG_WARN("BE710-SLOT #{} obj={:08X} h={} words={} served={}", n,
                     obj, h, ctx.r5.u32, served);
+      // C4 (M1 follow-up): dump the served header words for the script
+      // registrar's magic-check read (caller lr inside sub_82557A68; the
+      // guest compares word[4] against 0x0E514353/0x0E736353/0x0E736373
+      // to decide registration). Read-only, ERROR-level.
+      if (static_cast<uint32_t>(ctx.lr) == 0x82557B1Cu && ctx.r4.u32 != 0u &&
+          ctx.r4.u32 != 0xCDCDCDCDu) {
+        uint32_t w[6] = {0};
+        for (uint32_t i = 0u; i < 6u; ++i)
+          (void)mem.ReadU32BE(ctx.r4.u32 + i * 4u, &w[i]);
+        MCLA_LOG_ERROR("C4-SCRHDR slot magic={:08X} "
+                       "w=[{:08X},{:08X},{:08X},{:08X},{:08X},{:08X}] "
+                       "h={} words={} retR3={:08X} dst={:08X}",
+                       w[4], w[0], w[1], w[2], w[3], w[4], w[5], h,
+                       ctx.r5.u32, ctx.r3.u32, ctx.r4.u32);
+      }
       ctx.r3.u32 = static_cast<uint32_t>(served) / 4u;
       return;
     }
@@ -29179,6 +30161,18 @@ PPC_FUNC(sub_821BE710) {
                     outR3 != 0u ? 1 : 0, inR4, dstAfter,
                     dstAfter == 0x61786772u ? 1 : 0, lrIn);
     }
+  }
+  // C4 (M1 follow-up): dump the chain-read header words for the script
+  // registrar's magic-check call (lr inside sub_82557A68). Read-only.
+  if (lrIn == 0x82557B1Cu && inR4 != 0u && inR4 != 0xCDCDCDCDu) {
+    uint32_t w[6] = {0};
+    for (uint32_t i = 0u; i < 6u; ++i)
+      (void)mem.ReadU32BE(inR4 + i * 4u, &w[i]);
+    MCLA_LOG_ERROR("C4-SCRHDR chain magic={:08X} "
+                   "w=[{:08X},{:08X},{:08X},{:08X},{:08X},{:08X}] "
+                   "words={} retR3={:08X} dst={:08X}",
+                   w[4], w[0], w[1], w[2], w[3], w[4], w[5], inR5,
+                   ctx.r3.u32, inR4);
   }
   // ---------------------------------------------------------------------------
   // WINWR-CMP (AO, 2026-10-05). THE COMPARE'S OWN REGISTERS, ON THE CALL THAT
@@ -29727,7 +30721,9 @@ PPC_FUNC(sub_82130528) {
   ctx.r4.u32 = ctx.r3.u32;
   ctx.r5.u32 = 16;
   ctx.r6.u32 = 0;
+  const uint32_t tempSz = ctx.r4.u32, tempLr = static_cast<uint32_t>(ctx.lr);
   __xtl_alloc(ctx, base);
+  if (ctx.r3.u32 == 0) { static std::atomic<uint32_t> s_tn{0}; const uint32_t k = s_tn.fetch_add(1) + 1; if (k <= 30 || (k % 5000) == 0) MCLA_LOG_ERROR("TEMP-NEW-NULL #{} of {} size={} lr={:08X}", k, n, tempSz, tempLr); }
 }
 
 PPC_FUNC_IMPL(__imp__sub_82130550);
@@ -29866,7 +30862,7 @@ PPC_FUNC(sub_821CC800) {
   if (slotH != 0u && slotH != 0xCDCDCDCDu) {
     KernelObject *ko = LookupIdentityKernelObject(slotH);
     if (ko) {
-      Semaphore *sem = dynamic_cast<Semaphore *>(ko);
+      Semaphore *sem = SafeDynamicCast<Semaphore>(ko);
       if (sem)
         slotCnt = sem->count.load(std::memory_order_relaxed);
     }
@@ -29903,5 +30899,148 @@ PPC_FUNC(sub_821CBEB0) {
   if (n <= 40 || (n % 200) == 0) {
     MCLA_LOG_WARN("DEVCLOSE exit #{} ret={:08X} this={:08X} lr={:08X}", n,
                   ctx.r3.u32, thisPtr, lr);
+  }
+}
+
+
+// ===========================================================================
+// scrThread native command table instrumentation and robust registration
+// ===========================================================================
+PPC_FUNC_IMPL(__imp__sub_82554788);
+static std::atomic<uint32_t> s_scrInitClassCount{0};
+PPC_FUNC(sub_82554788) {
+  const uint32_t n = s_scrInitClassCount.fetch_add(1) + 1;
+  const uint32_t cap = ctx.r3.u32;
+  const uint32_t lr = static_cast<uint32_t>(ctx.lr);
+  MCLA_LOG_ERROR("SCRTHREAD-INITCLASS #{} cap={} lr={:08X}", n, cap, lr);
+  __imp__sub_82554788(ctx, base);
+}
+
+PPC_FUNC_IMPL(__imp__sub_82554500);
+static std::atomic<uint32_t> s_scrAllocCount{0};
+PPC_FUNC(sub_82554500) {
+  const uint32_t n = s_scrAllocCount.fetch_add(1) + 1;
+  const uint32_t table = ctx.r3.u32;
+  const uint32_t cap = ctx.r4.u32;
+  const uint32_t lr = static_cast<uint32_t>(ctx.lr);
+  auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
+
+  __imp__sub_82554500(ctx, base);
+
+  uint32_t buckets = 0, capAfter = 0, countAfter = 0;
+  (void)mem.ReadU32BE(table + 0u, &buckets);
+  (void)mem.ReadU32BE(table + 4u, &capAfter);
+  (void)mem.ReadU32BE(table + 12u, &countAfter);
+
+  bool zeroed = true;
+  uint32_t sample[4] = {0};
+  for (uint32_t i = 0; i < 4 && i < capAfter; ++i) {
+    (void)mem.ReadU32BE(buckets + i * 8u, &sample[i]);
+    if (sample[i] != 0) zeroed = false;
+  }
+  const char *arena = (buckets >= 0xA0000000u && buckets < 0xC0000000u) ? "physical" : "user-heap";
+  MCLA_LOG_ERROR("SCRTHREAD-ALLOC #{} table={:08X} req_cap={} cap={} count={} buckets={:08X} arena={} zeroed={} [0]={:08X} [1]={:08X} lr={:08X}",
+                 n, table, cap, capAfter, countAfter, buckets, arena, zeroed ? "yes" : "NO", sample[0], sample[1], lr);
+}
+
+static std::atomic<uint32_t> s_scrCmdCount{0};
+static char s_lastCmdName[128] = {0};
+PPC_FUNC_IMPL(__imp__sub_82554798);
+PPC_FUNC(sub_82554798) {
+  const uint32_t n = s_scrCmdCount.fetch_add(1) + 1;
+  const uint32_t namePtr = ctx.r3.u32;
+  const uint32_t hnd = ctx.r4.u32;
+  const uint32_t lr = static_cast<uint32_t>(ctx.lr);
+  auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
+
+  char nameBuf[64] = {0};
+  if (namePtr != 0) {
+    const char *p = static_cast<const char *>(mem.Translate(namePtr));
+    if (p) {
+      strncpy(nameBuf, p, sizeof(nameBuf) - 1);
+    }
+  }
+  strncpy(s_lastCmdName, nameBuf, sizeof(s_lastCmdName) - 1);
+
+  if (nameBuf[0] == '\0') {
+    MCLA_LOG_ERROR("SCRTHREAD-EMPTY #{} r3={:08X} r4={:08X} lr={:08X}", n, namePtr, hnd, lr);
+  }
+  if (n <= 50 || (n % 200) == 0) {
+    MCLA_LOG_ERROR("SCRTHREAD-CMD #{} name='{}' hnd={:08X} lr={:08X}", n, nameBuf, hnd, lr);
+  }
+
+  __imp__sub_82554798(ctx, base);
+}
+
+PPC_FUNC_IMPL(__imp__sub_825578C8);
+static std::atomic<uint32_t> s_scrRegCount{0};
+PPC_FUNC(sub_825578C8) {
+  const uint32_t rn = s_scrRegCount.fetch_add(1) + 1;
+  const uint32_t table = ctx.r3.u32;
+  const uint32_t hash = ctx.r4.u32;
+  const uint32_t hnd = ctx.r5.u32;
+  const uint32_t lr = static_cast<uint32_t>(ctx.lr);
+  auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
+
+  uint32_t capBefore = 0, countBefore = 0, bucketsBefore = 0, initCap = 0;
+  (void)mem.ReadU32BE(table + 0u, &bucketsBefore);
+  (void)mem.ReadU32BE(table + 4u, &capBefore);
+  (void)mem.ReadU32BE(table + 8u, &initCap);
+  (void)mem.ReadU32BE(table + 12u, &countBefore);
+
+  __imp__sub_825578C8(ctx, base);
+
+  uint32_t ret = ctx.r3.u32 & 0xFF;
+  if (ret == 0) {
+    const char *verdict = "unknown";
+    if (capBefore == 0) {
+      verdict = "wrong capacity (capacity is 0)";
+    } else if (countBefore >= capBefore) {
+      verdict = "table is full";
+    } else {
+      bool foundHash = false;
+      uint32_t matchSlot = 0;
+      if (bucketsBefore != 0) {
+        for (uint32_t i = 0; i < capBefore; ++i) {
+          uint32_t slotH = 0;
+          if (mem.ReadU32BE(bucketsBefore + i * 8u, &slotH) && slotH == hash) {
+            foundHash = true;
+            matchSlot = i;
+            break;
+          }
+        }
+      }
+      if (foundHash) {
+        verdict = "collision from registering twice";
+      } else {
+        verdict = "table not zeroed or bad slot";
+      }
+    }
+
+    MCLA_LOG_ERROR("SCRTHREAD-FAIL name='{}' table={:08X} cap={} used={} hash={:08X} lr={:08X}",
+                   s_lastCmdName, table, capBefore, countBefore, hash, lr);
+    MCLA_LOG_ERROR("SCRTHREAD-CENSUS sub_82554798_calls={} sub_825578C8_calls={}",
+                   s_scrCmdCount.load(), rn);
+    MCLA_LOG_ERROR("SCRTHREAD-DIAG verdict='{}'", verdict);
+  } else {
+    // Cycle C1 (M1 gate): success-side insertion census. The FAIL-only log
+    // above cannot answer "did a script-map insertion ever happen", and the
+    // two tables (0x828DA3E0 command, 0x82811134 script) need separating.
+    // Log-only, ERROR-level, capped.
+    uint32_t cnt = 0;
+    (void)mem.ReadU32BE(table + 12u, &cnt);
+    if (rn <= 32 || (rn % 200) == 0) {
+      MCLA_LOG_ERROR("C1-REG #{} table={:08X} hash={:08X} hnd={:08X} count={} lr={:08X}",
+                     rn, table, hash, hnd, cnt, lr);
+    }
+    // Cycle C2 (M1 follow-up): unconditional per-insertion line for the
+    // script map only. The C1 cadence (rn<=32, %200) samples table
+    // 0x828DA3E0 heavily and could hide the 0x82811134 insertions entirely;
+    // script registrations are rare (a handful per boot), so every one
+    // prints. Also prints immediately before any matching FAILdiagnosis.
+    if (table == 0x82811134u) {
+      MCLA_LOG_ERROR("C2-SCRIPTREG #{} hash={:08X} hnd={:08X} count={} lr={:08X}",
+                     rn, hash, hnd, cnt, lr);
+    }
   }
 }

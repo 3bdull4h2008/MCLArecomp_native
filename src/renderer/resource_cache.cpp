@@ -180,9 +180,9 @@ bool TextureCache::Find(const TextureCacheKey& key, TextureCacheEntry& out,
     return false;
 }
 
-std::vector<TextureCacheKey> TextureCache::Insert(const TextureCacheKey& key,
+std::vector<TextureCache::EvictedTexture> TextureCache::Insert(const TextureCacheKey& key,
                                                   const TextureCacheEntry& entry) {
-    std::vector<TextureCacheKey> stillToRelease;
+    std::vector<EvictedTexture> stillToRelease;
     auto it = map_.find(key);
     if (it != map_.end()) {
         residentBytes_ -= it->second->entry.residentBytes;
@@ -216,7 +216,7 @@ std::vector<TextureCacheKey> TextureCache::Insert(const TextureCacheKey& key,
             }
             stats_.evictions++;
             residentBytes_ -= it->entry.residentBytes;
-            stillToRelease.push_back(it->key);
+            stillToRelease.push_back({it->key, it->entry});
             map_.erase(it->key);
             it = lru_.erase(it);
             return true;

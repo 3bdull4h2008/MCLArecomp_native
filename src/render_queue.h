@@ -5,6 +5,7 @@
 #include <queue>
 #include <mutex>
 #include <condition_variable>
+#include <chrono>
 #include <atomic>
 
 namespace mcla::native {
@@ -142,6 +143,12 @@ struct CpVertexFormat {
 // with more than 8 fetches is truncated by that pre-existing bound, not by
 // this array, so the two cannot disagree.
 constexpr uint32_t kCpVertexElementMax = 8u;
+
+// F-899 (2026-10-27): the texture-descriptor carry bound. The fetch window has
+// 32 slots; the root signature binds t0..t3, so at most 4 can be sampled, but
+// 16 is kept as the carry bound (matching capture_hooks' kMaxTextureDescriptors)
+// so an over-bind is visible as a refusal rather than silently dropped.
+constexpr uint32_t kCpMaxTextureDescriptors = 16u;
 
 // ONE vertex-fetch instruction's declaration, carried verbatim from the guest's
 // own encoded word. Added because DrawCapturedCommand carried only element 0's
@@ -417,15 +424,18 @@ enum CpShaderAddrSpace : uint32_t {
 //   * WHEN: once per DRAW_CAPTURED, at the enqueue site, on the guest CP thread
 //     that executed the PM4_IM_LOAD. It is a SNAPSHOT, not a live view; the
 //     image is overwritten by the next PM4_IM_LOAD for that stage.
-//   * VALID iff present != 0 AND embedded != 0. For the pointer form
-//     (PM4_IM_LOAD, 0x27) the body is in guest memory at guestAddr and NOT
-//     here, so body is all zeroes; and when present == 0 the record is the
-//     zero-initialised `vs = {}` / `ps = {}` at gpu_cp.cpp:3086-3087. That
-//     value-initialisation is also what keeps the TAIL honest: it zeroes the
-//     whole body, so a shorter re-upload cannot ship the previous longer
-//     program's leftover words past `captured`. Remove the `= {}` and this
-//     array becomes a stale-tail source - the producer says the same at
-//     gpu_cp.cpp:3145-3157, and that is the falsifier for THIS field.
+//   * VALID iff present != 0. CpExecImLoad captures both pointer and immediate
+//     forms with ReadU32BE; CpSnapshotDrawState copies those dwords into body[].
+//     `embedded` identifies the packet form, not whether body[] is populated.
+//     `guestAddr` is the packet address and may be physical even when addrSpace
+//     records that the producer had to read through a kernel-VA alias. Consumers
+//     must use this captured body rather than dereference guestAddr directly.
+//     When present == 0 the record is the zero-initialised `vs = {}` / `ps = {}`
+//     at gpu_cp.cpp:3086-3087. That value-initialisation also keeps the TAIL
+//     honest: it zeroes the whole body, so a shorter re-upload cannot ship the
+//     previous longer program's leftover words past `captured`. Remove the
+//     `= {}` and this array becomes a stale-tail source - the producer says the
+//     same at gpu_cp.cpp:3145-3157, and that is the falsifier for THIS field.
 //   * HOW MANY ARE MEANINGFUL: min(captured, kCpShaderBodyDwords). A consumer
 //     MUST test captured <= kCpShaderBodyDwords before reading body, because
 //     `captured` is the PRODUCER'S retained count and CAN legitimately exceed
@@ -508,7 +518,20 @@ enum CpSnapshotReg : uint32_t {
     // are the same layout and are NOT captured; render_thread.cpp refuses rather
     // than filling slots 1..3 from a register this snapshot does not carry.
     kCpSnapColorInfo          = 8,  // 0x2001 RB_COLOR_INFO, for color_format only
-    kCpSnapRegCount           = 9,
+    // F-904: RT0 blend control + write mask. The blend-off baseline
+    // (kStateFlagUnmeasuredBlend) overwrites transparent texels instead of
+    // compositing them (measured black screen, F-901); these two registers
+    // are the measured source. RB_BLENDCONTROL0 layout: color_srcblend 5b+0,
+    // color_comb_fcn 3b+5, color_destblend 5b+8, alpha_srcblend 5b+16,
+    // alpha_comb_fcn 3b+21, alpha_destblend 5b+24 (registers.h:783-791).
+    // RB_COLOR_MASK: per-channel write enables, RT0 in bits 0-3
+    // (registers.h:758-761). RT1-3 blend controls (0x2209/0x220A/0x220B) are
+    // NOT carried: the backend binds one RTV (d3d12_backend.cpp:4083), same
+    // RT0-only discipline as color info above.
+    kCpSnapBlendControl0      = 9,  // 0x2201 RB_BLENDCONTROL0 (dword)
+    kCpSnapColorMask          = 10, // 0x2104 RB_COLOR_MASK (dword)
+    kCpSnapDepthControl       = 11, // 0x2200 RB_DEPTHCONTROL (dword)
+    kCpSnapRegCount           = 12,
 };
 
 struct CpRenderStateSnapshot {
@@ -546,6 +569,14 @@ struct DrawCapturedCommand {
     // non-zero count with a full count above 1 cannot be observed.
     uint32_t vbElementCount;
     CpVertexElement vbElements[kCpVertexElementMax];
+    struct CpVertexStreamBinding {
+        uint32_t vbBase = 0;
+        uint32_t vbSize = 0;
+        uint32_t vbStride = 0;
+        uint32_t slotIndex = 0;
+    };
+    uint32_t vbStreamCount = 0;
+    CpVertexStreamBinding vbStreams[4] = {};
     uint32_t ibBase;       // guest VA of the index stream; 0 = none (kAutoIndex)
     uint32_t ibSize;       // bytes (VGT_DMA_SIZE.num_words * index element size)
     uint32_t frameId;
@@ -589,6 +620,25 @@ struct DrawCapturedCommand {
     // CpRenderStateSnapshot). Fixed-size POD on the queue - no allocation, and
     // the consumer never re-reads a register file that may have moved on.
     CpRenderStateSnapshot rasterState;
+    // F-899 (2026-10-27): the guest's TEXTURE fetch descriptors, snapshotted at
+    // enqueue from the fetch-constant window (registers 0x4800..0x48BF, 32
+    // slots x 6 dwords). A slot is a texture descriptor when its dword_0 type
+    // field (bits 1:0) == kTexture (2). Each descriptor is 24 bytes stored
+    // BIG-ENDIAN - the exact byte layout DecodeGuestTextureDescriptor consumes
+    // (renderer/texture_decode.cpp:1185) - so the consumer hands them straight
+    // to BindGuestTextures with no re-encode. textureCount is the number of
+    // kTexture slots found (0..kCpMaxTextureDescriptors); slot i of the window
+    // maps to textureDescriptorBytes[i]. Bound at 16; an over-bound window is
+    // refused by the producer (g_textureDescOverBind), never truncated.
+    uint32_t textureCount;
+    uint8_t textureDescriptorBytes[kCpMaxTextureDescriptors][24];
+    // F-899 (2026-10-27): the pool VA of each carried texture's tiled payload,
+    // translated at enqueue time by CpBridgeDraw via CpPhysToPoolVa (the F-640
+    // A-view rule). The consumer reads guest memory through this VA; storing
+    // it here avoids re-translating in the render thread (where the helper is
+    // not declared) and keeps the descriptor bytes (format/dims) separate from
+    // the address (location).
+    uint32_t texturePoolVa[kCpMaxTextureDescriptors];
 };
 
 // F-605: pipe-proof marker. The CP auto-draw class (op36/src2, prim 1/8,
@@ -708,6 +758,7 @@ public:
     // thread is already refusing work, so enqueueing more of the same work
     // only deepens the backlog.
     static constexpr size_t kShedDepth = 60;
+    static constexpr uint32_t kFullWaitMs = 250;
 
     explicit CommandQueue(size_t maxCapacity = 4096) 
         : maxCapacity_(maxCapacity), shutdown_(false) {}
@@ -716,7 +767,7 @@ public:
         shutdown();
     }
     
-    // F-610: STRICTLY NON-BLOCKING enqueue. This used to wait on notFull_
+    // F-610: enqueue that a stalled consumer cannot hang. This used to wait on notFull_
     // when the queue reached maxCapacity_, which parked the *guest* thread
     // inside push() and hung the game whenever the backend stalled (BeginFrame
     // failure, device lost, vsync backlog). The producers are the guest CP
@@ -729,8 +780,8 @@ public:
     //   depth >= kShedDepth, and
     //     the command is sheddable -> REFUSE it. It carries no pixels, and the
     //     next guest draw re-emits the same information.
-    //   depth >= maxCapacity_      -> EVICT THE OLDEST entry to make room, then
-    //     enqueue. Last-resort backstop, and the only path that can cost guest
+    //   depth >= maxCapacity_      -> wait up to kFullWaitMs, then EVICT THE OLDEST
+    //     entry to make room and enqueue. Last-resort backstop, and the only path that can cost guest
     //     content. Dropping the oldest (not the newest) is the standard policy:
     //     it sheds latency rather than freshness, and it preserves the relative
     //     order of everything still queued. A stall that reaches this depth has
@@ -739,12 +790,22 @@ public:
         // Classify BEFORE taking the lock: IsSheddable only reads the command,
         // and doing it here keeps the lock section to the queue itself.
         const bool sheddable = IsSheddable(cmd);
-        std::lock_guard lock(mutex_);
+        std::unique_lock lock(mutex_);
         if (shutdown_) return;
 
         if (queue_.size() >= kShedDepth && sheddable) {
             refusedSheddable_.fetch_add(1, std::memory_order_relaxed);
             return;
+        }
+        // A UI frame is ~1,500 one-glyph draws, so a live consumer that is merely
+        // behind reaches capacity; evicting then deleted glyphs from the picture.
+        // Wait for it, but keep F-610's guarantee: a consumer that makes no room
+        // within kFullWaitMs is stalled, and nothing waits until it pops again.
+        if (queue_.size() >= maxCapacity_ && !consumerStalled_) {
+            consumerStalled_ = !notFull_.wait_for(lock, std::chrono::milliseconds(kFullWaitMs), [this] {
+                return queue_.size() < maxCapacity_ || shutdown_;
+            });
+            if (shutdown_) return;
         }
         if (queue_.size() >= maxCapacity_ && !queue_.empty()) {
             // A non-empty queue at capacity is the only case that reaches here
@@ -771,6 +832,8 @@ public:
         
         cmd = std::move(queue_.front());
         queue_.pop();
+        consumerStalled_ = false;
+        notFull_.notify_one();
         return true;
     }
     
@@ -778,6 +841,7 @@ public:
         std::lock_guard lock(mutex_);
         shutdown_ = true;
         notEmpty_.notify_all();
+        notFull_.notify_all();
     }
     
     size_t size() const {
@@ -816,6 +880,8 @@ public:
 private:
     mutable std::mutex mutex_;
     std::condition_variable notEmpty_;
+    std::condition_variable notFull_;
+    bool consumerStalled_ = false;  // guarded by mutex_
     std::queue<RenderCommand> queue_;
     size_t maxCapacity_;
     std::atomic<bool> shutdown_;
@@ -950,3 +1016,96 @@ constexpr uint32_t CpGpuSwap32(uint32_t value, uint32_t endianness) {
 }
 
 } // namespace mcla::gpu
+
+// ---------------------------------------------------------------------------
+// AUDIT ADDENDUM (2026-11-09, file-owned worker, build prohibited).
+// DrawCapturedCommand / DrawIndexedCommand layout, heap safety, and the
+// kCpShaderBodyDwords truncation contract. This addendum appends only; the
+// stale heap-cost table at F-694:391-394 is NOT remeasured here and must be
+// re-costed with the compiler before being cited again.
+//
+// LAYOUT (analytically derived from the field declarations above under
+// natural alignment; NOT compiler-measured in this audit because no
+// build was permitted -- verify with static_asserts in a follow-up):
+//   CpVertexFormat          16 B (4 x u32)
+//   CpVertexElement         80 B (15 x u32 + fmt 16 B + endianness 4 B)
+//   CpShaderProgram       1052 B (7 x u32 + body[256] 1024 B) -- matches the
+//                           F-694 table's CpShaderProgram column; _pad at
+//                           render_queue.h:465 is redundant (alignment
+//                           already satisfied) but harmless.
+//   CpRenderStateSnapshot    52 B (1 + 12 x u32)
+//   CpVertexStreamBinding    16 B (4 x u32)
+//   DrawIndexedCommand       72 B (13 x u32 + 4 x u8 + u64 + u8 + pad[7],
+//                           single u64 at offset 56, no extra pad)
+//   DrawCapturedCommand    3416 B (vb 12 B + vbFormat 16 B + counts +
+//                           vbElements[8] 640 B + vbStreamCount + vbStreams[4]
+//                           64 B + ib 12 B + ibfields 36 B + 4 B pad +
+//                           psoHash u64 + vs 1052 B + ps 1052 B + raster
+//                           52 B + textureCount + textureDescriptorBytes
+//                           [16][24] 384 B + texturePoolVa[16] 64 B; ends
+//                           8-aligned). The F-694 2256 B RenderCommand row
+//                           predates F-649 (vbElements 640 B + vbStreams
+//                           64 B) and F-899 (textures 448 B): 2256 + 1152 + 8
+//                           variant/pad = the ~3416 above. RenderCommand
+//                           (variant + Type) is therefore ~3424-3432 B, and a
+//                           full 4096-deep queue holds ~13.99 MB of
+//                           DrawCaptured payload alone (3416 * 4096), plus
+//                           deque overhead -- ~4.6 MB more than the table
+//                           claims at 9,371,795 B.
+//   No struct carries a pointer, reference, or virtual. All are POD by
+//   value, trivially copyable, and queued by 3x memcpy per draw
+//   (push by-value, queue element, pop) = ~10.2 KB memcpy/draw at 3416 B.
+//
+// TRUNCATION REPRO (hazard is real; current tree is safe ONLY because of
+// one consumer check):
+//   1. Guest declares size_dwords = 300, reader retains captured = 300
+//      (producer want = min(300, 1024) at gpu_cp.cpp:2266-2267, loop at
+//      :2277-2284, img.captured = 300 at :2285).
+//   2. Snapshot copies n = min(300, 256) = 256 (gpu_cp.cpp:4924-4926) and
+//      keeps dst.captured = 300 unclamped (:4910) + s_shipBody.truncated++
+//      (:4950-4955). body[256..299] simply never crosses the queue.
+//   3. Naive consumer `for (i = 0; i < p.captured; ++i) use(p.body[i])`
+//      without the guard at render_thread.cpp:1295 would read 44 dwords
+//      past body[255] into rasterState/textures (44 x 4 = 176 B intra-
+//      struct OOB); with dwords where captured belongs (up to 65535) it
+//      walks ~256 KiB past a 1 KiB array (corruption / fault).
+//   4. Actual consumer refuses: `if (p.captured == 0 || p.captured > 256)`
+//      at render_thread.cpp:1295 returns "captured-out-of-range" and the
+//      loop at :1306 never runs. Correct. The ONLY body readers in src/
+//      are this copy (:4926, bounded by n) and this guarded loop
+//      (render_thread.cpp:1306). No dwords-length body read exists.
+//   5. Falsifier (unchanged): any soak row with captured >= 256 or
+//      truncated=1 means raise kCpShaderBodyDwords, never relax the
+//      :1295 check. Two truncation layers exist: guest->producer at
+//      1024 (gpu_cp.cpp:2286-2288) and producer->queue at 256; both
+//      witnesses are preserved (totalDwords/captured divergence).
+//
+// HEAP-SAFETY GAPS (why the verdict is not a clean PASS):
+//   * textureCount: header at :630-632 says "Bound at 16; over-bound
+//     refused by producer". Consumers trust it: render_thread.cpp:2882
+//     reserve(dc.textureCount) (unbounded reserve = bad_alloc risk),
+//     :2891-2896 indexes textureDescriptorBytes[ti] with ti < count and
+//     NO ti < 16 check, and :4978-4988 does the same for texturePoolVa.
+//     A count > 16 OOB-reads the 384 B + 64 B arrays. The shader body
+//     discipline (consumer-side check) was NOT applied here. vbElementCount
+//     is the correct pattern (producer cap at gpu_cp.cpp:5782 + consumer
+//     inside-loop break at render_thread.cpp:3238-3240 and outer check at
+//     :4070-4072); textures must match it.
+//   * vbStreamCount (render_queue.h:578-579): producer caps at 4
+//     (gpu_cp.cpp:5762) but no consumer reads it yet; dead 64 B until the
+//     multi-stream path lands. Keep the cap documented.
+//   * Stale cost table: F-694:391-394 numbers are pre-growth and now
+//     wrong; auditability note -- F-694's gpu_cp.cpp:3083/... cites at
+//     :413-438 no longer resolve (CpSnapshotDrawState is now at
+//     gpu_cp.cpp:4873, g_microcode at :506, store at :2290). Cite
+//     SYMBOLS, not lines, from here on.
+//   * The w681-683 payload claim (max 27 dwords at :361-364) could NOT
+//     be re-verified: no w681-683 logs exist under build/ in this tree
+//     (only w10-w18, H1/C-series); H1n.log has 0 CP-IM-LOAD rows.
+//     Treat "27" as historical, not as a bound (header already says so).
+//
+// VERDICT: shader truncation contract PASS; DrawIndexed/DrawCaptured heap
+//   CONCERN (bounded but ~14 MB worst-case + 3x memcpy ~10 KB/draw; needs
+//   re-cost + static_asserts); textureCount CONSUMER BOUND FAIL (see
+//   above; fix lives in render_thread.cpp, which this worker may not
+//   edit). Details + repro in the worker's return message.

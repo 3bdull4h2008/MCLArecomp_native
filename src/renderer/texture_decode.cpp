@@ -70,7 +70,11 @@ enum {
 // canonical D3D mapping for each Xenos format: Xenos stores texel bits in the
 // same order as R5G6B5-style naming, and D3D names those BGR (e.g. 5_6_5 ->
 // DXGI_FORMAT_B5G6R5_UNORM). Compressed/constant formats with a literal DXGI
-// equivalent (DXT3A/DXT5A -> BC4_UNORM, both 1-channel 4bpp 4x4) are mapped,
+// equivalent (DXT5A -> BC4_UNORM) are mapped. DXT3A and DXT3A_AS_1_1_1_1 also
+// carry BC4_UNORM in this table, but NEITHER is BC4 (F-898(a): DXT3A is 16
+// direct 4-bit alphas, DXT3A_AS_1_1_1_1 is 4x1-bit -> B4G4R4A4) - the row is
+// only what plan.nativeDxgiFormat carries (the backend's Gate 2 looks that up
+// in kHostFormatTable); the exact expansion lives in PlanExpandsTo below.
 // and so are 8_A/8_B: both those rows carry dxgi=R8_UNORM (61), so they are
 // aliased onto one host form (which loses the luminance-vs-alpha distinction),
 // not left unsupported. What really is dxgi=0 here is YUV REP, MPEG,
@@ -805,6 +809,16 @@ void DecodeBc1Block(const uint8_t* blk, uint8_t out[16 * 4]) {
 }
 
 // BC2 (DXT3) -> 16 RGBA8 texels: 4-bit explicit alpha + a BC1 colour tail.
+// Alpha is row-major, LOW nibble first: texel (x,y) = bits 4x..4x+3 of the
+// 16-bit row at blk[2y..2y+1] -- the D3D BC2 layout (MSDN "Textures with Alpha
+// Channels": word bits 3:0 = texel [1][0]) and what Xenia extracts
+// (texture_load_dxt3_rgba8.cs.xesl:48, row 0 = block.x >> (0,4,8,12), texel 0
+// = bits 0..3). MEASURED WRONG (F-900 era): this took the HIGH nibble first,
+// exchanging each pair of texels within every byte; the fixed ternary is
+// verified against the same Xenia shader and the D3D spec. DecodeBc1/3/4 were
+// re-verified clean in the same audit -- BC2 was the only inverted one, and it
+// escaped the validator because texture_import_validator only accepts fourCC
+// DXT1/DXT5 (never DXT2/DXT3).
 void DecodeBc2Block(const uint8_t* blk, uint8_t out[16 * 4]) {
     uint8_t colour[16 * 4];
     DecodeBc1Block(blk + 8, colour);
@@ -813,7 +827,7 @@ void DecodeBc2Block(const uint8_t* blk, uint8_t out[16 * 4]) {
         out[i * 4 + 0] = colour[i * 4 + 0];
         out[i * 4 + 1] = colour[i * 4 + 1];
         out[i * 4 + 2] = colour[i * 4 + 2];
-        out[i * 4 + 3] = Expand4To8(uint8_t((i & 1) ? (a & 0x0Fu) : (a >> 4)));
+        out[i * 4 + 3] = Expand4To8(uint8_t((i & 1) ? (a >> 4) : (a & 0x0Fu)));
     }
 }
 
@@ -860,23 +874,89 @@ void DecodeBc4Block(const uint8_t* blk, uint8_t out[16]) {
     for (int i = 0; i < 16; ++i) out[i] = v[uint8_t((bits >> (i * 3)) & 7u)];
 }
 
-// 5_6_5 -> RGBA8. Xenos names the texel R5G6B5; B5G6R5_UNORM reads the same 16
-// bits as (G6 << 5) | (R5 << 11) | (B5 << 0), so the field extraction below is
-// the identity on the guest bit layout.
+// DXT3A (xenos 58) -> 16 one-channel texels. This is NOT BC4: a DXT3A block
+// holds 16 DIRECT 4-bit alphas (4 rows x 2 bytes). Row r is the little-endian
+// 16-bit word at blk[2r..2r+1] and texel x of that row is bits 4x..4x+3 - the
+// byte-for-byte twin of XeDXT3FourBlocksRowToA8
+// (.research/xenia/src/xenia/gpu/shaders/pixel_formats.xesli:745-753, fed by
+// texture_load_dxt3a.cs.xesl, which reads word0 for rows 0/1 and word1 for
+// rows 2/3), which widens each nibble to a byte as (n) | (n << 4). F-898(a):
+// this used to run through DecodeBc4Block - endpoint interpolation where the
+// guest stored explicit per-texel alphas, i.e. a different image.
+void DecodeDXT3ANibbleBlock(const uint8_t* blk, uint8_t out[16]) {
+    for (uint32_t y = 0; y < 4u; ++y) {
+        const uint16_t row = LoadU16LE(blk + 2u * y);
+        for (uint32_t x = 0; x < 4u; ++x) {
+            const uint8_t n = uint8_t((row >> (x * 4u)) & 0x0Fu);
+            out[y * 4u + x] = uint8_t(n | uint8_t(n << 4));
+        }
+    }
+}
+
+// DXT3A_AS_1_1_1_1 (xenos 61) -> 16 B4G4R4A4_UNORM texels (2 bytes each). The
+// block layout is the same as DXT3A's (4 rows x 2 bytes, texel x at bits
+// 4x..4x+3 of row word r - texture_load_dxt3aas1111.xesli packs word0 into
+// row 0 and word1 into row 2 exactly like the DXT3A shader does), but each
+// 4-bit texel carries ONE bit per component, alpha in the LSB and red in the
+// MSB ("Assuming alpha in LSB and red in MSB", the order
+// XeDXT3AAs1111TwoBlocksRowToBGRA4 assumes,
+// .research/xenia/src/xenia/gpu/shaders/pixel_formats.xesli:755-780). Each bit
+// is replicated to its 4-bit channel - the shader does row |= row << 1;
+// row |= row << 2 - and the host word is packed B(0:3) | G(4:7) | R(8:11) | A(12:15)
+// - that is DXGI_FORMAT_B4G4R4A4_UNORM's little-endian value, the same nibble
+// order XeR4G4B4A4ToB4G4R4A4 produces (pixel_formats.xesli:388-391), and the
+// host form Xenia picks for this format (d3d12_texture_cache.cc:375-379).
+// F-898(a): this used to run through DecodeBc4Block and land in R8_UNORM -
+// wrong algorithm AND wrong channel count.
+void DecodeDXT3AAs1111Block(const uint8_t* blk, uint8_t out[16 * 2]) {
+    for (uint32_t y = 0; y < 4u; ++y) {
+        const uint16_t row = LoadU16LE(blk + 2u * y);
+        for (uint32_t x = 0; x < 4u; ++x) {
+            const uint8_t n = uint8_t((row >> (x * 4u)) & 0x0Fu);
+            const uint16_t px = uint16_t((((n & 1u) ? 0xFu : 0u) << 12) |  // A -> 12:15
+                                         ((n & 2u) ? 0xFu : 0u) |          // B ->  0:3
+                                         (((n & 4u) ? 0xFu : 0u) << 4) |   // G ->  4:7
+                                         (((n & 8u) ? 0xFu : 0u) << 8));   // R ->  8:11
+            out[(y * 4u + x) * 2u] = uint8_t(px & 0xFFu);
+            out[(y * 4u + x) * 2u + 1u] = uint8_t(px >> 8);
+        }
+    }
+}
+
+// 5_6_5 -> RGBA8. The Xenos packs the FIRST-named component in the LSBs:
+// XePackR5G6B5UNorm (.research/xenia/src/xenia/gpu/shaders/pixel_formats.xesli:103-106)
+// is `n.r | (n.g << 5) | (n.b << 11)`, so guest bits 0..4 = R, 5..10 = G and
+// 11..15 = B. The old extraction here was MSB-first and swapped R/B (F-898(a)).
 void Decode565Block(const uint8_t* blk, uint8_t out[4]) {
     const uint16_t c = LoadU16LE(blk);
-    out[0] = Expand5To8(uint8_t((c >> 11) & 0x1Fu));
+    out[0] = Expand5To8(uint8_t(c & 0x1Fu));
     out[1] = Expand6To8(uint8_t((c >> 5) & 0x3Fu));
-    out[2] = Expand5To8(uint8_t(c & 0x1Fu));
+    out[2] = Expand5To8(uint8_t((c >> 11) & 0x1Fu));
     out[3] = 255;
 }
 
-// 1_5_5_5 -> RGBA8: A1R5G5B5, so bit 15 is the 1-bit alpha.
+// 6_5_5 -> RGBA8. NOT the same layout as 5_6_5: Xenia gives it its own pack,
+// XePackR5G5B6UNorm (pixel_formats.xesli:108-111) = `n.r | (n.g << 5) |
+// (n.b << 10)`, with n scaled 31/31/63, so the 6-bit field is B in bits 10..15.
+// d3d12_texture_cache.cc:108-113 gives it its own load shader
+// (XeR5G5B6ToB5G6R5WithRBGASwizzle) plus the R,B,G,G texture swizzle.
+void Decode655Block(const uint8_t* blk, uint8_t out[4]) {
+    const uint16_t c = LoadU16LE(blk);
+    out[0] = Expand5To8(uint8_t(c & 0x1Fu));
+    out[1] = Expand5To8(uint8_t((c >> 5) & 0x1Fu));
+    out[2] = Expand6To8(uint8_t((c >> 10) & 0x3Fu));
+    out[3] = 255;
+}
+
+// 1_5_5_5 -> RGBA8. XePackR5G5B5A1UNorm (pixel_formats.xesli:98-101) is
+// `n.r | (n.g << 5) | (n.b << 10) | (n.a << 15)`: R low, then G, then B, with
+// the 1-bit alpha in bit 15 - so bit 15 is the alpha and R/B was swapped
+// before this fix (F-898(a)).
 void Decode1555Block(const uint8_t* blk, uint8_t out[4]) {
     const uint16_t c = LoadU16LE(blk);
-    out[0] = Expand5To8(uint8_t((c >> 10) & 0x1Fu));
+    out[0] = Expand5To8(uint8_t(c & 0x1Fu));
     out[1] = Expand5To8(uint8_t((c >> 5) & 0x1Fu));
-    out[2] = Expand5To8(uint8_t(c & 0x1Fu));
+    out[2] = Expand5To8(uint8_t((c >> 10) & 0x1Fu));
     out[3] = uint8_t((c & 0x8000u) ? 255u : 0u);
 }
 
@@ -886,12 +966,20 @@ void Decode1555Block(const uint8_t* blk, uint8_t out[4]) {
 // Import plan
 // ---------------------------------------------------------------------------
 
-// Which guest formats this layer can hand to a host that today accepts only
-// R8G8B8A8_UNORM (28) and R8_UNORM (61) - the gate in
-// D3D12Backend::CreateDecodedTexture (src/d3d12_backend.cpp:703-709). Every
-// format listed here is expanded by an exact CPU twin of the matching Xenia
-// load shader; every format NOT listed stays a refusal, because "close enough"
-// is a corruption, not a fallback.
+// Which guest formats this layer can expand into an EXACT host payload form.
+// The payload is in plan.importDxgiFormat: every format listed here is
+// expanded by an exact CPU twin of the matching Xenia load shader; every
+// format NOT listed stays a refusal, because "close enough" is a corruption,
+// not a fallback.
+//
+// CAVEAT (measured 2026-10-27, F-898(a) follow-up): D3D12Backend::
+// CreateDecodedTexture still sizes its resource and its SRV from
+// plan.nativeDxgiFormat (src/d3d12_backend.cpp:1821, :2148), and its
+// kHostFormatTable (src/d3d12_backend.cpp:191-206) has no B4G4R4A4_UNORM row
+// - so until that gate is taught importDxgiFormat, an expanded payload is
+// correct bytes the backend cannot yet carry. That is a backend defect, not a
+// reason to decode wrongly here; it already applies to every CpuExpand format
+// (18/19/20/51/52/53 included) and is recorded here so nobody re-derives it.
 static bool PlanExpandsTo(uint32_t xenosFormat, uint32_t* outDxgi) {
     switch (xenosFormat) {
         // DXT1/DXT2_3/DXT4_5 (+ the _AS_16_16_16_16 aliases) -> RGBA8, the
@@ -899,16 +987,33 @@ static bool PlanExpandsTo(uint32_t xenosFormat, uint32_t* outDxgi) {
         case 18: case 19: case 20: case 51: case 52: case 53:
             *outDxgi = kDxgiR8G8B8A8Unorm;
             return true;
-        // DXT3A/DXT5A/DXT3A_AS_1_1_1_1 are 4x4 4bpp single channel; Xenia maps
-        // DXT3A to R8_UNORM and runs kDXT3A / kDXT5AToR8 to fill it
-        // (d3d12_texture_cache.cc:361-370), so the exact host form IS R8.
-        case 58: case 59: case 61:
+        // DXT3A (58) and DXT5A (59) are both 4x4 4bpp single channel and both
+        // land in R8_UNORM in Xenia (d3d12_texture_cache.cc:361-370) - but by
+        // different algorithms. kDXT3A fills R8 by DIRECT NIBBLE EXPANSION
+        // (texture_load_dxt3a.cs.xesl -> XeDXT3FourBlocksRowToA8,
+        // pixel_formats.xesli:745-753: 16 explicit 4-bit alphas, each widened
+        // as n | (n << 4)); kDXT5AToR8 is a true BC4 interpolation
+        // (texture_load_dxt5a_r8.cs.xesl + XeDXT5HighAlphaWeights).
+        // F-898(a): decoding 58 with DecodeBc4Block is a different image, not
+        // a fallback.
+        case 58: case 59:
             *outDxgi = kDxgiR8Unorm;
             return true;
+        // DXT3A_AS_1_1_1_1 (61) is 4x4 4bpp too, but its 4 bits are ONE BIT per
+        // component and Xenia's host form is B4G4R4A4_UNORM, fed by
+        // kDXT3AAs1111ToBGRA4 (d3d12_texture_cache.cc:375-379 ->
+        // texture_load_dxt3aas1111_bgra4.cs.xesl ->
+        // XeDXT3AAs1111TwoBlocksRowToBGRA4, pixel_formats.xesli:755-780). It is
+        // not a single channel, so R8_UNORM for it was wrong twice over
+        // (F-898(a)).
+        case 61:
+            *outDxgi = kDxgiB4G4R4A4Unorm;
+            return true;
         // 1_5_5_5 / 5_6_5 / 6_5_5 / 4_4_4_4 -> RGBA8 by exact unorm unpack
-        // (Xenia's kR5G5B5A1ToB5G5R5A1 / kR5G6B5ToB5G6R5 / kRGBA4ToBGRA4).
-        // 6_5_5 is bit-identical to 5_6_5 in memory and differs only by the
-        // fetch constant's exp_adjust/num_format, which the sampler carries.
+        // (Xenia load shaders XeR5G5B5A1ToB5G5R5A1 / XeR5G6B5ToB5G6R5 /
+        // XeR5G5B6ToB5G6R5WithRBGASwizzle / XeR4G4B4A4ToB4G4R4A4). The guest
+        // packs the first-named component in the LSBs, and 6_5_5 has its own
+        // layout (R5G5B6) - it is NOT bit-identical to 5_6_5 (F-898(a)).
         case 3: case 4: case 5: case 15:
             *outDxgi = kDxgiR8G8B8A8Unorm;
             return true;
@@ -977,14 +1082,14 @@ TextureImportPlan PlanTextureImport(uint32_t xenosFormat, uint32_t width, uint32
     }
     plan.guestEndianness = endianness;
     plan.needsByteSwap = endianness != 0u;
-    // A block-compressed surface carries no endianness in practice (every load
-    // shader reads the block words little-endian) and swapping them would
-    // corrupt the decode. Refuse rather than guess.
-    if (plan.needsByteSwap && info->isBlockCompressed) {
-        plan.refusal = TextureRefusal::EndianOnBlockCompressed;
-        NoteTextureRefusal(plan);
-        return plan;
-    }
+    // F-899 (2026-10-27): the untile is a byte-exact gather (it never swaps),
+    // and ConvertTextureEndianness runs on the LINEAR buffer AFTER untile, so a
+    // swap on a block-compressed surface is safe -- it only reorders bytes
+    // within 16-bit words of the linear buffer, which the DXT decode (running
+    // later, on the linear buffer) reads correctly. The previous refusal
+    // ("Xenia's load shaders read block words little-endian") was conservative
+    // and blocked every block-compressed texture whose guest endianness field
+    // was non-zero, which is the only kind the game actually produces.
     // 32_32_32_FLOAT: 1x1 block, 96 bits = 12 bytes/block. The XGAddress tiled
     // math is parameterised by bpbLog2 (a power of two), so 12 is not
     // addressable and Xenia refuses the format too
@@ -1077,12 +1182,15 @@ bool ExpandTextureToImportBytes(const TextureImportPlan& plan, const uint8_t* li
     const uint32_t bb = plan.blockBytes;
     const bool scalarPack = (plan.xenosFormat == 3 || plan.xenosFormat == 4 ||
                              plan.xenosFormat == 5 || plan.xenosFormat == 15);
-    // The output component count must match plan.importDxgiFormat, because that
-    // is the format the backend will hand to CreateDecodedTexture: 4 bytes for
-    // R8G8B8A8_UNORM, 1 for R8_UNORM (the DXT3A/DXT5A single-channel case -
-    // Xenia's own host form, d3d12_texture_cache.cc:361-366).
-    const uint32_t outTexelBytes =
-        (plan.importDxgiFormat == kDxgiR8Unorm) ? 1u : 4u;
+    // The output texel size must match plan.importDxgiFormat, because that is
+    // the format the payload is produced in: 4 bytes for R8G8B8A8_UNORM, 2 for
+    // B4G4R4A4_UNORM (DXT3A_AS_1_1_1_1 - Xenia's own host form for 61,
+    // d3d12_texture_cache.cc:375-379), 1 for R8_UNORM (the DXT3A/DXT5A
+    // single-channel case - d3d12_texture_cache.cc:361-366).
+    const uint32_t outTexelBytes = (plan.importDxgiFormat == kDxgiR8Unorm)
+                                       ? 1u
+                                       : ((plan.importDxgiFormat == kDxgiB4G4R4A4Unorm) ? 2u
+                                                                                        : 4u);
     const uint32_t bytesPerSlice = scalarPack ? (w * h * bb) : (w * h * outTexelBytes);
     out.assign(size_t(bytesPerSlice) * plan.arraySize, 0u);
 
@@ -1095,12 +1203,15 @@ bool ExpandTextureToImportBytes(const TextureImportPlan& plan, const uint8_t* li
                 switch (plan.xenosFormat) {
                     case 3: Decode1555Block(src + i * 2u, px); break;       // 1_5_5_5
                     case 4: Decode565Block(src + i * 2u, px); break;        // 5_6_5
-                    case 5: Decode565Block(src + i * 2u, px); break;        // 6_5_5
+                    case 5: Decode655Block(src + i * 2u, px); break;        // 6_5_5 (R5G5B6)
                     default: {                                              // 4_4_4_4
+                        // XePackR4G4B4A4UNorm (pixel_formats.xesli:123-126)
+                        // = r | (g << 4) | (b << 8) | (a << 12): R is the low
+                        // nibble, so R/B was swapped before (F-898(a)).
                         const uint16_t c = LoadU16LE(src + i * 2u);
-                        px[0] = Expand4To8(uint8_t((c >> 8) & 0x0Fu));
+                        px[0] = Expand4To8(uint8_t(c & 0x0Fu));
                         px[1] = Expand4To8(uint8_t((c >> 4) & 0x0Fu));
-                        px[2] = Expand4To8(uint8_t(c & 0x0Fu));
+                        px[2] = Expand4To8(uint8_t((c >> 8) & 0x0Fu));
                         px[3] = Expand4To8(uint8_t((c >> 12) & 0x0Fu));
                         break;
                     }
@@ -1126,9 +1237,17 @@ bool ExpandTextureToImportBytes(const TextureImportPlan& plan, const uint8_t* li
                     case 18: case 51: DecodeBc1Block(blk, texels); rowStride = 4; break;
                     case 19: case 52: DecodeBc2Block(blk, texels); rowStride = 4; break;
                     case 20: case 53: DecodeBc3Block(blk, texels); rowStride = 4; break;
-                    case 58: case 59: case 61:  // DXT3A/DXT5A are 1-channel BC4
+                    case 58:  // DXT3A: 16 direct 4-bit alphas -> R8 (n | n << 4)
+                        DecodeDXT3ANibbleBlock(blk, texels);
+                        rowStride = 1;  // importDxgiFormat is R8_UNORM
+                        break;
+                    case 59:  // DXT5A: BC4 endpoint interpolation -> R8
                         DecodeBc4Block(blk, texels);
                         rowStride = 1;  // importDxgiFormat is R8_UNORM
+                        break;
+                    case 61:  // DXT3A_AS_1_1_1_1: 4x1-bit -> B4G4R4A4 (2B/texel)
+                        DecodeDXT3AAs1111Block(blk, texels);
+                        rowStride = 2;  // importDxgiFormat is B4G4R4A4_UNORM
                         break;
                     default:
                         if (outRefusal) *outRefusal = TextureRefusal::NoHostFormat;

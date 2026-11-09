@@ -45,12 +45,12 @@ public:
     static constexpr const char* kPixelProfile = "ps_6_0";
 
     // D3D_SIT_* values, restated because d3dcommon.h is not in this header's
-    // include set. Numbers are from the Windows SDK d3dcommon.h and are stable.
-    static constexpr uint32_t kSitCbuffer = 6;
+    // include set. Keep these aligned with the Windows SDK enum.
+    static constexpr uint32_t kSitCbuffer = 0;
     static constexpr uint32_t kSitTexture = 2;
-    static constexpr uint32_t kSitSampler = 5;
-    static constexpr uint32_t kSitStructuredBuffer = 14;
-    static constexpr uint32_t kSitByteAddressBuffer = 26;
+    static constexpr uint32_t kSitSampler = 3;
+    static constexpr uint32_t kSitStructuredBuffer = 5;
+    static constexpr uint32_t kSitByteAddressBuffer = 7;
 
     DxcRuntime();
     ~DxcRuntime();
@@ -89,6 +89,17 @@ public:
         uint32_t firstVariableRegister = 0; // first c#/t#/s# the CBV covers
     };
 
+    struct SignatureParameter {
+        std::string semanticName;
+        uint32_t semanticIndex = 0;
+        uint32_t systemValueType = 0;
+        uint32_t componentType = 0;
+        uint32_t register_ = 0;
+        uint32_t mask = 0;
+        uint32_t readWriteMask = 0;
+        uint32_t stream = 0;
+    };
+
     // Reflects a compiled DXIL blob: every CBV (with the byte size the draw
     // path's upload needs) and every SRV/sampler, so the caller can REFUSE a
     // shader that binds a register the shared root signature does not declare
@@ -97,6 +108,11 @@ public:
     bool ReflectBindings(const std::vector<uint8_t>& dxil,
                          std::vector<ResourceBinding>& out,
                          std::string& error) const;
+
+    bool ReflectSignature(const std::vector<uint8_t>& dxil,
+                          std::vector<SignatureParameter>& inputs,
+                          std::vector<SignatureParameter>& outputs,
+                          std::string& error) const;
 
     // Reflects a compiled DXIL blob to extract CBV register bindings. Thin
     // wrapper over ReflectBindings.

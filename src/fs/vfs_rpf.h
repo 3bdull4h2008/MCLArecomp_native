@@ -84,6 +84,15 @@ public:
         // without this field another member's logical tail can win the election
         // for it. Feeds ClassifyTailClaim's kReadMemberHead; 0 means unknown,
         // and that case is then unreachable.
+        //
+        // NOTE on current consumers (verified, not assumed): every site that
+        // sets this also sets raw_positional=true on the preceding line, so
+        // ReadFileAt never reaches ApplyExpandedSpans with it (the handle
+        // branch returns under `if (!file.raw_positional)`). The live
+        // kReadMemberHead veto therefore arrives via the F-926 TOC-start
+        // table, not via this field. Setting this WITHOUT raw_positional is
+        // the only way the per-handle path fires; the two are documented as
+        // a pair because the census intends one fact about one read.
         uint64_t read_member_off = 0;
 
         // T43.20 (2026-10-13): handle_id for proper cleanup in CloseFile.
@@ -113,8 +122,12 @@ public:
 
     bool OpenFile(const std::string& virtual_path, OpenFileHandle& out_file);
     bool ReadFile(OpenFileHandle& file, void* buffer, uint64_t size, uint64_t& bytes_read);
-    // Session 76d: positional read — no shared file position, safe for
-    // concurrent NtReadFile callers (seek+read race served wrong bytes).
+    // Session 76d: positional read — no shared file position on the handle
+    // branch, safe for concurrent NtReadFile callers (seek+read race served
+    // wrong bytes). EXCEPTION: the nested branch unlocks before Materialize
+    // and the fallback branch unlocks then sets file.position before
+    // re-entering ReadFile, so a handle shared across threads is only safe
+    // on the handle branch.
     bool ReadFileAt(OpenFileHandle& file, uint64_t offset, void* buffer,
                     uint64_t size, uint64_t& bytes_read);
     bool CloseFile(OpenFileHandle& file);
@@ -139,6 +152,11 @@ private:
     std::unordered_map<std::string, FileEntry> m_file_index;
     std::unordered_map<uint64_t, std::unique_ptr<OpenFileHandle>> m_open_files;
     std::unordered_map<std::string, std::shared_ptr<VirtualRpf>> m_virtual_rpfs;
+    struct RealHandleCacheEntry {
+        void* handle = nullptr;
+        uint32_t refcount = 0;
+    };
+    std::unordered_map<std::string, RealHandleCacheEntry> m_real_handle_cache;
     uint64_t m_next_handle = 1;
     mutable std::mutex m_mutex;
     bool m_mounted = false;
@@ -165,12 +183,24 @@ private:
 // One registered member. `storedLen` is the ON-DISK extent (w3 & 0x00FFFFFF),
 // `logicalLen` the length the guest must see (w1); a member with the two equal
 // is STORED UNCOMPRESSED and must be served verbatim, byte for byte.
+//
+// OWNERSHIP: this table (g_expSpans) is one of three owners of the same
+// bytes. The other two are the synthesized VirtualRpf (served only when the
+// real packfile is absent) and the NestedRpfArchive registry (served on the
+// nested handle, bypassing this table). A member that IS a nested archive is
+// registered in both this table and the nested registry with the same
+// (off, stored, logical) triple - the triple must stay identical in both or
+// the two serve paths disagree byte-for-byte at the same address.
 struct ExpandedSpan {
     // Lowercased basename of the owning packfile, or empty for "any" (the
     // pre-F-628 single-packfile tables). The physical-path gate used to be a
     // hard `xarchive_cache.rpf` suffix test; keying on the packfile name keeps
     // the addressing honest now that more than one packfile is real, and an
     // empty key preserves the old single-packfile meaning exactly.
+    // READ-side matching is also wildcarded (SpanMatchesPack: empty row key
+    // OR empty read packKey OR equal), but the F-926 TOC-start lookup is
+    // exact-match only - a row this table would match can still miss the
+    // veto. Do not assume the two gates agree.
     std::string packfile;
     uint64_t off = 0;         // member data offset inside the packfile (w2)
     uint32_t storedLen = 0;   // on-disk length (w3 & 0x00FFFFFF)
@@ -190,13 +220,18 @@ struct ExpandedSpan {
 
 // The five verdicts. Only kInStoredRange and kContinuation are claims the owner
 // may write on; the other three are VOIDS, and a void DEMOTES the owner to
-// no-owner rather than clipping what it may write.
+// no-owner rather than clipping what it may write. NOTE: kReadMemberHead now
+// has TWO sources (see the contract below): the per-handle readMemberOff
+// (F-645) and the F-926 TOC-start table, both reporting the same verdict.
+// The name says "the member being read" but the TOC path fires for a head
+// that is any known member start, read or not.
 enum class TailClaim {
     kInStoredRange,   // head is a byte the member occupies on disk
     kContinuation,    // head is strictly inside the member's logical tail
     kBoundaryByte,    // head IS `off + storedLen`: the packer's next byte
     kNeighbour,       // a RESOLVED neighbour's stored range covers the head
-    kReadMemberHead,  // head IS the member the caller is reading (F-645)
+    kReadMemberHead,  // head IS a known member start: the caller's read
+                      // member (F-645) OR any F-926 TOC start
 };
 
 // Classify ONE window's head byte against the span `s` that was elected its
@@ -219,7 +254,16 @@ enum class TailClaim {
 //   3. head inside a resolved neighbour's stored range -> kNeighbour
 //   4. readMemberOff != 0 and head == readMemberOff
 //      and head > s.off + s.storedLen                  -> kReadMemberHead
-//   5. otherwise                                       -> kContinuation
+//   5. F-926: head is one of the packfile's TOC member
+//      starts (g_tocStarts[packKey]) and head > s.off+s.storedLen
+//                                                       -> kReadMemberHead
+//   6. otherwise                                       -> kContinuation
+//
+// LOCK PRECONDITION: this function reads the global g_tocStarts in test 5,
+// which is not in the parameter list. The caller must hold the span-table
+// mutex (ApplyExpandedSpans does); a bare caller against a locally built
+// `spans` vector does NOT reproduce the TOC veto without also populating
+// that global under the same key. Declared hidden dependency, not purity.
 //
 // WHY TEST 4 IS LAST, and not promoted: it is strictly ADDITIVE. Tests 2 and 3
 // name the same void for the same bytes, so an already-measured verdict keeps
@@ -228,7 +272,9 @@ enum class TailClaim {
 // read -- the sole window whose head equals readMemberOff -- and only when the
 // owner's own on-disk extent does not reach that head. So a member's own first
 // window, and every continuation window of every member, keep the pre-F-645
-// verdict.
+// verdict. Test 5 is likewise last among the voids, for the same additive
+// reason, and it is the live path today: test 4 needs the handle to carry
+// read_member_off without raw_positional, which no current census site does.
 TailClaim ClassifyTailClaim(const std::vector<ExpandedSpan>& spans,
                             const ExpandedSpan& s, uint64_t head,
                             const std::string& packKey,
@@ -257,9 +303,12 @@ TailClaim ClassifyTailClaim(const std::vector<ExpandedSpan>& spans,
 //
 // So the two old arguments collapse to one: offset (w2) plus stored (w3&0xFFFFFF)
 // plus logical (w1). `storedLen` is now the ON-DISK length and the expanded
-// bytes are produced once and cached; `MarkMemberExpanded` keeps its two-
-// argument form for the existing registrars in gpu_device.cpp, which pass the
-// length their span table holds.
+// bytes are produced once and cached. WARNING: `MarkMemberExpanded` (below)
+// keeps its two-argument form for compatibility only - it calls
+// MarkMemberExpandedIn with logicalLen==storedLen, which fabricates an
+// uncompressed member and asserts verbatim serve. Verified: zero live call
+// sites remain (every live registrar uses MarkMemberExpandedIn). Do not revive
+// it for a DEFLATE member; its length is not the guest's w1.
 //
 // STRADDLING MEMBERS ARE NOW SERVED. Previously substitution was refused unless
 // one read covered the whole span, so a member crossing a read-window boundary
@@ -269,14 +318,34 @@ TailClaim ClassifyTailClaim(const std::vector<ExpandedSpan>& spans,
 // is now a splice of the cached expanded bytes into the covered sub-range.
 void MarkMemberExpanded(uint64_t offset, uint32_t storedLen);
 
-// F-628: the full, unambiguous form. `packfile` is the host path of the
-// archive the offset lives in (empty = any, which is what the pre-F-628
-// single-packfile tables mean). Span table == the 16 hand-listed
-// kListMemberSpans/kTypeMemberSpans in gpu_device.cpp; the guest publishes the
-// same three words for every other member it opens, so the census can replace
-// those tables wholesale.
+// F-628: the full, unambiguous form. `packfile` is the OUTER archive the
+// offset lives in, spelled as a bare basename in every live call
+// ("xarchive_cache.rpf"); it is normalized via PackKeyOf (basename,
+// lowercased) so a host path, a guest path and a bare name all land on one
+// key. Empty = any, which is what the pre-F-628 single-packfile tables mean.
+// Span table == the 16 hand-listed kListMemberSpans/kTypeMemberSpans in
+// gpu_device.cpp; the guest publishes the same three words for every other
+// member it opens, so the census can replace those tables wholesale.
+// Dedup is by (off, packKey): re-registration with a non-zero logicalLen
+// rewrites stored/logical and clears the cached expansion (resolved=false),
+// so a late census can invalidate bytes an earlier window already served.
+// Neither this table nor the TOC-start table is cleared by Unmount - only
+// the nested registry is - so re-Initialize reuses stale spans.
 void MarkMemberExpandedIn(const std::string& packfile, uint64_t offset,
                           uint32_t storedLen, uint32_t logicalLen);
+
+// F-926: every member start offset from the guest's own parsed TOC. A window
+// whose head is another member's first byte is that member's stream, never an
+// expanded neighbour's logical tail (ClassifyTailClaim -> kReadMemberHead).
+// Semantics: REPLACE per packKey, not merge - a second call for the same
+// archive clobbers the first (the sole live caller runs once per boot, from
+// the one-shot TOC walk). Input is sorted and deduplicated in place; zero
+// entries are the CALLER's filter (gpu_device skips rec.off==0), not this
+// function's. Lookup is exact-match on PackKeyOf(packfile) against the
+// read's packKey, with no empty-key wildcard. Like the span table, this map
+// is never cleared by Unmount.
+void RegisterTocMemberStarts(const std::string& packfile,
+                             std::vector<uint64_t> starts);
 
 // F-628: register an outer member that is itself a complete RPF3 archive, so
 // the nested packfile becomes first-class instead of unserved. The member is
@@ -286,12 +355,23 @@ void MarkMemberExpandedIn(const std::string& packfile, uint64_t offset,
 // NOT the F-458 contamination: the inner TOC stays AES ciphertext and the
 // guest's own decrypt of it is untouched, because the host only ever moves
 // bytes the retail packer wrote.
+// DUAL OWNERSHIP: the same (storedOffset, storedLen, logicalLen) triple is
+// also an ExpandedSpan (MarkMemberExpandedIn). The nested handle serves the
+// inflated image positionally and never runs the span table; the outer
+// handle splices the same image via the span table. The two registries use
+// different lock families (g_nestedMtx vs g_expMtx) and different keys
+// (NormalizeNestedKey vs PackKeyOf). This registry - unlike the span/TOC
+// tables - IS cleared by Unmount.
 void RegisterNestedRpf(const std::string& packfile, const std::string& name,
                        uint64_t storedOffset, uint32_t storedLen,
                        uint32_t logicalLen);
 
 // F-628: a member INSIDE a nested archive, as published by the guest's inner
-// TOC census. `name` is the nested archive's own name.
+// TOC census. `path` carries the whole nested path (the archive is split
+// back out via SplitNestedPath); `name` is accepted for call-site symmetry
+// but IGNORED by the definition, so pass the same nested path for both (the
+// sole live caller does). Records that arrive before the archive is mounted
+// are parked and replayed by RegisterNestedRpf, not dropped.
 void RegisterNestedMember(const std::string& name, const std::string& path,
                           uint32_t logicalLen, uint32_t storedLen);
 

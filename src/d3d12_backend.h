@@ -33,6 +33,14 @@ class D3D12Backend {
 public:
     static constexpr uint32_t kBufferCount = 3;
 
+    struct GraphicsSettings {
+        uint32_t internalWidth = 1280;
+        uint32_t internalHeight = 720;
+        float    renderScale = 1.0f;     // 1.0 = native 720p, 1.5 = 1080p, 2.0 = 1440p, 3.0 = 4K
+        bool     aspectCorrection = true; // 16:9 letterbox
+        bool     vsync = true;
+    };
+
     D3D12Backend();
     ~D3D12Backend();
 
@@ -42,11 +50,13 @@ public:
 
     bool IsInitialized() const { return m_initialized; }
 
+
     // Resize swap chain buffers
     bool Resize(uint32_t width, uint32_t height);
 
     // Frame lifecycle
     bool BeginFrame();
+    bool BeginFrameForDraw();
     bool ClearAndPresent(float r, float g, float b, float a);
 
     // F-610: PresentDirect() was removed. It had zero callers and advanced
@@ -60,6 +70,10 @@ public:
     // not match the current backbuffer. Caller should fall back to
     // ClearAndPresent when this returns false.
     bool PresentBgra(uint32_t width, uint32_t height, const uint8_t* pixels);
+
+    // F-899: forward declaration -- GuestTextureEntry is defined later in this
+    // class, but DynamicMeshDesc needs a pointer member to it.
+    struct GuestTextureEntry;
 
     // Host-side geometry for DrawDynamicMesh. Data is already validated by the
     // caller; the backend never interprets guest layouts — it only uploads and
@@ -87,7 +101,28 @@ public:
         // same result, and the difference has to be countable.
         const void* guestConstBytes = nullptr;
         uint32_t guestConstBytesSize = 0;
+        // F-932: the PIXEL stage's own bank (array entries 256..511). Before this
+        // the pixel shader read the vertex bank at b0 (CONST-BANK-PRODUCE
+        // psDroppedNoSlot == every draw).
+        const void* guestPsConstBytes = nullptr;
+        uint32_t guestPsConstBytesSize = 0;
         uint32_t indexCount = 0;            // indexed draw count
+
+        // F-899 (2026-10-27): the guest's texture fetch descriptors for this
+        // draw, snapshotted at enqueue time (see CpBridgeDraw's
+        // CP-TEXDESC-CAPTURE). Each descriptor is 24 big-endian bytes matching
+        // GuestTextureEntry::descriptorBytes[24] -- the exact layout
+        // DecodeGuestTextureDescriptor consumes. The producer (render_thread)
+        // reads guest memory at each descriptor's baseAddress, untiles, and
+        // fills mipPayloads[] before calling BindGuestTextures; until that
+        // lands, guestTextures stays null and the backend binds nothing new
+        // (the null SRV already sitting in the heap is what the shader reads).
+        // guestTextureCount <= kCpMaxTextureDescriptors (16); only 0..3 are
+        // samplable (root signature binds t0..t3).
+        const GuestTextureEntry* guestTextures = nullptr;
+        uint32_t guestTextureCount = 0;
+        bool hasGuestSampler = false;
+        native::HostSamplerDesc guestSampler = {};
 
         // F-637: topology and index/vertex offsets. Before this the draw path
         // hardcoded IASetPrimitiveTopology(TRIANGLELIST) and
@@ -99,8 +134,14 @@ public:
         // maps it through MapXenosPrimType, which refuses the prim_types that
         // have no D3D12 equivalent instead of substituting a triangle list.
         D3D_PRIMITIVE_TOPOLOGY topology = D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
+        uint32_t xenosPrimType = 0;
         uint32_t startIndexLocation = 0;    // DrawIndexedInstanced StartIndexLocation
         int32_t baseVertexLocation = 0;     // DrawIndexedInstanced BaseVertexLocation
+
+        // Precompiled shader substitution flag. When true, DrawDynamicMeshWithPipeline
+        // binds the precompiled root signature, descriptor heaps, and SharedConstants
+        // buffer via BindPrecompiledDrawResources before executing the draw.
+        bool usePrecompiledPipeline = false;
     };
 
     // F-637: Xenos VGT_DRAW_INITIATOR.prim_type (xenos.h:44-59, enum
@@ -254,6 +295,7 @@ public:
     // only ever printed in two different translation units and never in the
     // same row.
     uint32_t BoundRtvFormat() const { return m_boundRtvFormat; }
+    bool IsDrawingIntoGuestRt() const { return m_drawsIntoGuestRt; }
 
     // ---------------------------------------------------------------------
     // F-725: the POST-DRAW PIXEL SAMPLE.
@@ -360,6 +402,16 @@ public:
         uint32_t width = 0;                 // mip 0, texels
         uint32_t height = 0;
         uint32_t srvSlot = kTexture2DSlot;  // heap slot to publish the SRV into
+        // F-914 tofu Fix 1 (docs/analysis-20261028/tofu-regression.md §2): set
+        // when mipPayloads[0] is ALREADY the post-CpuExpand import bytes -- the
+        // caller expanded them itself (for the content hash) and then mutated
+        // them (halo fix / testpat). Gate 5 must then upload them as-is:
+        // expanding m_importScratch a second time would run
+        // ExpandTextureToImportBytes with its destination aliasing the source,
+        // the F-900 corruption recorded at d3d12_backend.cpp:2541-2548.
+        // Default false: every existing caller hands raw bytes and behaves
+        // exactly as before.
+        bool payloadAlreadyExpanded = false;
         // Resident handle out-param. Committed only on success, so a refused
         // import leaves the previous resident in place.
         Microsoft::WRL::ComPtr<ID3D12Resource>* outTexture = nullptr;
@@ -460,6 +512,10 @@ public:
     // Returns the number of descriptor indices that ended up bound to a real
     // resident texture; refusals still leave a valid null SRV behind, so a
     // partial result is a usable draw.
+    // One glyph is one draw, so a UI frame binds the same atlas ~1,500 times. Within one guest
+    // frame a descriptor that already reached a resident texture skips read/untile/expand/hash.
+    static bool HasFrameTexture(const uint8_t* descriptorBytes);
+    static void ClearFrameTextures();
     uint32_t BindGuestTextures(const GuestTextureEntry* entries, uint32_t count);
 
     // F-639: sampler table for the current draw. `hostSampler` is
@@ -698,15 +754,64 @@ public:
 
     void EndFrame();
 
+    // =====================================================================
+    // F-899: THE GUEST'S DRAW BURST IS ONE FRAME, NOT NINE THOUSAND.
+    //
+    // MEASURED, build/g919.log (210 s soak). The guest issues its UI frame as a
+    // BURST of draw commands and swaps once at the end: CP-DRAW-CENSUS
+    // #554000 enqueued=553,926, and CP: XE_SWAP-EMIT #3400 emitOk=3400/3400.
+    // The host called BeginFrame() once per DRAW COMMAND, so the FIRST draw of
+    // each burst opened a frame, and BeginFrame()'s own latch refused every
+    // other one -- 552,600 refusals, all named in the log:
+    //   D3D12-BEGINFRAME-REFUSE #552600 gate=already-in-frame a=0 b=500
+    //     begins=501 refusals=552600 frameIndex=0 inFrame=1
+    //     initialized=1 presented=500 drawn=1 abandoned=0
+    // `begins=501` and `presented=500` are the whole story: ONE frame was
+    // opened and never closed, so nothing after it could be recorded, and the
+    // window kept showing present #500 while 553,926 draw commands were thrown
+    // away. DRAW-CP-CENSUS drawn=1 against consumed=553,799 is that number.
+    //
+    // WHAT THIS PAIR DOES. With batching on, DrawDynamicMeshWithPipeline()
+    // RECORDS into the open list and RETURNS WITHOUT PRESENTING; the frame stays
+    // open across the whole burst. FlushDrawFrame() closes, resolves, executes
+    // and presents it exactly ONCE, at the guest's own swap (render_thread.cpp
+    // `case RenderCommand::PRESENT`, gated on !IsHeartbeatPresent) -- which is
+    // the console's frame boundary, not the host's.
+    //
+    // NOT A SHORT-CIRCUIT: nothing is skipped and no refusal is weakened. Every
+    // draw still passes every gate; the only change is WHERE the frame ends.
+    // REVERT: SetBatchDrawFrames(false) restores one-present-per-draw exactly.
+    // =====================================================================
+    void SetBatchDrawFrames(bool on);
+    bool BatchDrawFrames() const { return m_batchDrawFrames; }
+    // Close + resolve + execute + present the frame the draws are accumulating
+    // in. Returns false when no frame is open (nothing to flush), so a caller
+    // cannot turn this into a no-op present.
+    bool FlushDrawFrame();
+
     // Accessors
     ID3D12Device* GetDevice() const { return m_device.Get(); }
     ID3D12GraphicsCommandList* GetCommandList() const { return m_commandList.Get(); }
     ID3D12CommandQueue* GetCommandQueue() const { return m_commandQueue.Get(); }
     ID3D12CommandQueue* GetCopyQueue() const { return m_copyQueue.Get(); }
     ID3D12RootSignature* GetRootSignature() const { return m_rootSignature.Get(); }
+    ID3D12RootSignature* GetPrecompiledRootSignature() const { return m_precompiledRootSignature.Get(); }
+    ID3D12DescriptorHeap* GetPrecompiledSrvHeap() const { return m_precompiledSrvHeap.Get(); }
+    ID3D12DescriptorHeap* GetPrecompiledSamplerHeap() const { return m_precompiledSamplerHeap.Get(); }
+    D3D12_GPU_VIRTUAL_ADDRESS GetPrecompiledSharedConstantsGpu() const { return m_precompiledSharedConstantsGpu; }
+    ID3D12PipelineState* GetPrecompiledTestPipeline() const { return m_precompiledTestPipeline.Get(); }
+    ID3D12PipelineState* GetPrecompiledDrawPipeline() const { return m_precompiledDrawPipeline.Get(); }
+    void UpdatePrecompiledSharedConstants(const uint32_t* indices, size_t count);
+    bool BindPrecompiledDrawResources(ID3D12GraphicsCommandList* cmdList);
     uint32_t GetCurrentFrameIndex() const { return m_frameIndex; }
     uint32_t GetWidth() const { return m_width; }
     uint32_t GetHeight() const { return m_height; }
+    bool IsMinimized() const { return m_isMinimized; }
+
+    const GraphicsSettings& GetGraphicsSettings() const { return m_graphicsSettings; }
+    void SetGraphicsSettings(const GraphicsSettings& s);
+
+    D3D12_VIEWPORT GetAspectCorrectViewport(float targetAspect = 16.0f / 9.0f) const;
 
     // Streaming upload via copy queue (P4.5′)
     // Uploads host data to a DEFAULT-heap resource using the copy queue.
@@ -740,6 +845,10 @@ public:
 // Phase 3 draw-path resources
     bool CreateUploadHeap();
     bool CreateTestRootSignature();
+    bool CreatePrecompiledRootSignature();
+    bool CreatePrecompiledDescriptorHeaps();
+    bool CreatePrecompiledSharedConstantsBuffer();
+    bool CreatePrecompiledTestPipeline();
     bool CreateTestPipeline();
     uint8_t* MapUpload(size_t size, size_t alignment, D3D12_GPU_VIRTUAL_ADDRESS& gpu);
 
@@ -752,9 +861,23 @@ public:
     size_t m_uploadRegionSize = 0;
     size_t m_uploadOffset = 0;
     uint8_t* m_uploadMap = nullptr;
+    // Per-draw committed upload resources for the current frame (batch mode).
+    // Cleared when the frame is presented (FlushDrawFrame / PresentOwnedFrame).
+    std::vector<Microsoft::WRL::ComPtr<ID3D12Resource>> m_frameUploadResources;
+
 
     Microsoft::WRL::ComPtr<ID3D12RootSignature> m_rootSignature;
+    Microsoft::WRL::ComPtr<ID3D12RootSignature> m_precompiledRootSignature;
+    Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> m_precompiledSrvHeap;
+    Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> m_precompiledSamplerHeap;
+    Microsoft::WRL::ComPtr<ID3D12Resource> m_precompiledSharedConstantsBuffer;
+    uint8_t* m_precompiledSharedConstantsMap = nullptr;
+    D3D12_GPU_VIRTUAL_ADDRESS m_precompiledSharedConstantsGpu = 0;
+    uint32_t m_precompiledSrvDescriptorSize = 0;
+    uint32_t m_precompiledSamplerDescriptorSize = 0;
     Microsoft::WRL::ComPtr<ID3D12PipelineState> m_testPipeline;
+    Microsoft::WRL::ComPtr<ID3D12PipelineState> m_precompiledTestPipeline;
+    Microsoft::WRL::ComPtr<ID3D12PipelineState> m_precompiledDrawPipeline;
 
     // Phase 5: Mipmap generation compute pipeline
     Microsoft::WRL::ComPtr<ID3D12RootSignature> m_mipGenRootSignature;
@@ -781,13 +904,20 @@ public:
     // NOT make t4 reachable, and pretending otherwise is the substitution this
     // charter forbids.
     static constexpr uint32_t kMaxGuestTextureDescriptors = 16;
-    static constexpr uint32_t kSrvHeapDescriptorCount =
+    // Dedicated slot 17 for guest render target scanout blit
+    static constexpr uint32_t kGuestRtSrvSlot =
         kTexture2DSlot + kMaxGuestTextureDescriptors;
+    static constexpr uint32_t kSrvHeapBaseCount = kGuestRtSrvSlot + 1;
+    static constexpr uint32_t kSrvRingTablesPerFrame = 4096;
+    static constexpr uint32_t kSrvHeapDescriptorCount =
+        kSrvHeapBaseCount + kBufferCount * kSrvRingTablesPerFrame * kShaderTextureSlotCount;
     // Xenos float-constant bank size bound at root CBV b0.
     static constexpr uint32_t kShaderConstantBytes = 256 * 16;
     bool CreateSrvHeap();
     Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> m_srvHeap;
     uint32_t m_srvDescriptorSize = 0;
+    uint32_t m_srvRingOffset = 0;
+    D3D12_GPU_DESCRIPTOR_HANDLE m_currentSrvTableGpu = {};
     Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> m_samplerHeap;
     uint32_t m_samplerDescriptorSize = 0;
     uint32_t m_samplerHeapOffset = 0;
@@ -1005,10 +1135,14 @@ public:
     // ---------------------------------------------------------------------
     bool EnsureGuestRenderTarget(uint32_t width, uint32_t height,
                                  DXGI_FORMAT format);
+    bool EnsureGuestDepthStencil(uint32_t width, uint32_t height,
+                                 DXGI_FORMAT format = DXGI_FORMAT_D24_UNORM_S8_UINT);
     // The console's EDRAM -> scanout resolve. Returns false when there is
     // nothing to resolve (no guest render target, or nothing drawn into it
     // since the last resolve).
     bool ResolveGuestRenderTarget();
+    bool EnsureBlitPipeline();
+    bool BlitGuestRenderTargetToScanout();
     // Named, counted refusal of the guest render target, so "the guest's
     // render target was not used" is a number and not an absence.
     //
@@ -1018,24 +1152,47 @@ public:
     // the cause -- the same silence the row exists to end.
     void GuestRenderTargetRefused(const char* why, uint32_t hr = 0xFFFFFFFFu);
     Microsoft::WRL::ComPtr<ID3D12Resource> m_guestRt;
-    // A replaced guest render target is kept here until the GPU has caught up
-    // with the fence, because a texture the GPU may still be reading must not
-    // be released under it. The size can only change on a window resize (the
-    // resolve requires the guest's render target to be 1:1 with the scan-out
-    // surface), so this list stays empty in practice.
-    std::vector<Microsoft::WRL::ComPtr<ID3D12Resource>> m_guestRtRetired;
+    // Replaced guest render-target / depth resources, each held until the fence
+    // passes the first present Signal after replacement (it follows execution of
+    // the list that was open at replacement time). MEASURED p1b.log: the guest resizes 1280->640->1280 at
+    // a screen change, and releasing at once faulted the driver 286 ms later.
+    std::vector<std::pair<uint64_t, Microsoft::WRL::ComPtr<ID3D12Pageable>>> m_retiredTargets;
+    void RetireTarget(Microsoft::WRL::ComPtr<ID3D12Pageable> res);
+    void PruneRetiredTargets();
     Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> m_guestRtvHeap;
     D3D12_CPU_DESCRIPTOR_HANDLE m_guestRtv = {};
+    D3D12_GPU_DESCRIPTOR_HANDLE m_guestRtSrvGpu = {};
+    bool m_guestRtSrvValid = false;
+    Microsoft::WRL::ComPtr<ID3D12RootSignature> m_blitRootSignature;
+    Microsoft::WRL::ComPtr<ID3D12PipelineState> m_blitPipeline;
     uint32_t m_guestRtW = 0;
     uint32_t m_guestRtH = 0;
     DXGI_FORMAT m_guestRtFormat = DXGI_FORMAT_UNKNOWN;
     bool m_guestRtValid = false;
+    Microsoft::WRL::ComPtr<ID3D12Resource> m_guestDepth;
+    Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> m_guestDsvHeap;
+    D3D12_CPU_DESCRIPTOR_HANDLE m_guestDsv = {};
+    uint32_t m_guestDepthW = 0;
+    uint32_t m_guestDepthH = 0;
+    DXGI_FORMAT m_guestDepthFormat = DXGI_FORMAT_UNKNOWN;
+    bool m_guestDepthValid = false;
     // The guest render target's tracked D3D12 state. It starts COMMON and is
     // RENDER_TARGET between draws; the readback and the resolve each take it
     // to COPY_SOURCE and back. Asserting a state the resource is not in is
     // the F-725 hazard this file already documents at :4130-4142, so the
     // state is TRACKED here rather than assumed.
     D3D12_RESOURCE_STATES m_guestRtState = D3D12_RESOURCE_STATE_COMMON;
+    // F-900: the guest RT state AS OF THE LAST EXECUTED list, snapshotted at
+    // BeginFrame (before anything is recorded) and RESTORED by AbandonFrame.
+    // m_guestRtState is updated when a barrier is RECORDED, but an abandoned
+    // frame's recording is DISCARDED without executing -- so the flag used to
+    // claim RENDER_TARGET while the resource was still COMMON. The next frame
+    // then SKIPPED the COMMON->RT transition (flag said RT) and recorded
+    // ClearRenderTargetView on a resource in COMMON state = undefined
+    // behaviour the driver silently ignores -> every clear lost -> guest RT
+    // reads (0,0,0,0) forever (measured: build/g967.log, CLEAR-TARGET rows
+    // isGuestRtv=1 yet nonBlack=0/921600).
+    D3D12_RESOURCE_STATES m_guestRtStateAtFrameStart = D3D12_RESOURCE_STATE_COMMON;
     // True once the guest has drawn into m_guestRt since the last resolve.
     bool m_guestRtDrawn = false;
     // True while the draw path is rendering into m_guestRt rather than into
@@ -1043,6 +1200,7 @@ public:
     // the BACK BUFFER, so while the draws land in the guest render target
     // they must not be counted as writes to it; the resolve is the write.
     bool m_drawsIntoGuestRt = false;
+    bool m_hadBackBufferDraw = false;  // 2026-10-31: any draw went to scan-out back buffer
     // F-XXX: the number of NON-MODAL pixels the last post-draw readback
     // measured in the GUEST RENDER TARGET (the same count the D3D12-DRAW-PIXEL
     // row prints as changedPx). The resolve's row carries it, because "the
@@ -1056,21 +1214,24 @@ public:
     // after the resolve of frame N. The value is a MEMBER and is not cleared,
     // so once the guest has drawn something the number stays.
     uint64_t m_guestRtChangedPx = 0;
+    // F-XXX: the modal (most common) RGBA of the guest render target as
+    // measured by ReportDrawReadback, printed by GUEST-RT-RESOLVE. A user
+    // report of a "white screen" cannot be judged without this: changedPx
+    // counts non-modal pixels and says nothing about the background colour.
+    uint32_t m_guestRtModalRgba = 0;
+    uint64_t m_guestRtModalCount = 0;
     uint64_t m_guestRtResolves = 0;
     uint64_t m_guestRtRefusals = 0;
     uint64_t m_guestRtCreated = 0;
 
     // ---------------------------------------------------------------------
-    // F-725: the post-draw readback (see ReportDrawReadback in the .cpp for the
-    // measurement and for the four dead ends it supersedes).
-    //
-    // m_readbackDisabled is a ONE-WAY latch: once the READBACK heap buffer has
-    // failed to be created the path never retries, because a retry per draw is
-    // exactly the per-frame cost this feature was created to remove. It is
-    // separate from the attempt bound below, which is about doing the readback
-    // too OFTEN rather than failing.
+    // F-887 (2026-10-24): 64 samples, not 4, so the bounded probe can span a
+    // soak. In batched mode a sample is recorded once at the guest swap, not
+    // once per draw, and only every 120 presents after the first sample, so a
+    // draw burst cannot consume the bound before the gate window is reached.
     // ---------------------------------------------------------------------
-    static constexpr uint64_t kDrawReadbackMaxReadbacks = 4;
+    static constexpr uint64_t kDrawReadbackMaxReadbacks = 64;
+    static constexpr uint64_t kDrawReadbackPresentInterval = 120;
     bool EnsureDrawReadback();
     bool RecordDrawReadback();
     void ReportDrawReadback();
@@ -1086,6 +1247,11 @@ public:
     uint64_t m_drawReadbackCompletions = 0;
     uint64_t m_drawReadbackCreateFailures = 0;
     uint64_t m_drawReadbackMapFailures = 0;
+    // Readback samples NOT taken because the fence wait timed out (F-XXX,
+    // 2026-10-27). A timed-out wait used to fall through to Map, so a zero
+    // sample could be an uncompleted copy rather than a rendered pixel; the
+    // timeout now skips the Map and is counted here.
+    uint64_t m_drawReadbackFenceTimeouts = 0;
 
     // ---------------------------------------------------------------------
     // F-761: THE LATE-FRAME READBACK -- a sample of a frame that carries NO
@@ -1114,10 +1280,21 @@ public:
     uint64_t m_lateFrameReadbackAttempts = 0;
     uint64_t m_lateFrameReadbackCompletions = 0;
     uint64_t m_lateFrameReadbackMapFailures = 0;
+    // Same fence-timeout discipline as the draw-path readback above.
+    uint64_t m_lateFrameReadbackFenceTimeouts = 0;
     bool m_lateFrameExhaustedLogged = false;
     // Presents refused because the buffer the swap chain had rotated onto had
     // never been written by anything. See RefuseUnwrittenPresent in the .cpp.
     uint64_t m_unwrittenPresentRefused = 0;
+    // F-900/F-898(d): PresentOwnedFrame's Close() failure -- the only silent
+    // exit in the present path (no Signal runs, so a later readback maps stale
+    // bytes under a stale fenceTarget). Counted here, logged as
+    // PRESENT-CLOSE-FAILED in the .cpp.
+    uint64_t m_presentCloseFailures = 0;
+    // F-900: a failed Signal (s_lastSignalledFenceValue stays stale -> next
+    // readback's wait is skipped on a stale target). Logged as
+    // PRESENT-SIGNAL-FAILED.
+    uint64_t m_signalFailures = 0;
     // Beats that showed nothing new and were therefore NOT shown. See
     // RefuseUnchangedPresent in the .cpp. This is deliberately NOT folded into
     // m_presentedFrames: presented= is the count of flips issued, and a
@@ -1144,6 +1321,8 @@ DrawStats m_stats;
 
     // Phase 6: Dynamic sampler descriptor heap
     static constexpr uint32_t kSamplerHeapSize = 2048;
+    static constexpr uint32_t kPrecompiledSrvHeapSize = 1024;
+    static constexpr uint32_t kPrecompiledSamplerHeapSize = 256;
     // SamplerCacheKey and hash must be defined before the map that uses them
     struct SamplerCacheKey {
         D3D12_SAMPLER_DESC desc;
@@ -1298,9 +1477,15 @@ private:
     HWND m_hwnd = nullptr;
     uint32_t m_width = 1280;
     uint32_t m_height = 720;
+    bool m_isMinimized = false;
+    GraphicsSettings m_graphicsSettings;
 
     Microsoft::WRL::ComPtr<IDXGIFactory4> m_factory;
     Microsoft::WRL::ComPtr<ID3D12Device> m_device;
+    // F-XXX: POULLED info queue (see d3d12_backend.cpp CreateDevice). Set
+    // when MCLA_D3D12_INFOQUEUE=1; stored messages are dumped into the
+    // OMSET-FAULT row. No callback object -- pull model.
+    Microsoft::WRL::ComPtr<ID3D12InfoQueue> m_infoQueue;
     Microsoft::WRL::ComPtr<ID3D12CommandQueue> m_commandQueue;
     Microsoft::WRL::ComPtr<IDXGISwapChain3> m_swapChain;
 
@@ -1431,11 +1616,38 @@ private:
     bool RefuseUnchangedPresent(const char* ownerName);
 
     bool m_inFrame = false;
+    uint64_t m_batchDrawFrameReuses = 0;
+    // F-899: see SetBatchDrawFrames/FlushDrawFrame in the public section.
+    // false = one present per draw (the historical shape); true = the draw
+    // burst accumulates and the guest's swap closes it.
+    bool m_batchDrawFrames = false;
+    bool m_batchDrawFrameHasDraw = false;
+    // F-XXX: PER-COMMAND-LIST RENDER-TARGET BIND CACHE. The draw path used to
+    // call OMSetRenderTargets on EVERY draw with the same two handles; measured
+    // 264,426 redundant binds before the driver fault in build/w12.log. A bind
+    // is now skipped when the handles are unchanged since the last bind IN THE
+    // SAME LIST. The cache is invalidated at every Reset() and Close(): a skip
+    // across a new list would leave that list with no render target bound,
+    // which is a silent black frame, not an optimisation.
+    bool m_boundTargetsValid = false;
+    uint64_t m_boundRtvKey = 0;
+    uint64_t m_boundDsvKey = 0;
+    // F-XXX: OMSET forensics counters (w13 follow-up). The fault row used to
+    // print m_textureBindPasses (texture binds) under the name "binds=" -- the
+    // wrong number, which made the w13 measurement useless. These three are
+    // the real quantities: actual OMSet calls, skipped redundant binds, and
+    // draws recorded into the CURRENT list. The fault row prints all three.
+    uint64_t m_omSetCalls = 0;
+    uint64_t m_omSetSkips = 0;
+    uint64_t m_drawsThisFrame = 0;
+    uint64_t m_maxDrawsThisFrame = 0;  // high-water mark, updated at frame end
     std::recursive_mutex m_mutex;
 
     // Phase 5 pipeline cache for live shader compilation
     renderer::PipelineCache m_pipelineCache;
 };
+
+using GraphicsSettings = D3D12Backend::GraphicsSettings;
 
 // ===========================================================================
 // F-762: THE WHOLE-SURFACE COHERENCE GATE ON THE GUEST-MEMORY BLIT.

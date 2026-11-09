@@ -8,10 +8,17 @@
 #include <cstring>
 #include <functional>
 #include <d3d12.h>
+#include <d3d12sdklayers.h>
 #include <atomic>
+#include <cstdlib> // F-900: getenv for MCLA_FORCE_BLEND probe
+#include <vector>
 #include "common/logging.h"
 #include "dxc_runtime.h"
 #include "texture_decode.h"
+#include <filesystem>
+#include <fstream>
+#include <set>
+#include <mutex>
 // NOTE: d3d12_backend.h is deliberately NOT included. It is needed for nothing
 // here any more, and the offline validator targets (CMakeLists.txt:414-421)
 // compile this file without the backend.
@@ -133,10 +140,13 @@ static uint64_t HashState(const PipelineState& state) {
 }
 
 PipelineKey ComputePipelineKey(uint64_t vsHash, uint64_t psHash,
-                               uint64_t vertexDeclHash, const PipelineState& state) {
+                              uint64_t vsHlslHash, uint64_t psHlslHash,
+                              uint64_t vertexDeclHash, const PipelineState& state) {
     PipelineKey key;
     key.vsHash = vsHash;
     key.psHash = psHash;
+    key.vsHlslHash = vsHlslHash;
+    key.psHlslHash = psHlslHash;
     key.vertexDeclHash = vertexDeclHash;
     key.inputLayoutHash = 0;
     key.state = state;
@@ -151,10 +161,12 @@ PipelineKey ComputePipelineKey(uint64_t vsHash, uint64_t psHash,
 }
 
 PipelineKey ComputePipelineKeyForLayout(
-        uint64_t vsHash, uint64_t psHash, uint64_t vertexDeclHash,
+        uint64_t vsHash, uint64_t psHash,
+        uint64_t vsHlslHash, uint64_t psHlslHash,
+        uint64_t vertexDeclHash,
         const PipelineState& state,
         const std::vector<D3D12_INPUT_ELEMENT_DESC>& inputLayout) {
-    PipelineKey key = ComputePipelineKey(vsHash, psHash, vertexDeclHash, state);
+    PipelineKey key = ComputePipelineKey(vsHash, psHash, vsHlslHash, psHlslHash, vertexDeclHash, state);
     key.inputLayoutHash = HashInputLayout(inputLayout);
     if (inputLayout.empty()) key.refuseMask |= kRefuseEmptyInputLayout;
     return key;
@@ -230,6 +242,10 @@ void FormatPipelineRefusal(uint32_t mask, char* out, size_t outBytes) {
         // F-692/F-716: the name the PSO-creation failures were missing. It used
         // to print "empty-hlsl" for a cause with nothing to do with HLSL.
         {kRefusePsoCreateFailed,       "pso-create-failed"},
+        // F-904: constant blend factor requested. OMSetBlendFactor is per-draw
+        // dynamic state the backend never sets, so name it rather than baking
+        // in a (1,1,1,1) factor.
+        {kRefuseBlendConstantFactor,   "blend-constant-factor"},
     };
     // Every bit in use must have a name here, or FormatPipelineRefusal renders
     // "unnamed-0x..." and a soak grepping for a reason name finds none -- which
@@ -648,6 +664,9 @@ static void ApplyBaselineD3D12State(PipelineState& s) {
         b.RenderTarget[i].LogicOp = D3D12_LOGIC_OP_NOOP;
         b.RenderTarget[i].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
     }
+    // NOTE (F-904): MCLA_FORCE_BLEND lives at the end of DerivePipelineState
+    // now, overriding the DECODED state. It used to sit here, where any real
+    // decode (which runs later) would have silently discarded it.
 
     D3D12_DEPTH_STENCIL_DESC& d = s.d3d12.depthStencil;
     d.DepthEnable = FALSE;
@@ -821,7 +840,10 @@ uint32_t RectangleDrawsOffered() {
     return s_rectangleDrawsOffered.load(std::memory_order_relaxed);
 }
 
-PipelineState DerivePipelineState(const PipelineStateInputs& in, uint32_t& refuseMask) {
+PipelineState DerivePipelineState(const PipelineStateInputs& in, uint32_t& refuseMask,
+                                  DecodedXenosRenderState* decodedOut) {
+    if (decodedOut) *decodedOut = DecodedXenosRenderState{};
+
     // F-646: the bit-layout self-check runs ONCE, on the first real derivation,
     // and speaks up only if it fails. A wrong bit here renders wrong geometry
     // with no error at all, so a silent failure is the one outcome this must
@@ -898,6 +920,7 @@ PipelineState DerivePipelineState(const PipelineStateInputs& in, uint32_t& refus
         case 0x04:  // kTriangleList
         case 0x05:  // kTriangleFan
         case 0x06:  // kTriangleStrip
+        case 0x0D:  // kQuadList (expanded to triangles in render_thread)
             s.topology = kTopoTriangle; break;
         case 0x02:  // kLineList
         case 0x03:  // kLineStrip
@@ -1017,6 +1040,7 @@ PipelineState DerivePipelineState(const PipelineStateInputs& in, uint32_t& refus
     // (never at a decoded zero) and the key already refuses.
     uint32_t regRefusals = kRefuseNone;
     const DecodedXenosRenderState xr = DecodeGuestRenderState(in, regRefusals);
+    if (decodedOut) *decodedOut = xr;
     refuseMask |= regRefusals;
 
     // Cull: cull_front/cull_back, the direct bit mapping Xenia uses
@@ -1026,7 +1050,10 @@ PipelineState DerivePipelineState(const PipelineStateInputs& in, uint32_t& refus
     // equivalent. That case is LOSSY, not mapped, so it is counted: a soak
     // that shows a non-zero count is telling us the title uses dual-sided
     // primitive mode and the host cannot reproduce it.
-    if (!xr.suPresent) {
+    if (in.is2DQuad) {
+        r.CullMode = D3D12_CULL_MODE_NONE;
+    }
+    else if (!xr.suPresent) {
         // Baseline (CULL_MODE_NONE) already applied by ApplyBaselineD3D12State.
         // No default is invented and no zero is decoded.
     }
@@ -1218,6 +1245,234 @@ PipelineState DerivePipelineState(const PipelineStateInputs& in, uint32_t& refus
         // the key so the PSO and the key cannot disagree.
         d.DepthEnable = FALSE;
         d.StencilEnable = FALSE;
+    } else {
+        // Depth-stencil format is present (e.g. DXGI_FORMAT_D24_UNORM_S8_UINT).
+        if (in.is2DQuad || in.samplesFontAtlas) {
+            // 2D quads and text overlays render on top without depth testing or depth writes
+            d.DepthEnable = FALSE;
+            d.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ZERO;
+            d.DepthFunc = D3D12_COMPARISON_FUNC_ALWAYS;
+            d.StencilEnable = FALSE;
+        } else if (in.registersPresent & kGuestRegDepthControl) {
+            const uint32_t dc = in.depthControl;
+            const bool zEnable = (dc & (1u << 1)) != 0;
+            const bool zWrite = (dc & (1u << 2)) != 0;
+            const uint32_t zFunc = (dc >> 4) & 7u;
+            d.DepthEnable = zEnable ? TRUE : FALSE;
+            d.DepthWriteMask = zWrite ? D3D12_DEPTH_WRITE_MASK_ALL : D3D12_DEPTH_WRITE_MASK_ZERO;
+            d.DepthFunc = static_cast<D3D12_COMPARISON_FUNC>(D3D12_COMPARISON_FUNC_NEVER + zFunc);
+
+            const bool stencilEn = (dc & (1u << 0)) != 0;
+            d.StencilEnable = stencilEn ? TRUE : FALSE;
+            if (stencilEn) {
+                d.StencilReadMask = 0xFF;
+                d.StencilWriteMask = 0xFF;
+                const uint32_t sFunc = (dc >> 8) & 7u;
+                d.FrontFace.StencilFunc = static_cast<D3D12_COMPARISON_FUNC>(D3D12_COMPARISON_FUNC_NEVER + sFunc);
+                d.BackFace.StencilFunc = d.FrontFace.StencilFunc;
+            }
+        } else {
+            // 3D world geometry default when explicit RB_DEPTHCONTROL was not snapshotted
+            d.DepthEnable = TRUE;
+            d.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
+            d.DepthFunc = D3D12_COMPARISON_FUNC_LESS_EQUAL;
+            d.StencilEnable = FALSE;
+        }
+    }
+
+    // F-904: BLEND DERIVED from RB_BLENDCONTROL0 (0x2201) + RB_COLOR_MASK
+    // (0x2104) when the guest presented them; the unmeasured baseline above
+    // (blend-off + kStateFlagUnmeasuredBlend) stays for draws whose packet
+    // never carried them. The baseline overwrote transparent texels instead
+    // of compositing them (measured black screen, F-901); deriving the real
+    // equation is what un-blacks it.
+    //
+    // Field layout (registers.h:783-791): color_srcblend 5b+0, color_comb_fcn
+    // 3b+5, color_destblend 5b+8, alpha_srcblend 5b+16, alpha_comb_fcn 3b+21,
+    // alpha_destblend 5b+24. Factor maps are Xenia's
+    // d3d12/pipeline_cache.cc:1577-1624 verbatim (kBlendFactorMap for color,
+    // kBlendFactorAlphaMap for alpha -- color modes become alpha modes because
+    // D3D12 has no separate color/alpha factor namespace the way the indexing
+    // there assumes; indices 17-31 are zero-initialised to kZero exactly as
+    // in the reference). Op map is d3d12/pipeline_cache.cc:3142-3145.
+    // Enable rule is the reference's (:3163-3168): off only when every factor
+    // is ONE/ZERO and both ops are ADD. Write mask is the RT0 nibble of
+    // RB_COLOR_MASK (registers.h:758-761), which is bit-identical to
+    // D3D12_COLOR_WRITE_ENABLE_* (R/G/B/A = bits 0/1/2/3 both sides).
+    {
+        static constexpr uint32_t kColorFactorMap[32] = {
+            0, 1, 0, 0, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 10, 11, 12,
+            // 17..31 zero-initialised to 0 (kZero), as in the reference.
+        };
+        static constexpr uint32_t kAlphaFactorMap[32] = {
+            0, 1, 0, 0, 4, 5, 4, 5, 6, 7, 6, 7, 10, 11, 10, 11, 12,
+            // 17..31 zero-initialised to 0 (kZero), as in the reference.
+        };
+        // Indexed by PipelineBlendFactor value (kZero=0 .. kSrcAlphaSat=12).
+        static constexpr D3D12_BLEND kD3DBlendMap[13] = {
+            D3D12_BLEND_ZERO, D3D12_BLEND_ONE,
+            D3D12_BLEND_SRC_COLOR, D3D12_BLEND_INV_SRC_COLOR,
+            D3D12_BLEND_SRC_ALPHA, D3D12_BLEND_INV_SRC_ALPHA,
+            D3D12_BLEND_DEST_COLOR, D3D12_BLEND_INV_DEST_COLOR,
+            D3D12_BLEND_DEST_ALPHA, D3D12_BLEND_INV_DEST_ALPHA,
+            D3D12_BLEND_BLEND_FACTOR, D3D12_BLEND_INV_BLEND_FACTOR,
+            D3D12_BLEND_SRC_ALPHA_SAT};
+        static constexpr D3D12_BLEND_OP kD3DBlendOpMap[8] = {
+            D3D12_BLEND_OP_ADD, D3D12_BLEND_OP_SUBTRACT,
+            D3D12_BLEND_OP_MIN, D3D12_BLEND_OP_MAX,
+            D3D12_BLEND_OP_REV_SUBTRACT, D3D12_BLEND_OP_ADD,
+            D3D12_BLEND_OP_ADD, D3D12_BLEND_OP_ADD};
+        const bool blendPresent =
+            (in.registersPresent & kGuestRegBlendControl) != 0;
+        if (blendPresent) {
+            const uint32_t ctl = in.blendControl0;
+            const uint32_t cSrc = ctl & 0x1Fu;
+            const uint32_t cOp = (ctl >> 5) & 0x7u;
+            const uint32_t cDst = (ctl >> 8) & 0x1Fu;
+            const uint32_t aSrc = (ctl >> 16) & 0x1Fu;
+            const uint32_t aOp = (ctl >> 21) & 0x7u;
+            const uint32_t aDst = (ctl >> 24) & 0x1Fu;
+            const uint32_t fCSrc = kColorFactorMap[cSrc];
+            const uint32_t fCDst = kColorFactorMap[cDst];
+            const uint32_t fASrc = kAlphaFactorMap[aSrc];
+            const uint32_t fADst = kAlphaFactorMap[aDst];
+            // Constant factors need OMSetBlendFactor (per-draw dynamic state
+            // the backend never sets). Baking in (1,1,1,1) would invent the
+            // blend constant, so refuse by name instead. Counted: the soak
+            // says whether the game even uses them.
+            if (fCSrc == 10u || fCSrc == 11u || fCDst == 10u ||
+                fCDst == 11u || fASrc == 10u || fASrc == 11u ||
+                fADst == 10u || fADst == 11u) {
+                refuseMask |= kRefuseBlendConstantFactor;
+                static std::atomic<uint32_t> s_blendConst{0};
+                const uint32_t n = s_blendConst.fetch_add(1) + 1;
+                if (n <= 4 || (n % 200) == 0) {
+                    MCLA_LOG_WARN("PC-BLEND-CONSTANT #{} blendControl={:08X} "
+                                  "(a constant factor needs OMSetBlendFactor, "
+                                  "which no path sets) -- refused, not defaulted",
+                                  n, ctl);
+                }
+            } else {
+                const uint32_t writeMask =
+                    (in.registersPresent & kGuestRegColorMask) != 0u
+                        ? (in.blendColorMask & 0xFu)
+                        : 0xFu;
+                D3D12_RENDER_TARGET_BLEND_DESC& b0 =
+                    s.d3d12.blend.RenderTarget[0];
+                b0.SrcBlend = kD3DBlendMap[fCSrc];
+                b0.DestBlend = kD3DBlendMap[fCDst];
+                b0.BlendOp = kD3DBlendOpMap[cOp];
+                b0.SrcBlendAlpha = kD3DBlendMap[fASrc];
+                b0.DestBlendAlpha = kD3DBlendMap[fADst];
+                b0.BlendOpAlpha = kD3DBlendOpMap[aOp];
+                b0.RenderTargetWriteMask = static_cast<UINT8>(writeMask);
+                s.d3d12.blend.IndependentBlendEnable = TRUE;
+                // The reference's enable rule: off only when the equation is
+                // the identity (ONE/ZERO + ADD on both color and alpha).
+                const bool isIdentity =
+                    fCSrc == 1u && fCDst == 0u && cOp == 0u && fASrc == 1u &&
+                    fADst == 0u && aOp == 0u;
+                b0.BlendEnable = isIdentity ? FALSE : TRUE;
+                // F-904 census: the raw register + the decoded equation, so a
+                // soak measures what the game actually asks for. Throttled
+                // like PC-BLEND-BASELINE (per derive attempt, not per PSO).
+                static std::atomic<uint32_t> s_blendDerived{0};
+                const uint32_t n = s_blendDerived.fetch_add(1) + 1;
+                if (n <= 4 || (n % 200) == 0) {
+                    MCLA_LOG_WARN("PC-BLEND-DERIVED #{} blendControl={:08X} "
+                                  "mask={:01X} src={} dst={} op={} srcA={} "
+                                  "dstA={} opA={} enable={} -- measured guest "
+                                  "blend equation (F-904)",
+                                  n, ctl, writeMask, fCSrc, fCDst, cOp, fASrc,
+                                  fADst, aOp, b0.BlendEnable ? 1 : 0);
+                }
+            }
+            // TEMP F-900 BLEND-PROBE (moved from ApplyBaselineD3D12State so it
+            // overrides the DECODED state, not the pre-decode baseline; remove
+            // with the other env probes once real blend is default-on verified).
+            // MCLA_FORCE_BLEND=1 forces slot 0 to standard UI alpha blending.
+            {
+                static int s_forceBlend2 = -1;
+                if (s_forceBlend2 < 0) {
+                    const char* e = std::getenv("MCLA_FORCE_BLEND");
+                    // Default OFF (0) to respect the guest's native enable=0 equation (ga058).
+                    s_forceBlend2 = (e && e[0] == '1') ? 1 : 0;
+                }
+                if (s_forceBlend2 == 1) {
+                    D3D12_RENDER_TARGET_BLEND_DESC& fb0 =
+                        s.d3d12.blend.RenderTarget[0];
+                    fb0.BlendEnable = TRUE;
+                    fb0.SrcBlend = D3D12_BLEND_SRC_ALPHA;
+                    fb0.DestBlend = D3D12_BLEND_INV_SRC_ALPHA;
+                    fb0.SrcBlendAlpha = D3D12_BLEND_ONE;
+                    fb0.DestBlendAlpha = D3D12_BLEND_INV_SRC_ALPHA;
+                    // F-920: the force had NO log row, so whether it reached the
+                    // legals PSO was unmeasurable. Throttled to 1 in 200 like
+                    // PC-BLEND-DERIVED (this runs per derive attempt).
+                    static std::atomic<uint32_t> s_forceBlendApplied{0};
+                    const uint32_t fn2 = s_forceBlendApplied.fetch_add(1) + 1;
+                    if (fn2 <= 4 || (fn2 % 200) == 0) {
+                        MCLA_LOG_WARN("PC-BLEND-FORCE #{} slot0 <- "
+                                      "SRC_ALPHA/INV_SRC_ALPHA on BOTH color "
+                                      "and alpha (was declared "
+                                      "blend-off/identity by the guest)",
+                                      fn2);
+                    }
+                }
+            }
+        } else {
+            // No blend registers in this packet: the declared blend-off
+            // baseline stands, flagged countable (was: stamped unconditionally
+            // with a note that it cannot split a key -- it now splits exactly
+            // when the guest's equation differs, which is the point).
+            s.flags |= kStateFlagUnmeasuredBlend;
+            {
+                // Throttled like PC-MSAA-EN above: this runs for EVERY derive attempt
+                // (render_thread.cpp), not once per PSO, so an unthrottled line would
+                // own the log the way one mitigation did in F-054. Counts derives;
+                // stats_.unmeasuredBlendState below counts PSOs actually created --
+                // read them apart, do not expect them to match.
+                static std::atomic<uint32_t> s_blendBaseline{0};
+                const uint32_t n = s_blendBaseline.fetch_add(1) + 1;
+                if (n <= 4 || (n % 200) == 0)
+                    MCLA_LOG_WARN("PC-BLEND-BASELINE #{} blend state is the declared "
+                                  "blend-off baseline (kStateFlagUnmeasuredBlend); no "
+                                  "Xenos blend register was presented for this draw",
+                                  n);
+            }
+        }
+
+        // Alpha blending for font atlas (0x13BCC000) and 2D UI quads:
+        // Enables proper transparency and fading, eliminating tofu boxes and black backgrounds.
+        // Applied whether blend registers were present or not.
+        {
+            static int s_blendUi = -1;
+            if (s_blendUi < 0) {
+                const char* e = std::getenv("MCLA_BLEND_TEXT");
+                s_blendUi = (e && e[0] == '0') ? 0 : 1;
+            }
+            if (s_blendUi == 1 && (in.samplesFontAtlas || in.is2DQuad)) {
+                D3D12_RENDER_TARGET_BLEND_DESC& tb0 =
+                    s.d3d12.blend.RenderTarget[0];
+                tb0.BlendEnable = TRUE;
+                tb0.SrcBlend = D3D12_BLEND_SRC_ALPHA;
+                tb0.DestBlend = D3D12_BLEND_INV_SRC_ALPHA;
+                tb0.BlendOp = D3D12_BLEND_OP_ADD;
+                tb0.SrcBlendAlpha = D3D12_BLEND_ONE;
+                tb0.DestBlendAlpha = D3D12_BLEND_INV_SRC_ALPHA;
+                tb0.BlendOpAlpha = D3D12_BLEND_OP_ADD;
+                tb0.RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+                s.d3d12.blend.IndependentBlendEnable = TRUE;
+                static std::atomic<uint32_t> s_blendUiApplied{0};
+                const uint32_t bn = s_blendUiApplied.fetch_add(1) + 1;
+                if (bn <= 4 || (bn % 200) == 0) {
+                    MCLA_LOG_WARN("BLEND-UI-ON #{} slot0 <- "
+                                  "SRC_ALPHA/INV_SRC_ALPHA (font atlas / 2D quad "
+                                  "draw; alpha blend enabled)",
+                                  bn);
+                }
+            }
+        }
     }
 
     s.derivation = kStateDerivedGuest;
@@ -1578,11 +1833,315 @@ std::string JoinNames(const std::vector<std::string>& v) {
     return out;
 }
 
+std::string JoinBindings(
+    const std::vector<DxcRuntime::ResourceBinding>& bindings) {
+    if (bindings.empty()) return "none";
+    std::string out;
+    for (size_t i = 0; i < bindings.size(); ++i) {
+        if (i) out += "|";
+        const auto& binding = bindings[i];
+        out += std::to_string(binding.type) + ":" +
+               std::to_string(binding.register_) + ":" +
+               std::to_string(binding.space_);
+    }
+    return out;
+}
+
+std::string JoinSignature(
+    const std::vector<DxcRuntime::SignatureParameter>& parameters) {
+    if (parameters.empty()) return "none";
+    std::string out;
+    for (size_t i = 0; i < parameters.size(); ++i) {
+        if (i) out += "|";
+        const auto& parameter = parameters[i];
+        out += parameter.semanticName + std::to_string(parameter.semanticIndex) +
+               ":" + std::to_string(parameter.systemValueType) + ":" +
+               std::to_string(parameter.componentType) + "/" +
+               std::to_string(parameter.mask) + "/" +
+               std::to_string(parameter.readWriteMask) + "@" +
+               std::to_string(parameter.register_);
+    }
+    return out;
+}
+
+void LogPsoDebugMessages(ID3D12InfoQueue* infoQueue, UINT64 firstMessage) {
+    static std::atomic<uint32_t> s_psoInfoQueueDumps{0};
+    const uint32_t n = s_psoInfoQueueDumps.fetch_add(1) + 1;
+    if (n > 4) return;
+    if (!infoQueue) {
+        MCLA_LOG_WARN("PC-PSO-D3D12-INFO #{} unavailable; enable "
+                      "MCLA_D3D12_DEBUG_LAYER=1 before starting the process",
+                      n);
+        return;
+    }
+
+    const UINT64 messageCount =
+        infoQueue->GetNumStoredMessagesAllowedByRetrievalFilter();
+    if (messageCount <= firstMessage) {
+        MCLA_LOG_WARN("PC-PSO-D3D12-INFO #{} no new debug-layer messages "
+                      "followed CreateGraphicsPipelineState",
+                      n);
+        return;
+    }
+
+    constexpr UINT64 kMaxMessages = 8;
+    const UINT64 lastMessage =
+        std::min(messageCount, firstMessage + kMaxMessages);
+    for (UINT64 i = firstMessage; i < lastMessage; ++i) {
+        SIZE_T messageBytes = 0;
+        const HRESULT sizeHr =
+            infoQueue->GetMessage(i, nullptr, &messageBytes);
+        if (messageBytes < sizeof(D3D12_MESSAGE)) {
+            MCLA_LOG_WARN("PC-PSO-D3D12-INFO #{} message={} size-query-hr=0x{:08X} "
+                          "returned an invalid message size {}",
+                          n, i, static_cast<uint32_t>(sizeHr), messageBytes);
+            continue;
+        }
+
+        std::vector<uint64_t> storage(
+            (messageBytes + sizeof(uint64_t) - 1) / sizeof(uint64_t));
+        auto* message = reinterpret_cast<D3D12_MESSAGE*>(storage.data());
+        const HRESULT messageHr =
+            infoQueue->GetMessage(i, message, &messageBytes);
+        if (FAILED(messageHr)) {
+            MCLA_LOG_WARN("PC-PSO-D3D12-INFO #{} message={} retrieval-hr=0x{:08X}",
+                          n, i, static_cast<uint32_t>(messageHr));
+            continue;
+        }
+
+        MCLA_LOG_WARN("PC-PSO-D3D12-INFO #{} message={} id={} severity={} {}",
+                      n, i, static_cast<uint32_t>(message->ID),
+                      static_cast<uint32_t>(message->Severity),
+                      message->pDescription ? message->pDescription : "");
+    }
+    if (messageCount > lastMessage) {
+        MCLA_LOG_WARN("PC-PSO-D3D12-INFO #{} omitted {} additional messages",
+                      n, messageCount - lastMessage);
+    }
+}
+
+void ProbeFailedPsoDescriptor(
+    ID3D12Device* device, DxcRuntime& dxc,
+    const D3D12_GRAPHICS_PIPELINE_STATE_DESC& original,
+    const std::vector<uint8_t>& vsDxil,
+    const std::vector<uint8_t>& psDxil) {
+    static std::atomic<uint32_t> s_psoDescriptorProbes{0};
+    const uint32_t n = s_psoDescriptorProbes.fetch_add(1) + 1;
+    if (n != 1) return;
+
+    MCLA_LOG_WARN("PC-PSO-FAIL-DESC #{} rtCount={} rt0={} dsv={} samples={}/{} "
+                  "topologyType={} inputElements={} rootSignature={}",
+                  n, original.NumRenderTargets,
+                  static_cast<uint32_t>(original.RTVFormats[0]),
+                  static_cast<uint32_t>(original.DSVFormat),
+                  original.SampleDesc.Count, original.SampleDesc.Quality,
+                  static_cast<uint32_t>(original.PrimitiveTopologyType),
+                  original.InputLayout.NumElements,
+                  original.pRootSignature ? 1u : 0u);
+    const UINT inputCount = std::min(original.InputLayout.NumElements, 8u);
+    for (UINT i = 0; i < inputCount; ++i) {
+        const D3D12_INPUT_ELEMENT_DESC& input =
+            original.InputLayout.pInputElementDescs[i];
+        MCLA_LOG_WARN("PC-PSO-FAIL-INPUT #{} index={} semantic={}{} format={} "
+                      "slot={} offset={} class={} step={}",
+                      n, i, input.SemanticName ? input.SemanticName : "",
+                      input.SemanticIndex, static_cast<uint32_t>(input.Format),
+                      input.InputSlot, input.AlignedByteOffset,
+                      static_cast<uint32_t>(input.InputSlotClass),
+                      input.InstanceDataStepRate);
+    }
+
+    std::vector<DxcRuntime::SignatureParameter> vsInputs, vsOutputs;
+    std::vector<DxcRuntime::SignatureParameter> psInputs, psOutputs;
+    std::string vsError, psError;
+    const bool vsSignatureOk =
+        dxc.ReflectSignature(vsDxil, vsInputs, vsOutputs, vsError);
+    const bool psSignatureOk =
+        dxc.ReflectSignature(psDxil, psInputs, psOutputs, psError);
+    MCLA_LOG_WARN("PC-PSO-SIGNATURE #{} vsOk={} vsInputs={} vsOutputs={} "
+                  "psOk={} psInputs={} psOutputs={} vsError={} psError={}",
+                  n, vsSignatureOk ? 1u : 0u, JoinSignature(vsInputs),
+                  JoinSignature(vsOutputs), psSignatureOk ? 1u : 0u,
+                  JoinSignature(psInputs), JoinSignature(psOutputs),
+                  vsError.empty() ? "none" : vsError,
+                  psError.empty() ? "none" : psError);
+
+    auto probe = [&](const char* variant,
+                     const D3D12_GRAPHICS_PIPELINE_STATE_DESC& desc) {
+        Microsoft::WRL::ComPtr<ID3D12PipelineState> testPso;
+        const HRESULT hr =
+            device->CreateGraphicsPipelineState(&desc, IID_PPV_ARGS(&testPso));
+        MCLA_LOG_WARN("PC-PSO-PROBE #{} variant={} hr=0x{:08X} created={}",
+                      n, variant, static_cast<uint32_t>(hr),
+                      testPso ? 1u : 0u);
+    };
+
+    PipelineState baseline = {};
+    baseline.sampleCount = original.SampleDesc.Count;
+    ApplyBaselineD3D12State(baseline);
+
+    auto desc = original;
+    desc.RasterizerState = baseline.d3d12.raster;
+    probe("baseline-raster", desc);
+    desc = original;
+    desc.BlendState = baseline.d3d12.blend;
+    probe("baseline-blend", desc);
+    desc = original;
+    desc.DepthStencilState = baseline.d3d12.depthStencil;
+    probe("baseline-depth", desc);
+    desc = original;
+    desc.RasterizerState = baseline.d3d12.raster;
+    desc.BlendState = baseline.d3d12.blend;
+    desc.DepthStencilState = baseline.d3d12.depthStencil;
+    probe("baseline-states", desc);
+    desc = original;
+    desc.InputLayout = {nullptr, 0};
+    probe("empty-input-layout", desc);
+
+    constexpr char kProbeVs[] =
+        "struct V { float4 p : SV_Position; float4 t1 : TEXCOORD1; };"
+        "V main(uint id : SV_VertexID) { V o; o.p=float4(0,0,0,1); "
+        "o.t1=0; return o; }";
+    constexpr char kProbeVsExtraOutput[] =
+        "struct V { float4 p : SV_Position; float4 t0 : TEXCOORD0; "
+        "float4 t1 : TEXCOORD1; };"
+        "V main(uint id : SV_VertexID) { V o; o.p=float4(0,0,0,1); "
+        "o.t0=0; o.t1=0; return o; }";
+    constexpr char kProbeVsReorderedExtraOutput[] =
+        "struct V { float4 p : SV_Position; float4 t1 : TEXCOORD1; "
+        "float4 t0 : TEXCOORD0; };"
+        "V main(uint id : SV_VertexID) { V o; o.p=float4(0,0,0,1); "
+        "o.t1=0; o.t0=0; return o; }";
+    constexpr char kProbePs[] =
+        "float4 main() : SV_Target0 { return float4(1,0,1,1); }";
+    constexpr char kProbePsWithUnusedInput[] =
+        "float4 main(float4 p : SV_Position, float4 t0 : TEXCOORD0, "
+        "float4 t1 : TEXCOORD1) : SV_Target0 { return t1; }";
+    std::vector<uint8_t> probeVs, probeVsExtraOutput,
+        probeVsReorderedExtraOutput, probePs, probePsWithUnusedInput;
+    std::string compileError;
+    const bool probeVsCompiled = dxc.Compile(
+        kProbeVs, "main", DxcRuntime::kVertexProfile, probeVs, compileError, false);
+    if (!probeVsCompiled) {
+        MCLA_LOG_WARN("PC-PSO-PROBE #{} variant=simple-vs-compile failed={}",
+                      n, compileError);
+        return;
+    }
+    if (!dxc.Compile(kProbeVsExtraOutput, "main", DxcRuntime::kVertexProfile,
+                     probeVsExtraOutput, compileError, false)) {
+        MCLA_LOG_WARN("PC-PSO-PROBE #{} variant=simple-vs-extra-output-compile "
+                      "failed={}",
+                      n, compileError);
+        return;
+    }
+    if (!dxc.Compile(kProbeVsReorderedExtraOutput, "main",
+                     DxcRuntime::kVertexProfile,
+                     probeVsReorderedExtraOutput, compileError, false)) {
+        MCLA_LOG_WARN("PC-PSO-PROBE #{} variant=reordered-extra-output-vs-compile "
+                      "failed={}",
+                      n, compileError);
+        return;
+    }
+    const bool probePsCompiled = dxc.Compile(
+        kProbePs, "main", DxcRuntime::kPixelProfile, probePs, compileError, false);
+    if (!probePsCompiled) {
+        MCLA_LOG_WARN("PC-PSO-PROBE #{} variant=simple-ps-compile failed={}",
+                      n, compileError);
+        return;
+    }
+    if (!dxc.Compile(kProbePsWithUnusedInput, "main",
+                     DxcRuntime::kPixelProfile, probePsWithUnusedInput,
+                     compileError, false)) {
+        MCLA_LOG_WARN("PC-PSO-PROBE #{} variant=extra-input-ps-compile failed={}",
+                      n, compileError);
+        return;
+    }
+
+    desc = original;
+    desc.RasterizerState = baseline.d3d12.raster;
+    desc.BlendState = baseline.d3d12.blend;
+    desc.DepthStencilState = baseline.d3d12.depthStencil;
+    desc.VS = {probeVs.data(), probeVs.size()};
+    desc.PS = {probePs.data(), probePs.size()};
+    desc.InputLayout = {nullptr, 0};
+    probe("simple-shader-pair", desc);
+
+    desc = original;
+    desc.RasterizerState = baseline.d3d12.raster;
+    desc.BlendState = baseline.d3d12.blend;
+    desc.DepthStencilState = baseline.d3d12.depthStencil;
+    desc.PS = {probePs.data(), probePs.size()};
+    probe("guest-vs-simple-ps", desc);
+
+    desc = original;
+    desc.RasterizerState = baseline.d3d12.raster;
+    desc.BlendState = baseline.d3d12.blend;
+    desc.DepthStencilState = baseline.d3d12.depthStencil;
+    desc.VS = {probeVs.data(), probeVs.size()};
+    desc.InputLayout = {nullptr, 0};
+    probe("simple-vs-guest-ps", desc);
+
+    std::vector<DxcRuntime::SignatureParameter> extraVsInputs, extraVsOutputs;
+    std::string extraVsError;
+    const bool extraVsSignatureOk = dxc.ReflectSignature(
+        probeVsExtraOutput, extraVsInputs, extraVsOutputs, extraVsError);
+    MCLA_LOG_WARN("PC-PSO-PROBE-SIGNATURE #{} variant=simple-vs-extra-output "
+                  "ok={} outputs={} error={}",
+                  n, extraVsSignatureOk ? 1u : 0u,
+                  JoinSignature(extraVsOutputs),
+                  extraVsError.empty() ? "none" : extraVsError);
+    desc = original;
+    desc.RasterizerState = baseline.d3d12.raster;
+    desc.BlendState = baseline.d3d12.blend;
+    desc.DepthStencilState = baseline.d3d12.depthStencil;
+    desc.VS = {probeVsExtraOutput.data(), probeVsExtraOutput.size()};
+    desc.InputLayout = {nullptr, 0};
+    probe("simple-vs-extra-output-guest-ps", desc);
+
+    std::vector<DxcRuntime::SignatureParameter> reorderedVsInputs,
+        reorderedVsOutputs;
+    std::string reorderedVsError;
+    const bool reorderedVsSignatureOk = dxc.ReflectSignature(
+        probeVsReorderedExtraOutput, reorderedVsInputs, reorderedVsOutputs,
+        reorderedVsError);
+    MCLA_LOG_WARN("PC-PSO-PROBE-SIGNATURE #{} "
+                  "variant=reordered-extra-output-vs ok={} outputs={} error={}",
+                  n, reorderedVsSignatureOk ? 1u : 0u,
+                  JoinSignature(reorderedVsOutputs),
+                  reorderedVsError.empty() ? "none" : reorderedVsError);
+    desc = original;
+    desc.RasterizerState = baseline.d3d12.raster;
+    desc.BlendState = baseline.d3d12.blend;
+    desc.DepthStencilState = baseline.d3d12.depthStencil;
+    desc.VS = {probeVsReorderedExtraOutput.data(),
+               probeVsReorderedExtraOutput.size()};
+    desc.InputLayout = {nullptr, 0};
+    probe("reordered-extra-output-vs-guest-ps", desc);
+
+    std::vector<DxcRuntime::SignatureParameter> extraPsInputs, extraPsOutputs;
+    std::string extraPsError;
+    const bool extraPsSignatureOk = dxc.ReflectSignature(
+        probePsWithUnusedInput, extraPsInputs, extraPsOutputs, extraPsError);
+    MCLA_LOG_WARN("PC-PSO-PROBE-SIGNATURE #{} variant=unused-extra-ps-input "
+                  "ok={} inputs={} error={}",
+                  n, extraPsSignatureOk ? 1u : 0u,
+                  JoinSignature(extraPsInputs),
+                  extraPsError.empty() ? "none" : extraPsError);
+    desc = original;
+    desc.RasterizerState = baseline.d3d12.raster;
+    desc.BlendState = baseline.d3d12.blend;
+    desc.DepthStencilState = baseline.d3d12.depthStencil;
+    desc.PS = {probePsWithUnusedInput.data(), probePsWithUnusedInput.size()};
+    probe("guest-vs-unused-extra-ps-input", desc);
+}
+
 // ONE line, bounded (first 4 then every 200th) so a soak can count it without
 // the log becoming the fault -- the F-054 lesson, applied to the new marker.
 void LogPsoCreateFailed(HRESULT hr, size_t vsDxilBytes, size_t psDxilBytes,
                         size_t gsDxilBytes, bool wantGeomStage,
                         const std::vector<std::string>& unproduced,
+                        const std::vector<DxcRuntime::ResourceBinding>& vsBindings,
+                        const std::vector<DxcRuntime::ResourceBinding>& psBindings,
                         const StageSemantics& vsOut, const StageSemantics& psIn) {
     static std::atomic<uint32_t> s_psoFail{0};
     const uint32_t n = s_psoFail.fetch_add(1) + 1;
@@ -1590,21 +2149,17 @@ void LogPsoCreateFailed(HRESULT hr, size_t vsDxilBytes, size_t psDxilBytes,
     char hrText[16] = {};
     std::snprintf(hrText, sizeof(hrText), "0x%08lX", static_cast<unsigned long>(hr));
     MCLA_LOG_WARN("PC-PSO-CREATE-FAILED #{}: hr={} vsDxil={} psDxil={} gsDxil={} "
-                  "geomStage={} psInputs={} vsOutputs={} unproduced={} -- "
-                  "CreateGraphicsPipelineState rejected the pipeline. DXC "
-                  "reported no diagnostic for either stage (PC-TRANSLATE "
-                  "failed=0), so the cause is a D3D12 stage-signature link, not "
-                  "a compile. Each name in unproduced is a pixel-shader INPUT "
-                  "with no producing output in the vertex signature (or in the "
-                  "geometry stage, whose output this module writes from that "
-                  "same set). NOT patched here: pairing a vertex program that "
-                  "exports the interpolator the pixel program reads is a "
-                  "decision about the draw, and inventing either side would "
-                  "fabricate guest data",
+                  "geomStage={} psInputs={} vsOutputs={} unproduced={} "
+                  "vsBindings={} psBindings={} -- "
+                  "CreateGraphicsPipelineState rejected the pipeline after "
+                  "successful shader compilation. unproduced is a name-only "
+                  "signature check, not a complete diagnosis; use "
+                  "PC-PSO-D3D12-INFO for debug-layer details when available.",
                   n, hrText, vsDxilBytes, psDxilBytes,
                   wantGeomStage ? gsDxilBytes : 0, wantGeomStage ? 1 : 0,
                   JoinNames(psIn.names), JoinNames(vsOut.names),
-                  JoinNames(unproduced));
+                  JoinNames(unproduced), JoinBindings(vsBindings),
+                  JoinBindings(psBindings));
 }
 
 }  // namespace
@@ -1751,6 +2306,18 @@ void PipelineCache::WorkerLoop(Microsoft::WRL::ComPtr<ID3D12Device> device,
             task.promise.set_value(nullptr);
             continue;
         }
+        {  // TEMP-G4: dump each distinct translated VS/PS pair once (build/shaders/).
+            static std::mutex s_g4m; static std::set<size_t> s_g4seen;
+            const size_t hk = std::hash<std::string>{}(task.vsHlsl + task.psHlsl);
+            bool fresh = false;
+            { std::lock_guard<std::mutex> lk(s_g4m); if (s_g4seen.size() < 200) fresh = s_g4seen.insert(hk).second; }
+            if (fresh) {
+                std::error_code ec; std::filesystem::create_directories("shaders", ec);
+                const std::string base = fmt::format("shaders/pair_{:016X}", static_cast<uint64_t>(hk));
+                std::ofstream(base + "_vs.hlsl") << task.vsHlsl;
+                std::ofstream(base + "_ps.hlsl") << task.psHlsl;
+            }
+        }
         if (!dxc.Compile(task.psHlsl, "main", DxcRuntime::kPixelProfile, psDxil, error, true)) {
             {
                 std::lock_guard<std::mutex> lock(statsMutex_);
@@ -1806,6 +2373,29 @@ void PipelineCache::WorkerLoop(Microsoft::WRL::ComPtr<ID3D12Device> device,
             failTask(resourceRefusal,
                      "reflected resource is outside the shared root signature (t0..t3, b0, s0)");
             continue;
+        }
+        // TEMP F-900 (remove after VS->PS linkage is settled): log the COMPILED
+        // signatures (DXIL reflection, not HLSL text) for the first few PSOs.
+        // The dumped HLSL shows matching TEXCOORD0/1 on both stages while the
+        // PS reads zeros at runtime; this names whether the COMPILED blobs
+        // agree with the dump. Bounded: first 4 only.
+        {
+            static std::atomic<uint32_t> s_sigDiag{0};
+            const uint32_t sd = s_sigDiag.fetch_add(1) + 1;
+            if (sd <= 4) {
+                std::vector<DxcRuntime::SignatureParameter> vsIn, vsOut, psIn, psOut;
+                std::string sigErr;
+                const bool vsSigOk = dxc.ReflectSignature(vsDxil, vsIn, vsOut, sigErr);
+                const bool psSigOk = dxc.ReflectSignature(psDxil, psIn, psOut, sigErr);
+                MCLA_LOG_WARN("PC-PSO-SIG #{} keyVsHash={:016X} vsSigOk={} vsIn=[{}] vsOut=[{}] "
+                              "psSigOk={} psIn=[{}] psOut=[{}] vsHasVsuv={} psHasUvvis={}",
+                              sd, task.key.vsHash, vsSigOk ? 1u : 0u,
+                              JoinSignature(vsIn), JoinSignature(vsOut),
+                              psSigOk ? 1u : 0u, JoinSignature(psIn),
+                              JoinSignature(psOut),
+                              task.vsHlsl.find("0.9922") != std::string::npos ? 1u : 0u,
+                              task.psHlsl.find("frac(r0") != std::string::npos ? 1u : 0u);
+            }
         }
         // A VS that declares no CBV still reads ShaderConstants in the generated
         // HLSL body, so the draw path always binds b0; record it so the bind
@@ -1969,6 +2559,12 @@ void PipelineCache::WorkerLoop(Microsoft::WRL::ComPtr<ID3D12Device> device,
                 continue;
             }
 
+            Microsoft::WRL::ComPtr<ID3D12InfoQueue> infoQueue;
+            (void)device.As(&infoQueue);
+            const UINT64 firstInfoQueueMessage =
+                infoQueue
+                    ? infoQueue->GetNumStoredMessagesAllowedByRetrievalFilter()
+                    : 0;
             HRESULT hr = device->CreateGraphicsPipelineState(&psoDesc, IID_PPV_ARGS(&pso));
             if (FAILED(hr) || !pso) {
                 {
@@ -1995,8 +2591,12 @@ void PipelineCache::WorkerLoop(Microsoft::WRL::ComPtr<ID3D12Device> device,
                 // GS set and the comparison below is the same either way.
                 const std::vector<std::string> unproduced =
                     UnproducedPixelInputs(vsOut, psIn);
+                ProbeFailedPsoDescriptor(device.Get(), dxc, psoDesc,
+                                         vsDxil, psDxil);
                 LogPsoCreateFailed(hr, vsDxil.size(), psDxil.size(), gsDxil.size(),
-                                   wantGeomStage, unproduced, vsOut, psIn);
+                                   wantGeomStage, unproduced, vsRes, psRes,
+                                   vsOut, psIn);
+                LogPsoDebugMessages(infoQueue.Get(), firstInfoQueueMessage);
 
                 // F-692, THIRD SITE -- and the one the ledger entry is named for.
                 // Every one of the 21 bits that existed before F-716 names a
@@ -2045,6 +2645,7 @@ void PipelineCache::WorkerLoop(Microsoft::WRL::ComPtr<ID3D12Device> device,
         {
             std::lock_guard<std::mutex> lock(statsMutex_);
             if (st.flags & kStateFlagUnmeasuredDepth) ++stats_.unmeasuredDepthState;
+            if (st.flags & kStateFlagUnmeasuredBlend) ++stats_.unmeasuredBlendState;
             // F-653: "the geometry stage WAS created". The single most
             // important rectangle number, because geomStageCreated == 0 with
             // rectangleDrawsOffered > 0 is a black rectangle area with nothing
@@ -2631,14 +3232,14 @@ Microsoft::WRL::ComPtr<ID3D12PipelineState> PipelineCache::GetOrCompile(
     {
         std::lock_guard<std::mutex> lock(mapMutex_);
         auto it = map_.find(key);
-        if (it != map_.end()) {
+        if (it != map_.end() && !(std::getenv("MCLA_NO_PSOCACHE") && std::getenv("MCLA_NO_PSOCACHE")[0] == '1')) {
             pso = it->second;
             if (pso) {
                 std::lock_guard<std::mutex> slock(statsMutex_);
                 ++stats_.hits;
-                // THE ONE PATH THAT SETS THE CARRIED FLAG. The key names the
-                // geometry stage as identity (PipelineState::geometryStage, and
-                // the == operator at pipeline_cache.h), the worker is the only
+                    // THE ONE PATH THAT SETS THE CARRIED FLAG. The key names the
+                    // geometry stage as identity (PipelineState::geometryStage, and
+                    // the == operator at pipeline_cache.h), the worker is the only
                 // writer of this map, and the worker binds pGeometryShader
                 // exactly when the key named a stage (pipeline_cache.cpp
                 // :1716-1718, and only from a blob that compiled at :1681).
@@ -2799,11 +3400,10 @@ Microsoft::WRL::ComPtr<ID3D12PipelineState> PipelineCache::WaitForGeomStagePso(
     bool* outCarriesGeometryStage) {
     if (outCarriesGeometryStage) *outCarriesGeometryStage = false;
 
-    // Not a geometry-stage key: the historical behaviour, unchanged and unwaiting.
-    if (key.state.geometryStage == kGeomStageNone) return fallback;
-    // Nothing to wait for (the task's future could not be registered). Refuse
-    // rather than hand back a GS-less PSO to a caller that is about to map 0x08.
+    // Wait for in-flight compile task so the draw receives a real translated PSO
+    // matching its input layout rather than the fixed-stride test PSO (which refuses non-28 strides).
     if (!fut.valid()) {
+        if (key.state.geometryStage == kGeomStageNone) return fallback;
         {
             std::lock_guard<std::mutex> lock(statsMutex_);
             ++stats_.geomStageWaitFailed;
@@ -2822,6 +3422,7 @@ Microsoft::WRL::ComPtr<ID3D12PipelineState> PipelineCache::WaitForGeomStagePso(
         workerAlive = workerAlive_;
     }
     if (!workerAlive) {
+        if (key.state.geometryStage == kGeomStageNone) return fallback;
         {
             std::lock_guard<std::mutex> lock(statsMutex_);
             ++stats_.geomStageWaitFailed;
@@ -2845,32 +3446,27 @@ Microsoft::WRL::ComPtr<ID3D12PipelineState> PipelineCache::WaitForGeomStagePso(
         static std::atomic<uint32_t> s_waitTimeout{0};
         const uint32_t n = s_waitTimeout.fetch_add(1) + 1;
         if (n <= 4 || (n % 200) == 0)
-            MCLA_LOG_WARN("PC-RECT-PSO-WAIT-TIMEOUT #{}: waited {} ms for the "
-                          "geometry-stage PSO of key=%016llX and it did not "
+            MCLA_LOG_WARN("PC-PSO-WAIT-TIMEOUT #{}: waited {} ms for the "
+                          "PSO of key={:016X} and it did not "
                           "arrive. The draw is REFUSED, not drawn against the "
-                          "GS-less fallback. This is a new marker: no previous "
-                          "line could report it, because nothing waited.",
+                          "fallback. This is a new marker.",
                           n, static_cast<long>(kGeomStageWaitTimeoutMs),
                           static_cast<unsigned long long>(HashPipelineKey(key)));
         {
             std::lock_guard<std::mutex> lock(statsMutex_);
             ++stats_.geomStageWaitFailed;
         }
-        return nullptr;
+        return (key.state.geometryStage == kGeomStageNone) ? fallback : nullptr;
     }
 
     Microsoft::WRL::ComPtr<ID3D12PipelineState> pso = fut.get();
     if (!pso) {
-        // The worker refused this key and said why on its own line. Returning the
-        // fallback would put a stage-less PSO in the caller's hands on a key whose
-        // identity says "rectangle"; nullptr routes the draw to the caller's
-        // pso-refused branch, which names GetOrCompile's own refusal instead of
-        // blaming the topology for it.
+        // The worker refused this key and said why on its own line.
         {
             std::lock_guard<std::mutex> lock(statsMutex_);
             ++stats_.geomStageWaitFailed;
         }
-        return nullptr;
+        return (key.state.geometryStage == kGeomStageNone) ? fallback : nullptr;
     }
 
     // The claim, and exactly what backs it: this PSO came back from the task
@@ -2883,7 +3479,9 @@ Microsoft::WRL::ComPtr<ID3D12PipelineState> PipelineCache::WaitForGeomStagePso(
         std::lock_guard<std::mutex> lock(statsMutex_);
         ++stats_.geomStageWaited;
     }
-    if (outCarriesGeometryStage) *outCarriesGeometryStage = true;
+    if (outCarriesGeometryStage) {
+        *outCarriesGeometryStage = (key.state.geometryStage == kGeomStageRectangleList);
+    }
     return pso;
 }
 

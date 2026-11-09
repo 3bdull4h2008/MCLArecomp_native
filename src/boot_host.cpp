@@ -39,6 +39,7 @@ Image Xex2LoadImage(const uint8_t* data, size_t dataSize);
 // UILOAD thread tracking
 std::atomic<DWORD> s_uiLoadThreadId{0};
 std::atomic<bool> s_inUILoad{false};
+extern thread_local bool t_inSafeExcept;
 
 #pragma comment(lib, "dbghelp.lib")
 
@@ -593,6 +594,13 @@ namespace
         std::atomic<uint32_t> g_hgHdrTrips{0};
         std::atomic<uint32_t> g_hgFragTrips{0};
         std::atomic<uint32_t> g_hgLogged{0};
+        // F-374: budget for the selftest row alone. The deliberate first-arm read (g_hgSelfTest=true)
+        // must not consume the 48-row real-trip budget, and a WARN demotion would hide it at the
+        // default Error level (src/app.cpp:53-55), so the selftest row stays at ERROR under its
+        // own distinct tag with its own hard cap. First occurrences stay visible; trip counters
+        // still increment unconditionally.
+        std::atomic<uint32_t> g_hgSelfTestLogged{0};
+        constexpr uint32_t kHgSelfTestLogCap = 8;
 
         // F-388: a second guard, over the PHYSICAL heap's instance page (guest
         // kPhysArenaBeginVa = 0xA0400000 since F-391 (old `RESERVED_END`, heap.cpp:250); it was
@@ -632,6 +640,13 @@ namespace
         // F-637: one-shot. A repair is expected exactly once per stranded window; a flood is the
         // F-054 log-poisoning class, and the depth it reports is already the loud part.
         std::atomic<uint32_t> g_hgRepairLog{0};
+        // F-637 proof separation: the deliberate cross-thread proof in PhysGuardArmImpl must not
+        // consume the real F637 one-shot, or a genuine strand later would never log at ERROR.
+        // The proof tags its repair F637-PROOF (own one-shot) and leaves this counter untouched.
+        // t_hgRepairProof is thread-local so a concurrent real strand on another thread still logs
+        // as GUARDREPAIR and consumes the real one-shot.
+        std::atomic<uint32_t> g_hgRepairProofLog{0};
+        thread_local bool t_hgRepairProof = false;
 
         // F-386 / F-412: ONE nesting depth covering BOTH guards, serialised by ONE mutex.
         // Before this the two arms were plain bools toggled from two different heap locks --
@@ -726,7 +741,8 @@ namespace
                 //       Depth is the only thing the old early-return consulted, so this is the one shape
                 //       that reaches the repair branch at all;
                 //   (c) the first arm closes: stranded=true AND a trip is unaccounted for, so it re-arms
-                //       OVER the still-open window and logs F637-GUARDREPAIR;
+                //       OVER the still-open window and logs F637-PROOF (not GUARDREPAIR: the proof
+                //       must not consume the real one-shot);
                 //   (d) the second arm returns depth to 0;
                 //   (e) a deliberate read must FAULT -- and that read is the entire oracle. Were the page
                 //       left writable, the read would succeed, PhysGuardHandle would never run, and
@@ -736,11 +752,13 @@ namespace
                 const uint32_t stBefore = g_pgSelfTests.load();
                 uint32_t xthread = 0;
                 try {
+                    t_hgRepairProof = true;
                     PhysGuardForeignTripForTest();
                     HeapGuardDisarmImpl();  // depth 2
                     HeapGuardDisarmImpl();
                     HeapGuardArmImpl();     // depth 1 -- stranded, repays the foreign trip
                     HeapGuardArmImpl();     // depth 0
+                    t_hgRepairProof = false;
                     g_pgSelfTest.store(true);
                     volatile uint32_t sink2 = 0;
                     sink2 = *reinterpret_cast<volatile uint32_t *>(g_pgPage);
@@ -748,6 +766,7 @@ namespace
                     g_pgSelfTest.store(false);
                     xthread = g_pgSelfTests.load() - stBefore;
                 } catch (...) {
+                    t_hgRepairProof = false;
                     // A thread that could not be created proves nothing; say 0 rather than guess, so a
                     // soak can tell "the repair is broken" from "the test could not run".
                     xthread = 0;
@@ -841,16 +860,31 @@ namespace
             (g_moduleBase != 0 && rip >= g_moduleBase) ? rip - g_moduleBase : rip;
         uint32_t glr = 0;
         if (const PPCContext* pc = GetPPCContext()) glr = (uint32_t)pc->lr;
-        const bool interesting = off < kHdrEnd || g_hgSelfTest.load();
-        if (interesting && g_hgLogged.fetch_add(1) < 48)
+        const bool isSelfTest = g_hgSelfTest.load();
+        if (isSelfTest) {
+            // Selftest trips (the deliberate first-arm liveness read) get their own bounded
+            // ERROR row with a distinct tag so they neither masquerade as real trips nor
+            // consume the real 48 budget. ERROR (not WARN) so the first occurrence stays
+            // visible at the default Error level (src/app.cpp:53-55). Tag keeps the
+            // "F374-HEAPGUARD" prefix and "SELFTEST trip=" so accept_check still counts it
+            // as a trip but excludes it from the real-trip count. Counters above and
+            // g_hgSelfTests below still increment unconditionally.
+            if (g_hgSelfTestLogged.fetch_add(1) < kHgSelfTestLogCap)
+                MCLA_LOG_ERROR("F374-HEAPGUARD SELFTEST trip={} off={:#X} want={} live={} selftest=true "
+                               "hostRIP=0x{:X} rva={:#X} guestLR={:08X} tid={} "
+                               "(cap={},hdr={},frag={})",
+                               n, off, wantWrite ? "W" : "R", wasLive, rip, rv,
+                               glr, GetCurrentThreadId(), g_hgCapTrips.load(), g_hgHdrTrips.load(),
+                               g_hgFragTrips.load());
+            g_hgSelfTests.fetch_add(1);
+        } else if (off < kHdrEnd && g_hgLogged.fetch_add(1) < 48) {
             MCLA_LOG_ERROR("F374-HEAPGUARD trip={} off={:#X} want={} live={} selftest={} "
                            "hostRIP=0x{:X} rva={:#X} guestLR={:08X} tid={} "
                            "(cap={},hdr={},frag={})",
-                           n, off, wantWrite ? "W" : "R", wasLive, g_hgSelfTest.load(), rip, rv,
+                           n, off, wantWrite ? "W" : "R", wasLive, isSelfTest, rip, rv,
                            glr, GetCurrentThreadId(), g_hgCapTrips.load(), g_hgHdrTrips.load(),
                            g_hgFragTrips.load());
-        if (g_hgSelfTest.load())
-            g_hgSelfTests.fetch_add(1);
+        }
         spdlog::default_logger()->flush();
         return true;
     }
@@ -888,16 +922,30 @@ namespace
         }
         PhysGuardArmImpl();  // F-388: the physical-heap guard shares this window
         g_hgArmedTripGen = g_hgTripGen.load(std::memory_order_relaxed);
-        if (stranded && g_hgRepairLog.fetch_add(1) == 0) {
-            // BootReportError, NOT MCLA_LOG_*: this TU holds __try and clang 19.1.7 ICEs instantiating
-            // spdlog/fmt here (boot_host.h:161). `depth` is the reason the arm could not happen the old
-            // way; a depth that never returns to 0 is a stuck thread and names itself in this one line.
-            char lbuf[224];
-            std::snprintf(lbuf, sizeof(lbuf),
-                          "F637-GUARDREPAIR depth=%d tripGen=%u armedGen=%u - page(s) re-armed "
-                          "OVER a still-open window; a thread has stranded g_hgDepth",
-                          (int)g_hgDepth, g_hgArmedTripGen, (unsigned)g_hgTripGen.load());
-            BootReportError(lbuf);
+        if (stranded) {
+            if (t_hgRepairProof) {
+                // Deliberate proof (PhysGuardArmImpl): own tag, own one-shot. Does NOT consume
+                // g_hgRepairLog, so a later genuine strand still logs at ERROR as GUARDREPAIR.
+                // Same ERROR path (BootReportError) so the proof stays visible at default level.
+                if (g_hgRepairProofLog.fetch_add(1) == 0) {
+                    char lbuf[224];
+                    std::snprintf(lbuf, sizeof(lbuf),
+                                  "F637-PROOF depth=%d tripGen=%u armedGen=%u - page(s) re-armed "
+                                  "OVER a still-open window (deliberate proof; GUARDREPAIR one-shot preserved)",
+                                  (int)g_hgDepth, g_hgArmedTripGen, (unsigned)g_hgTripGen.load());
+                    BootReportError(lbuf);
+                }
+            } else if (g_hgRepairLog.fetch_add(1) == 0) {
+                // BootReportError, NOT MCLA_LOG_*: this TU holds __try and clang 19.1.7 ICEs instantiating
+                // spdlog/fmt here (boot_host.h:161). `depth` is the reason the arm could not happen the old
+                // way; a depth that never returns to 0 is a stuck thread and names itself in this one line.
+                char lbuf[224];
+                std::snprintf(lbuf, sizeof(lbuf),
+                              "F637-GUARDREPAIR depth=%d tripGen=%u armedGen=%u - page(s) re-armed "
+                              "OVER a still-open window; a thread has stranded g_hgDepth",
+                              (int)g_hgDepth, g_hgArmedTripGen, (unsigned)g_hgTripGen.load());
+                BootReportError(lbuf);
+            }
         }
         // F-412: ~(uintptr_t)0 is PhysGuardArmImpl's "this guard is broken" marker. It sits AFTER
         // the two decrements, not at the very top: a top-of-function return would skip them and
@@ -1037,6 +1085,7 @@ namespace
     size_t InstallFunctionTable()
     {
         size_t inserted = 0;
+        PPCFunc* forceHost = nullptr;
         g_hostToGuest.clear();
         for (size_t i = 0; PPCFuncMappings[i].host != nullptr; i++)
         {
@@ -1045,21 +1094,16 @@ namespace
             InsertFunction(guest, host);
             g_hostToGuest.emplace((uintptr_t)host, guest);
             inserted++;
+            if (guest == 0x821A5CC0u) forceHost = host;
         }
-        // Runtime holes: 8C760 bctrls to vtable+88 = 0x821A5CC0 and AVs
-        // when the table slot is null. Force-map the no-op stub.
-        for (size_t i = 0; PPCFuncMappings[i].host != nullptr; i++)
+        if (forceHost != nullptr)
         {
-            if ((uint32_t)PPCFuncMappings[i].guest == 0x821A5CC0u)
-            {
-                InsertFunction(0x821A5CC0u, PPCFuncMappings[i].host);
-                char lbuf[128];
-                std::snprintf(lbuf, sizeof(lbuf),
-                              "[boot] force-map 821A5CC0 -> %p",
-                              (void*)PPCFuncMappings[i].host);
-                BootReportInfo(lbuf);
-                break;
-            }
+            InsertFunction(0x821A5CC0u, forceHost);
+            char lbuf[128];
+            std::snprintf(lbuf, sizeof(lbuf),
+                          "[boot] force-map 821A5CC0 -> %p",
+                          (void*)forceHost);
+            BootReportInfo(lbuf);
         }
         return inserted;
     }
@@ -1847,7 +1891,9 @@ static int F635CaptureFilter(EXCEPTION_POINTERS* ep, uintptr_t* outAddr,
         // a soak has the table's real bounds, the 15 decoded registrations and the
         // collision answer in the log next to whatever the entry point then does
         // with them. Log-only, no guest writes, no guest calls.
-        CensusCrtXcu();
+        if (std::getenv("MCLA_BOOT_CENSUS")) {
+            CensusCrtXcu();
+        }
 
         ReplayDeadMemoryDeviceCtor();
 
@@ -2340,6 +2386,93 @@ void BootWorker(uint32_t entryGuest)
         if (code == 0xC0000005L && (HeapGuardHandle(ExceptionInfo) ||
                                     PhysGuardHandle(ExceptionInfo))) {
             return EXCEPTION_CONTINUE_EXECUTION;
+        }
+
+        // F-908: integer-divide-by-zero skip (STATUS_INTEGER_DIVIDE_BY_ZERO).
+        // Measured: 10/10 div-zero crashes hit guest 0x82419818 (host+0x1A4), the
+        // second generated divwu whose divisor is the first div's quotient and is
+        // zero iff r29 > 49875000 (KeQueryPerformanceFrequency, imports.cpp:6233).
+        // Xenia's x64 backend skips the divide on zero divisor; its PPC frontend
+        // has it as TODO. So: decode REX? + F6/F7 /6(DIV) /7(IDIV) register-direct
+        // only, prove divisor==0 from ContextRecord, advance RIP. Anything else
+        // (memory forms, non-zero divisor e.g. IDIV overflow, outside mapped guest
+        // code) falls through to the existing handling below. New Rule-1b static:
+        // one function-static atomic counter s_divSkipN below, nothing else.
+        if (code == 0xC0000094L && ExceptionInfo->ContextRecord) {
+            const uint8_t* ip = (const uint8_t*)pc;
+            size_t adv = 0;
+            uint8_t rex = 0;
+            bool hasRex = false, op16 = false;
+            if (ip[0] >= 0x40 && ip[0] <= 0x4F) { rex = ip[0]; hasRex = true; adv = 1; }
+            if (ip[adv] == 0x66) { op16 = true; adv += 1; }
+            const uint8_t op = ip[adv];
+            if ((op == 0xF6 || op == 0xF7)) {
+                const uint8_t modrm = ip[adv + 1];
+                const unsigned mod = (modrm >> 6) & 3u;
+                const unsigned reg = (modrm >> 3) & 7u;
+                if ((reg == 6u || reg == 7u) && mod == 3u) {
+                    const CONTEXT* c = ExceptionInfo->ContextRecord;
+                    const uint64_t regs[16] = { c->Rax, c->Rcx, c->Rdx, c->Rbx,
+                        c->Rsp, c->Rbp, c->Rsi, c->Rdi,
+                        c->R8, c->R9, c->R10, c->R11,
+                        c->R12, c->R13, c->R14, c->R15 };
+                    bool isZero = false;
+                    unsigned rm = modrm & 7u;
+                    if (op == 0xF7) {
+                        if (hasRex && (rex & 1)) rm += 8;
+                        uint64_t v = regs[rm];
+                        if (op16) v &= 0xFFFFu;
+                        else if (!(hasRex && (rex & 0x08))) v &= 0xFFFFFFFFu;
+                        isZero = (v == 0);
+                    } else {
+                        uint64_t b = 0;
+                        if (!hasRex) {
+                            switch (rm) {
+                                case 0: b = c->Rax & 0xFFu; break;
+                                case 1: b = c->Rcx & 0xFFu; break;
+                                case 2: b = c->Rdx & 0xFFu; break;
+                                case 3: b = c->Rbx & 0xFFu; break;
+                                case 4: b = (c->Rax >> 8) & 0xFFu; break;
+                                case 5: b = (c->Rcx >> 8) & 0xFFu; break;
+                                case 6: b = (c->Rdx >> 8) & 0xFFu; break;
+                                default: b = (c->Rbx >> 8) & 0xFFu; break;
+                            }
+                        } else {
+                            if (rex & 1) rm += 8;
+                            b = regs[rm] & 0xFFu;
+                        }
+                        isZero = (b == 0);
+                    }
+                    if (isZero) {
+                        DWORD64 imageBase = 0;
+                        const PRUNTIME_FUNCTION rf =
+                            RtlLookupFunctionEntry((DWORD64)pc, &imageBase, nullptr);
+                        bool mapped = false;
+                        if (rf != nullptr) {
+                            const uintptr_t start = (uintptr_t)(imageBase + rf->BeginAddress);
+                            for (size_t mi = 0; PPCFuncMappings[mi].host != nullptr; ++mi) {
+                                if ((uintptr_t)PPCFuncMappings[mi].host == start) { mapped = true; break; }
+                            }
+                        }
+                        if (mapped) {
+                            static std::atomic<uint32_t> s_divSkipN{0};
+                            const uint32_t n =
+                                s_divSkipN.fetch_add(1, std::memory_order_relaxed);
+                            const unsigned ilen = (unsigned)(adv + 2);
+                            if (n < 8) {
+                                MCLA_LOG_WARN("DIV0-SKIP #{} owner={} {} {}div r/m={} ilen={} "
+                                              "-- zero divisor, skipping (Xenia x64 shape)",
+                                              n, GuestFnAtHostAddr(pc),
+                                              op == 0xF7 ? "F7" : "F6",
+                                              reg == 6u ? "" : "i", rm, ilen);
+                                spdlog::default_logger()->flush();
+                            }
+                            ExceptionInfo->ContextRecord->Rip = (DWORD64)(pc + ilen);
+                            return EXCEPTION_CONTINUE_EXECUTION;
+                        }
+                    }
+                }
+            }
         }
 
         // W0 flood cap: full dump only for the first few exceptions. Later
@@ -2856,6 +2989,50 @@ void BootWorker(uint32_t entryGuest)
                            (PVOID)c->R10, (PVOID)c->R11, (PVOID)c->Rsp);
         }
 
+        if (code == 0xE06D7363) {
+            const char* typeName = "unknown";
+            __try {
+                if (ExceptionInfo->ExceptionRecord &&
+                    ExceptionInfo->ExceptionRecord->NumberParameters >= 3) {
+                    const ULONG_PTR* params = ExceptionInfo->ExceptionRecord->ExceptionInformation;
+                    const uintptr_t imageBase = (ExceptionInfo->ExceptionRecord->NumberParameters >= 4) ? params[3] : 0;
+                    struct ThrowInfo_t {
+                        uint32_t attributes;
+                        int32_t pmfnUnwind;
+                        int32_t pForwardCompat;
+                        int32_t pCatchableTypeArray;
+                    };
+                    struct CatchableTypeArray_t {
+                        int nCatchableTypes;
+                        int arrayOfCatchableTypes[1];
+                    };
+                    struct CatchableType_t {
+                        uint32_t properties;
+                        int32_t pType;
+                    };
+                    struct TypeDescriptor_t {
+                        const void* pVFTable;
+                        void* spare;
+                        char name[1];
+                    };
+                    const auto* ti = reinterpret_cast<const ThrowInfo_t*>(params[2]);
+                    if (ti && imageBase && ti->pCatchableTypeArray) {
+                        const auto* cta = reinterpret_cast<const CatchableTypeArray_t*>(imageBase + ti->pCatchableTypeArray);
+                        if (cta && cta->nCatchableTypes > 0 && cta->arrayOfCatchableTypes[0]) {
+                            const auto* ct = reinterpret_cast<const CatchableType_t*>(imageBase + cta->arrayOfCatchableTypes[0]);
+                            if (ct && ct->pType) {
+                                const auto* td = reinterpret_cast<const TypeDescriptor_t*>(imageBase + ct->pType);
+                                typeName = td->name;
+                            }
+                        }
+                    }
+                }
+            } __except (EXCEPTION_EXECUTE_HANDLER) {
+                typeName = "read-fault";
+            }
+            MCLA_LOG_ERROR("STEP6 C++ Exception 0xE06D7363 type={} thread={}", typeName, GetCurrentThreadId());
+        }
+
         // resolve host symbols from the PDB so crashes name themselves
         if (code == 0xC0000005 || code == 0x80000003 || code == 0xE06D7363)
         {
@@ -2978,6 +3155,12 @@ void BootWorker(uint32_t entryGuest)
         // the atArray allocator chain triggers when the TLS chain is broken.
         if (code == 0xC0000005 || code == 0xC000001D || code == 0xC000012A ||
             code == 0xC000008E) {
+            if (t_inSafeExcept) {
+                MCLA_LOG_WARN("VEH SEHPASS: tid={} code=0x{:08X} inside guarded host block -- continuing search",
+                              GetCurrentThreadId(), code);
+                spdlog::default_logger()->flush();
+                return EXCEPTION_CONTINUE_SEARCH;
+            }
             // F-412: never park the PARK-SAMPLE sampler. It is registered as a process-wide VEH
             // (AddVectoredExceptionHandler at BootWorker), so an AV on ANY thread reaches this
             // branch before any __try/__except can run -- ParkUnwindCapture's EXCEPTION_EXECUTE_HANDLER
@@ -3557,7 +3740,9 @@ bool LoadAndPrepare(const std::string& xexPath, uint32_t& entryGuest)
         }
     }
     DumpImageRegion(0x827EB900u, 32);
-    mcla::trace::ScanForDispatchVtableWords((uint32_t)image.base, image.size);
+    if (std::getenv("MCLA_SCAN_VTABLE")) {
+        mcla::trace::ScanForDispatchVtableWords((uint32_t)image.base, image.size);
+    }
     const size_t mapped = InstallFunctionTable();
     {
         char lbuf[256];
@@ -3608,7 +3793,7 @@ void Start(uint32_t entryGuest)
     // its host RIP + top stack return addresses resolved to guest VAs.
     // Evidence for boot-progression blockers (ring put frozen post-init,
     // 2026-08-23). Capture-only; runs 600 x 500 ms = 5 min or until boot completes.
-    if (workerHandle != nullptr)
+    if (workerHandle != nullptr && std::getenv("MCLA_PARK_SAMPLE"))
     {
         std::thread([workerHandle]() {
             s_parkSamplerTid = GetCurrentThreadId();  // F-412: named so the VEH never parks us

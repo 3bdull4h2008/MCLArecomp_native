@@ -28,35 +28,38 @@ struct TranslatedShader {
     std::vector<uint8_t> dxil;     // compiled DXIL (empty unless compiled)
     bool dxilOk = false;
     std::string error;             // last translation/compile error
+
+    // Pre-compiled cache coverage for this container (see
+    // renderer/precompiled_shaders.h and docs/SHADER_TRANSLATION_PLAN.md).
+    // `precompiledAvailable` says a DXIL blob produced at setup time exists for
+    // exactly this container. It is a CENSUS, not yet a substitution: the blob
+    // targets shader_common.h's resource model (t0/space0..2, s0/space3,
+    // b0..b2/space4), which the current backend root signature does not match.
+    uint64_t precompiledCacheHash = 0;
+    bool precompiledAvailable = false;
+    uint32_t precompiledDxilSize = 0;
+    uint32_t precompiledSpecConstantsMask = 0;
+
     uint64_t instructionCount = 0; // decoded instructions processed
     uint64_t unknownOpcodeCount = 0;   // instructions with no decoder table entry
     uint64_t unsupportedOpcodeCount = 0; // instructions with no lowering (never dropped)
 
     // Did this translation's vertex epilogue actually carry the clip_disable
-    // rescale? FALSE means it was emitted as the IDENTITY because no viewport
-    // extent had been published yet, i.e. SetClipDisableViewportExtent had not
-    // been called when this program was translated.
+    // rescale? FALSE means either this draw did not request the rescale or no
+    // viewport extent had been published yet.
     //
     // It is set from what AppendEpilogue DID, not from a re-read of the global,
     // so it cannot disagree with the HLSL in `hlsl`. Only meaningful when
     // `isVertex` is true: a pixel program writes no position and nothing is
     // withheld, so it reads true.
     //
-    // WHY IT IS HERE. The identity is a defensible choice -- it asserts no
-    // number nobody measured -- but it is UNDETECTABLE from the outside: the
-    // only trace was a comment inside the generated HLSL, which no caller reads
-    // and no census counts. A caller that keys a pipeline on this HLSL would
-    // cache a geometry-less vertex program with nothing to show for it. This
-    // field is the seam that lets the owner of the call ORDER see it.
+    // A false value can mean the draw did not request the transform, or that a
+    // requested transform had no published viewport extent. In the latter case
+    // the epilogue emits identity; in the former it emits no transform. This
+    // field records what the generated HLSL actually contains.
     //
-    // MEASURED (build/w707.log, 2026-10-04): the one extent publication in that
-    // soak, d3d12_backend.cpp:3157 inside the first draw, happened at 06:57:37.295
-    // -- AFTER that draw's vertex program was translated at 06:57:37.262
-    // (timestamped by the unwritten-register row this very call emits two lines
-    // above AppendEpilogue, shader_translator.cpp:586). So the first draw's
-    // program carries this field false and the second draw's carries it true,
-    // and the two are byte-identical guest programs as far as AppendEpilogue is
-    // concerned. Ordering harness: %TEMP%\opencode\clipgate\run1.txt.
+    // The per-draw request comes from the same decoded PA_CL_CLIP_CNTL and
+    // PA_CL_VTE_CNTL snapshot used to derive the pipeline state.
     bool clipRescaleBaked = true;
 };
 
@@ -75,10 +78,13 @@ bool ParseShaderContainer(const uint8_t* data, size_t size,
 bool HashShaderContainer(const uint8_t* data, size_t size, bool& isVertex, uint64_t& programHash);
 
 // Runtime translation contract. The heavy half (HLSL/DXIL generation) is
-// provided by the offline translation tool today. Returns true if the container
-// parsed successfully; `out.dxilOk` reports whether a compiled blob was produced.
+// provided by the offline translation tool today. The caller supplies the
+// per-draw clip_disable rescale decision; this wrapper has no register snapshot
+// from which to infer it. Returns true if the container parsed successfully;
+// `out.dxilOk` reports whether a compiled blob was produced.
 bool TranslateShader(const uint8_t* container, size_t size,
-                     std::string_view commonHeader, TranslatedShader& out);
+                     std::string_view commonHeader, TranslatedShader& out,
+                     bool applyClipDisableRescale);
 
 // Reflected vertex input for pipeline input-layout creation: the exact
 // (usage, usageIndex) pair the generated VS entry signature consumes, plus the
@@ -168,6 +174,7 @@ struct PixelShaderPairing {
 bool TranslateShaderPinned(const uint8_t* container, size_t size,
                           const VertexInputSemantic* layout, size_t layoutCount,
                           TranslatedShader& out, std::string& error,
+                          bool applyClipDisableRescale,
                           const PixelShaderPairing* pairing = nullptr);
 
 // Publishes the render-target extent (in pixels) that the vertex-shader
@@ -208,10 +215,9 @@ struct ClipDisableRescaleConstants {
 // reset) when no extent has been accepted yet.
 bool QueryClipDisableRescale(ClipDisableRescaleConstants* out);
 
-// One-shot note explaining that the rescale's GATE (whether a given draw has
-// clip_disable set with the vport enables clear) is a MEASURED constant rather
-// than a per-draw register read, and citing where it was measured. Logged once
-// per process by the backend. Names no tracked marker on purpose.
+// One-shot note explaining the per-draw rescale gate, decoded from the same
+// register snapshot used to derive the pipeline state. Logged once per process
+// by the backend. Names no tracked marker on purpose.
 extern const char* const kClipDisableRescaleGateNote;
 
 // Vertex inputs the VS entry signature must declare, resolved exactly the way

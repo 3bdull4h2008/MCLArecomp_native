@@ -61,6 +61,8 @@ public:
 
     // Allocate/free within guest heap (for kernel objects, etc.)
     uint32_t Alloc(size_t size, size_t alignment = 16);
+    uint32_t AllocHostBody(size_t size);
+    void FreeHostBody(uint32_t guestAddr, size_t size = 0);
     void Free(uint32_t guestAddr, size_t size);
 
     // --- Guest-virtual region tracking (NtAllocateVirtualMemory honesty) ---
@@ -131,6 +133,7 @@ private:
     mutable std::mutex m_virtualMutex;
     std::vector<VirtualRegion> m_virtualRegions; // sorted by base, disjoint
 
+public:
     static uint16_t Swap16(uint16_t val) { return ((val & 0xFF) << 8) | ((val >> 8) & 0xFF); }
     static uint32_t Swap32(uint32_t val) { return ((val & 0xFF) << 24) | ((val & 0xFF00) << 8) | ((val >> 8) & 0xFF00) | ((val >> 24) & 0xFF); }
     static uint64_t Swap64(uint64_t val) {

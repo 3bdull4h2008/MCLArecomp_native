@@ -2165,6 +2165,38 @@ namespace
     }
 } // namespace
 
+// TEMP-BINWALK (diagnostic only): after a user-heap null return, walk each non-empty bin head and
+// print the fragment header words, so the corrupted fragment (and who owns its address) is named.
+// FragmentHeader{next@0,prev@8,size@16,used@24}, then next_free@32, prev_free@40 (o1heap.c).
+namespace
+{
+    struct TempFragRead { bool ok; uint64_t w[6]; };
+    static TempFragRead TempReadFrag(const void *p)
+    {
+        TempFragRead r{};
+        __try { const uint64_t *q = static_cast<const uint64_t *>(p); for (int i = 0; i < 6; ++i) r.w[i] = q[i]; r.ok = true; }
+        __except (EXCEPTION_EXECUTE_HANDLER) { r.ok = false; }
+        return r;
+    }
+    static void TempUserBinWalk(O1HeapInstance *h, size_t cap)
+    {
+        if (h == nullptr) return;
+        const uint8_t *inst = reinterpret_cast<const uint8_t *>(h);
+        const uint64_t mask = O1BinMask(h);
+        MCLA_LOG_ERROR("TEMP-BINWALK inst={:p} arena={:p} cap={:#x} mask={:#x}", (const void *)inst, (void *)g_hdrArena, (uint64_t)cap, mask);
+        for (int i = 0; i < 64; ++i)
+        {
+            const uint64_t head = *reinterpret_cast<const uint64_t *>(inst + i * 8);
+            if (head == 0 && !((mask >> i) & 1)) continue;
+            const TempFragRead f = TempReadFrag(reinterpret_cast<const void *>(head));
+            const bool inArena = head >= (uint64_t)(uintptr_t)g_hdrArena && head < (uint64_t)(uintptr_t)g_hdrArena + cap;
+            MCLA_LOG_ERROR("TEMP-BINWALK bin={} maskbit={} head={:#x} inArena={} readable={} next={:#x} prev={:#x} size={:#x} used={:#x} nfree={:#x} pfree={:#x} guestOff={:#x}",
+                           i, (unsigned)((mask >> i) & 1), head, inArena, f.ok, f.w[0], f.w[1], f.w[2], f.w[3], f.w[4], f.w[5],
+                           (uint64_t)(head - (uint64_t)(uintptr_t)g_hdrArena));
+        }
+    }
+}
+
 // ---- leak census (READ-ONLY) ----------------------------------------------------------------
 // WHY: `__xtl_free` (src/kernel/imports.cpp:61) is a deliberate no-op that returns 1, so EVERY
 // guest XTL allocation is un-reclaimable and the physical arena can only grow. `w654` (2026-09-28
@@ -3196,6 +3228,7 @@ void* Heap::Alloc(size_t size)
                            n, size, d.capacity, d.allocated, d.peak_allocated,
                            static_cast<unsigned long long>(d.oom_count),
                            CallerRva(_ReturnAddress()));
+            TempUserBinWalk(heap, d.capacity); // TEMP-BINWALK probe
         }
     }
     // HEAPLEAK: the USER arena's share of the census, recorded on both outcomes so a refusal is
@@ -3378,7 +3411,30 @@ void* Heap::AllocPhysical(size_t size, size_t alignment)
         int badSlot = -1;
         uintptr_t badVal = 0;
         uintptr_t bins[64] = {};
-        std::memcpy(bins, (const void *)physArenaBase, sizeof(bins));
+        // F-779 CORRECTION, and the same stale-layout class as F-806 (boot_host.cpp:691/911): read
+        // the bin heads from the INSTANCE, not from the arena base. This block was written against
+        // F-375's attached layout, where `o1heapInit` placed the instance (and therefore `bins[]` at
+        // +0) at the arena base. F-779 detached both instances -- `o1heapInitSeparate`
+        // (heap.cpp:2829-2831; o1heap.c:377/400) puts the instance in its own VirtualAlloc block and
+        // the ROOT FRAGMENT at the arena base -- so since then these 512 bytes are that fragment's
+        // header plus payload, and `bins[2]` is `Fragment::header.size` at +16.
+        //
+        // MEASURED in build/w12.log, three relations that only this reading explains: `#1
+        // value=20000000` (:13) is the pool capacity itself (the same log's `PHYS-VERDICT-CHANGE
+        // capacity=0x20000000`, :35, and a detached instance subtracts no 0x240); `#2..#4
+        // value=2E85000` (:17-19) is the split the first allocation made at the front of the arena;
+        // and `2E85000 + 1D17B000` -- the offset and size of the free fragment on the same log's
+        // `PHYS-BINPROBE #0`, :14 -- is exactly `20000000`. That BINPROBE row also prints the
+        // fragment's `prev=1A0400000`, which is the arena base with no +0x240 offset: an attached
+        // layout cannot produce that adjacent link. So all four rows were the root fragment's size
+        // field being reported as a corrupt bin head.
+        //
+        // `physicalHeap` is non-null above and is the instance pointer in BOTH layouts
+        // (`o1heapInitSeparate` returns `instanceMem`, `o1heapInit` returns `base`), so if the
+        // VirtualAlloc ever fails and the attached fallback is taken this reads the same bytes the
+        // old code did. The old read also spent the `s_binBad <= 4` print budget on allocation 1 of
+        // every boot, so a genuinely poisoned bin head later in a run could never be printed.
+        std::memcpy(bins, (const void *)physicalHeap, sizeof(bins));
         for (int i = 0; i < 64; ++i)
         {
             const uintptr_t v = bins[i];

@@ -544,8 +544,37 @@ class Decoder {
 // --- UI .xsf driver: ONE rule, the container's FRAME CHAIN. On success `out`
 //     holds exactly uncLen bytes with head "DIU\0" and the return value is 2
 //     ("walk" -- the frame chain). 0 means "not a decodable UI container". ---
+// `require_diu` (2026-10-31) selects the ADMISSIBILITY RULE for the decode's
+// payload, not the decode itself. "DIU\0" is a property of the UI .xsf class
+// (five of five retail members measured, see the note below). It is NOT a
+// property of an RSC5 container: a non-UI resource (.xrsc/.xtp/.xwt/.xlp/.xov/
+// .xtl/.xct/.xrn) decompresses to that resource's own structure, whose head is
+// a RAGE resource word, never "DIU\0".
+//
+// MEASURED 2026-10-31 with this decoder driven over the retail archive
+// (build/game_data/xarchive_cache.rpf, tools/xmem_decode.py's chain walk):
+//   off        unc      frames used  produced  complete  decoded head
+//   63871000   50,349   7/2         50,349    yes       84 c8 56 00 50 00 00 40
+//   6387E000      425   1/1            425    yes       bc c6 56 00 50 00 00 50
+//   630D3000    2,339   13/1         2,339    yes       9c c6 56 00 50 00 00 10
+//   64580000  238,895   25/8       238,895    yes       9c c6 56 00 50 00 00 10
+//   62A3F000   46,531   9/2         46,531    yes       64 c6 56 00 50 00 00 30
+//   0035A000   10,799   3/1         10,799    yes       cc b4 47 00 50 00 5d 00
+// Every one reproduced its container's own declared length EXACTLY and returned
+// a head whose second dword is a 0x5000xxxx address-table entry -- i.e. the
+// chain did not merely "fill" the request, it decoded a consistent structure.
+// Before this parameter existed the DIU test discarded all six (the decode
+// result was thrown away and `out` stayed empty, which is why
+// RSC5-XMEM-DECODE-FAIL rows print decoded=0: that field is out.size(), and
+// `out` is only swapped on acceptance).
+//
+// Callers that know their member's class pass require_diu=false for the
+// non-UI classes; gpu_device.cpp then admits the body on the container's own
+// declared length (proof term (3)), which is the same rule term (3) already
+// applied to the UI class.
 inline int host_decode_ui_xsf(const uint8_t* pkg, size_t pkg_len,
-                              std::vector<uint8_t>& out, int window_bits = 17) {
+                              std::vector<uint8_t>& out, int window_bits = 17,
+                              bool require_diu = true) {
   if (pkg_len < 24) return 0;
   auto be32 = [&](size_t i) -> uint32_t {
     return ((uint32_t)pkg[i] << 24) | ((uint32_t)pkg[i + 1] << 16) |
@@ -645,7 +674,16 @@ inline int host_decode_ui_xsf(const uint8_t* pkg, size_t pkg_len,
     }
     if (is_diu(o)) {
       out.swap(o);
-      return 2;  // walk (the frame chain) -- the only path left
+      return 2;  // walk (the frame chain), UI payload
+    }
+    // 2026-10-31: NON-UI RSC5 member. The decode reproduced the container's
+    // declared length; the head is the resource's own structure, not "DIU\0".
+    // Admissibility rests on the length the container declares for ITSELF
+    // (gpu_device.cpp proof term (3)) -- the same two-independent-sources rule
+    // the UI class uses, minus a head test that only the UI class can satisfy.
+    if (!require_diu) {
+      out.swap(o);
+      return 3;  // walk, non-UI payload accepted on declared length
     }
   }
   return 0;

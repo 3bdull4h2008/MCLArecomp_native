@@ -4184,6 +4184,7 @@ PPC_FUNC_IMPL(__imp__sub_821C22D0);
 
 
 static std::atomic<uint32_t> s_genFree{0};
+static void MclaArenaNoteFree(uint32_t ptr);  // TEMP-M1 fwd: simple-free ledger.
 
 
 
@@ -4194,7 +4195,7 @@ static std::atomic<uint32_t> s_genFree{0};
 PPC_FUNC(sub_821C22D0) {
 
 
-
+ 
 
 
 
@@ -4208,6 +4209,7 @@ PPC_FUNC(sub_821C22D0) {
 
 
   const uint32_t ptr = ctx.r4.u32;
+  MclaArenaNoteFree(ptr);  // TEMP-M1: direct simple-free bypasses 821C09C8.
 
 
 
@@ -4463,6 +4465,7 @@ PPC_FUNC(sub_821C1BB0) {
 
 
 
+      { void MclaArenaDumpTop(); MclaArenaDumpTop(); }
       MCLA_LOG_ERROR("ARENA-OOM: sub_821C1BB0 failed size={} align={} heap={:08X} "
 
 
@@ -12502,6 +12505,178 @@ std::atomic<uint32_t> s_routerCensus{0};
 
 
 
+// TEMP-M1: long-term live-bytes ledger for the XTL title allocator (bank 0x82830B18).
+// The bank's r6==0 slot is the simple heap at 0x82830CD8 (src/kernel/imports.cpp:322-333,
+// F-931: cap 48,758,768, [heap+76]=capacity, [+84]=carved, [+152]=free with
+// carved+free==capacity). The alloc side is noted at sub_821C08F8 exit in
+// src/gpu_device.cpp:28688 (TEMP-M1, r6==0 only) and the free side at
+// sub_821C09C8 entry below plus the simple free itself sub_821C22D0 (same TU).
+// A 20+ minute soak cannot be read from an OOM-only dump: M1b (239 s) is the
+// only run that ever printed TEMP-M1-TOP, and M1d/M1e (400 s, ARENA-OOM 0)
+// printed none. So this ledger keeps (a) requested-size totals, (b) per-LR
+// alloc/free/live so churn (measured consumers) separates from monotonic
+// growth (leaks), (c) per-block birth time so aged blocks separate from a
+// young working set, and (d) a periodic guest-heap reconciliation
+// (ledger live vs carved/free) so ledger bias (missed frees, ptr reuse) is
+// not mistaken for a guest leak. All sinks are log-only census; no guest
+// state is written here.
+static std::mutex g_m1Mtx;
+struct M1LiveEntry {
+  uint32_t lr = 0;
+  uint32_t size = 0;
+  int64_t born_ms = 0;
+};
+static std::unordered_map<uint32_t, M1LiveEntry> g_m1Live;  // ptr -> (lr, size, born)
+struct M1LrAgg {
+  uint64_t alloc_bytes = 0, free_bytes = 0, live_bytes = 0;
+  uint64_t alloc_count = 0, free_count = 0, live_count = 0;
+};
+static std::unordered_map<uint32_t, M1LrAgg> g_m1ByLr;  // lr -> cumulative + live
+static std::atomic<uint64_t> g_m1Allocs{0}, g_m1Frees{0};
+static std::atomic<uint64_t> g_m1AllocReqBytes{0}, g_m1FreeReqBytes{0};
+static std::atomic<uint64_t> g_m1Reuse{0}, g_m1UnmatchedFree{0};
+static std::atomic<uint64_t> g_m1Events{0}, g_m1SnapSeq{0};
+static std::atomic<int64_t> g_m1LastSnapMs{0};
+static int64_t M1NowMs() {
+  return std::chrono::duration_cast<std::chrono::milliseconds>(
+             std::chrono::steady_clock::now().time_since_epoch())
+      .count();
+}
+static bool M1ReadHeapAccounting(uint32_t &cap, uint32_t &carved, uint32_t &freebytes) {
+  constexpr uint32_t kSimpleHeap = 0x82830CD8u;  // bank+4, F-931 / imports.cpp:322.
+  auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
+  cap = carved = freebytes = 0;
+  const bool ok = mem.ReadU32BE(kSimpleHeap + 76, &cap) &&
+                  mem.ReadU32BE(kSimpleHeap + 84, &carved) &&
+                  mem.ReadU32BE(kSimpleHeap + 152, &freebytes);
+  return ok;
+}
+static void M1Snapshot(const char *reason) {
+  const int64_t now_ms = M1NowMs();
+  uint64_t live_total = 0, live_blocks = 0, aged60_blocks = 0, aged60_bytes = 0;
+  int64_t oldest_ms = 0, max_age_ms = 0;
+  std::unordered_map<uint32_t, M1LrAgg> byLr;
+  std::unordered_map<uint32_t, uint64_t> agedByLr;
+  {
+    std::lock_guard<std::mutex> lk(g_m1Mtx);
+    byLr = g_m1ByLr;
+    live_blocks = (uint64_t)g_m1Live.size();
+    for (const auto &kv : g_m1Live) {
+      live_total += kv.second.size;
+      const int64_t age = now_ms - kv.second.born_ms;
+      if (oldest_ms == 0 || kv.second.born_ms < oldest_ms) oldest_ms = kv.second.born_ms;
+      if (age > max_age_ms) max_age_ms = age;
+      if (age >= 60000) {
+        ++aged60_blocks;
+        aged60_bytes += kv.second.size;
+        agedByLr[kv.second.lr] += kv.second.size;
+      }
+    }
+  }
+  uint32_t cap = 0, carved = 0, freebytes = 0;
+  const bool heap_ok = M1ReadHeapAccounting(cap, carved, freebytes);
+  const int64_t carved_minus_free = heap_ok ? (int64_t)carved - (int64_t)freebytes : 0;
+  const int64_t ledger_minus_carved = heap_ok ? (int64_t)live_total - (int64_t)carved : 0;
+  const int64_t ledger_minus_carvedfree =
+      heap_ok ? (int64_t)live_total - carved_minus_free : 0;
+  const bool invariant = heap_ok && ((uint64_t)carved + (uint64_t)freebytes == (uint64_t)cap);
+  const uint64_t snap_n = g_m1SnapSeq.fetch_add(1) + 1;
+  MCLA_LOG_WARN(
+      "TEMP-M1-SNAPSHOT #{} reason={} live_total={} live_blocks={} callers={} "
+      "allocs={} frees={} alloc_req={} free_req={} reuse={} unmatched_free={} "
+      "heap_cap={} heap_carved={} heap_free={} heap_ok={} invariant={} "
+      "carved_minus_free={} ledger_minus_carved={} ledger_minus_carvedfree={} "
+      "aged60_blocks={} aged60_bytes={} max_age_ms={}",
+      snap_n, reason, live_total, live_blocks, byLr.size(),
+      g_m1Allocs.load(std::memory_order_relaxed),
+      g_m1Frees.load(std::memory_order_relaxed),
+      g_m1AllocReqBytes.load(std::memory_order_relaxed),
+      g_m1FreeReqBytes.load(std::memory_order_relaxed), g_m1Reuse.load(std::memory_order_relaxed),
+      g_m1UnmatchedFree.load(std::memory_order_relaxed), cap, carved, freebytes,
+      heap_ok ? 1 : 0, invariant ? 1 : 0, carved_minus_free, ledger_minus_carved,
+      ledger_minus_carvedfree, aged60_blocks, aged60_bytes, max_age_ms);
+  std::vector<std::pair<uint32_t, M1LrAgg>> v(byLr.begin(), byLr.end());
+  std::sort(v.begin(), v.end(),
+            [](const auto &a, const auto &b) { return a.second.live_bytes > b.second.live_bytes; });
+  for (size_t i = 0; i < v.size() && i < 20; ++i)
+    MCLA_LOG_WARN(
+        "TEMP-M1-TOP #{} lr={:08X} bytes={} count={} live_bytes={} live_count={} "
+        "alloc_bytes={} free_bytes={} alloc_count={} free_count={}",
+        i + 1, v[i].first, v[i].second.live_bytes, v[i].second.live_count,
+        v[i].second.live_bytes, v[i].second.live_count, v[i].second.alloc_bytes,
+        v[i].second.free_bytes, v[i].second.alloc_count, v[i].second.free_count);
+  if (!agedByLr.empty()) {
+    std::vector<std::pair<uint32_t, uint64_t>> av(agedByLr.begin(), agedByLr.end());
+    std::sort(av.begin(), av.end(),
+              [](const auto &a, const auto &b) { return a.second > b.second; });
+    if (!av.empty() && av[0].second >= (1u << 20))
+      MCLA_LOG_WARN("TEMP-M1-LEAK lr={:08X} aged60_bytes={} aged60_blocks={} live_total={}",
+                    av[0].first, av[0].second, aged60_blocks, live_total);
+  }
+}
+static void M1MaybeSnapshot() {
+  const uint64_t e = g_m1Events.fetch_add(1, std::memory_order_relaxed) + 1;
+  if (e % 2000u != 0) return;
+  const int64_t now = M1NowMs();
+  int64_t last = g_m1LastSnapMs.load(std::memory_order_relaxed);
+  if (last == 0) {
+    g_m1LastSnapMs.store(now, std::memory_order_relaxed);
+    return;
+  }
+  if (now - last < 30000) return;
+  if (!g_m1LastSnapMs.compare_exchange_strong(last, now)) return;
+  M1Snapshot("periodic");
+}
+void MclaArenaNoteAlloc(uint32_t ptr, uint32_t lr, uint32_t size) {
+  if (!ptr) return;
+  {
+    std::lock_guard<std::mutex> lk(g_m1Mtx);
+    auto it = g_m1Live.find(ptr);
+    if (it != g_m1Live.end()) {
+      ++g_m1Reuse;
+      auto &old = g_m1ByLr[it->second.lr];
+      if (old.live_bytes >= it->second.size) old.live_bytes -= it->second.size;
+      if (old.live_count) --old.live_count;
+      it->second = {lr, size, M1NowMs()};
+    } else {
+      g_m1Live.emplace(ptr, M1LiveEntry{lr, size, M1NowMs()});
+    }
+    auto &a = g_m1ByLr[lr];
+    a.alloc_bytes += size;
+    ++a.alloc_count;
+    a.live_bytes += size;
+    ++a.live_count;
+    ++g_m1Allocs;
+    g_m1AllocReqBytes += size;
+  }
+  M1MaybeSnapshot();
+}
+static void MclaArenaNoteFree(uint32_t ptr) {
+  if (!ptr) return;
+  {
+    std::lock_guard<std::mutex> lk(g_m1Mtx);
+    auto it = g_m1Live.find(ptr);
+    ++g_m1Frees;
+    if (it == g_m1Live.end()) {
+      ++g_m1UnmatchedFree;
+    } else {
+      auto &a = g_m1ByLr[it->second.lr];
+      a.free_bytes += it->second.size;
+      ++a.free_count;
+      if (a.live_bytes >= it->second.size) a.live_bytes -= it->second.size;
+      if (a.live_count) --a.live_count;
+      g_m1FreeReqBytes += it->second.size;
+      g_m1Live.erase(it);
+    }
+  }
+  M1MaybeSnapshot();
+}
+void MclaArenaDumpTop() {
+  // OOM path (sub_821C1BB0 failure, below): repeatable, unlike the old
+  // once-only flag, so a second OOM in a 20+ min soak is still attributed.
+  // Periodic snapshots above cover the no-OOM case.
+  M1Snapshot("oom");
+}
 PPC_FUNC_IMPL(__imp__sub_821C09C8);
 
 
@@ -12511,6 +12686,7 @@ PPC_FUNC_IMPL(__imp__sub_821C09C8);
 
 
 PPC_FUNC(sub_821C09C8) {
+  MclaArenaNoteFree(ctx.r4.u32);  // TEMP-M1
 
 
 

@@ -135,6 +135,13 @@ PPC_FUNC_IMPL(gpu_MmioWriteHook) {
                     static_cast<uint32_t>(ctx.lr));
     }
 
+    // F-910 probe REMOVED 2026-10-28: placed in this dispatcher hook, but the
+    // guest reaches sub_824238E0 through 10 DIRECT bl sites (ppc_xrefs calls),
+    // never through the dispatcher slot, so this hook fired 0 times in the
+    // full 20-min ga034 -- a second F-057(6)-class dead-row trap. The live
+    // probe is F910-RING in the GFX-2D-BEGIN hook (src/gpu_device.cpp), which
+    // replicates this thunk's table[idx] load and samples [r31+0/8/48/52].
+
     if (g_hooks.onGpuKick)
         g_hooks.onGpuKick(ctx);
 

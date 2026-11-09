@@ -156,6 +156,9 @@ find_path(DXC_INCLUDE_DIR dxc/dxcapi.h PATHS "${CMAKE_CURRENT_SOURCE_DIR}/third_
 set(XENOS_RECOMP_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/.research/XenosRecomp/XenosRecomp")
 set(XENOS_RECOMP_THIRDPARTY_DIR "${CMAKE_CURRENT_SOURCE_DIR}/.research/XenosRecomp/thirdparty")
 
+# Vendored zstd is left untouched. The shared target is unnecessary for the
+# emulator (it links libzstd_static), so do not require it in the default build.
+set(ZSTD_BUILD_SHARED OFF CACHE BOOL "Build zstd shared library" FORCE)
 add_subdirectory(${XENOS_RECOMP_THIRDPARTY_DIR}/zstd/build/cmake zstd_build)
 add_subdirectory(${XENOS_RECOMP_THIRDPARTY_DIR}/xxHash/cmake_unofficial xxhash_build)
 
@@ -242,10 +245,24 @@ link_directories(${MSVC_LIB_PATH} ${WINDOWS_SDK_UM_LIB_PATH} ${WINDOWS_SDK_UCRT_
 add_compile_options("$<$<CXX_COMPILER_ID:MSVC>:/utf-8>")
 add_compile_definitions("$<$<CXX_COMPILER_ID:MSVC>:__builtin_isnan=_isnan>")
 
+# Precompile the icon as a raw Windows resource with llvm-rc. Keeping it out of
+# CMake's generated RC path avoids the rc.exe/line-marker failure entirely; no C
+# or C++ translation unit is affected.
+set(MCLA_RC_RES "${CMAKE_CURRENT_BINARY_DIR}/mcla.rc.res")
+add_custom_command(
+    OUTPUT "${MCLA_RC_RES}"
+    COMMAND "${CMAKE_COMMAND}" -E env "PATH=C:/Program Files/LLVM/bin;$ENV{PATH}"
+            "C:/Program Files/LLVM/bin/llvm-rc.exe" /fo "${MCLA_RC_RES}" "${CMAKE_CURRENT_SOURCE_DIR}/mcla.rc"
+    WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+    DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/mcla.rc" "${CMAKE_CURRENT_SOURCE_DIR}/icon.ico"
+    COMMENT "Building Windows icon resource with llvm-rc"
+    VERBATIM)
+add_custom_target(mcla_rc_res DEPENDS "${MCLA_RC_RES}")
+
 # Main executable
 add_executable(mcla
     src/main.cpp
-    mcla.rc
+    ${MCLA_RC_RES}
     src/early_init.cpp
     src/app.cpp
     src/app.h
@@ -525,6 +542,27 @@ add_executable(mcla
     .research/XenonRecomp/thirdparty/tiny-AES-c/aes.c
 )
 
+# XenonRecomp emitted these guest instructions as comments only (F-833 D2, F-921). generated/**
+# stays untouched: the affected TUs compile from a patched copy under the build tree.
+find_package(Python3 REQUIRED COMPONENTS Interpreter)
+set(MCLA_OVERLAY_TOOL "${CMAKE_CURRENT_SOURCE_DIR}/tools/emit_dropped_ops.py")
+execute_process(
+    COMMAND "${Python3_EXECUTABLE}" "${MCLA_OVERLAY_TOOL}" "${MCLA_RECOMP_DIR}" "${CMAKE_CURRENT_BINARY_DIR}/gen_overlay"
+    OUTPUT_VARIABLE _mcla_overlay_tus
+    RESULT_VARIABLE _mcla_overlay_rc)
+if(NOT _mcla_overlay_rc EQUAL 0)
+    message(FATAL_ERROR "tools/emit_dropped_ops.py failed (${_mcla_overlay_rc})")
+endif()
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${MCLA_OVERLAY_TOOL}")
+string(STRIP "${_mcla_overlay_tus}" _mcla_overlay_tus)
+string(REPLACE "\n" ";" _mcla_overlay_tus "${_mcla_overlay_tus}")
+get_target_property(_mcla_sources mcla SOURCES)
+foreach(_mcla_tu IN LISTS _mcla_overlay_tus)
+    list(TRANSFORM _mcla_sources REPLACE "^generated/ppc_xenon/ppc_recomp\\.${_mcla_tu}\\.cpp$"
+         "${CMAKE_CURRENT_BINARY_DIR}/gen_overlay/ppc_recomp.${_mcla_tu}.cpp")
+endforeach()
+set_target_properties(mcla PROPERTIES SOURCES "${_mcla_sources}")
+
 target_include_directories(mcla PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}/src
@@ -556,6 +594,12 @@ target_link_libraries(mcla PRIVATE
     ws2_32.lib dbghelp.lib dxgi.lib dxguid.lib d3d12.lib
 )
 
+# mcla.rc is compiled directly by Windows rc.exe. Do not add clang-only `-P`
+# here: in this generator/layout it changes the .rc rule into a preprocessed
+# output that rc.exe then rejects, which is worse than the failure this was
+# meant to fix. Measured 2026-11-03. The path containing a space is handled by
+# CMake quoting; icon resolution works from the source root.
+
 target_link_directories(mcla PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/third_party/SDL3/lib")
 
 target_compile_definitions(mcla PRIVATE
@@ -568,8 +612,135 @@ target_compile_definitions(mcla PRIVATE
     _HAS_CXX23=0
 )
 
+# ---------------------------------------------------------------------------
+# MCLA build profiles: release-lean vs mcla-debug (BOTH /O2, differ only in symbols)
+#
+# Two supported profiles, both keeping /O2, because the emulator's guest CPU is
+# recompiled C++ that must stay optimized to be usable. The ONLY difference is
+# whether PDB + linker /MAP (mcla.map) are kept for offline host debugging.
+#
+#   * release-lean (default for Release): /MT /O2, NO /Zi, link WITHOUT /DEBUG,
+#     NO /MAP. Smallest exe, no offline host symbol resolution. For soaks/timing.
+#   * mcla-debug (the Debug fork): SAME /O2 /MT /DNDEBUG as Release, PLUS /Zi,
+#     link /DEBUG, AND /MAP (mcla.map). For README/offline debugging with
+#     tools/host_rva_resolve.py (needs the map; see F-119 note below). Same
+#     runtime speed as Release (symbols do not execute); larger disk/link cost.
+#
+# The historical true Debug (/Od /RTC1 /MTd) is deliberately NOT a profile. As
+# of CMakeCache.txt measured 2026-11-09 (this tree, Ninja/ clang-cl):
+#   CMAKE_CXX_FLAGS_DEBUG          = /Ob0 /Od /RTC1   (no inlining, no opt, RTC checks)
+#   CMAKE_CXX_FLAGS_RELEASE        = /O2 /Ob2 /DNDEBUG
+#   CMAKE_CXX_FLAGS_RELWITHDEBINFO = /O2 /Ob1 /DNDEBUG (CMakeLists.txt below)
+#   CMAKE_EXE_LINKER_FLAGS_DEBUG          = /debug /INCREMENTAL
+#   CMAKE_EXE_LINKER_FLAGS_RELEASE        = /INCREMENTAL:NO (no /debug)
+#   CMAKE_EXE_LINKER_FLAGS_RELWITHDEBINFO = /debug /INCREMENTAL
+# plus CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>" above
+# (true Debug uses the debug CRT). configure.bat pins RelWithDebInfo, i.e. the
+# mcla-debug fork is the status quo; this block only makes Release lean and names it.
+#
+# Why naive Debug (-O0 / /Od) would be unusably slow for Xenia CPU emulation
+# (measurements, NOT estimates; all measured 2026-11-09 in this tree/build):
+#   * Guest mass: generated/ppc_xenon holds 176 TUs, 130,207,263 B source
+#     (124.2 MB); largest single TU ppc_recomp.119.cpp 2,468,422 B. This is the
+#     bulk of the executable: one PPC guest instruction becomes dozens of host
+#     C++ statements in ctx.r* register code, so the hot loop is entirely those
+#     TUs. Without inlining/register allocation/scheduling (/Od disables all;
+#     /Ob0 disables inlining; /RTC1 adds runtime checks), every guest step
+#     spills to stack and checks: PREDICTION is 10-100x slower guest execution
+#     (see falsifier F1 below; not yet measured -- no /Od build was produced here).
+#   * Compile cost per TU at /O2 (from build/.ninja_log v7, this RelWithDebInfo
+#     build: FLAGS "/MT /O2 /Ob1 /DNDEBUG ... -Zi /GS- /EHa" per build.ninja
+#     for ppc_recomp.9): avg ~11.4 s per recompiler TU, max 41.1 s
+#     (ppc_recomp.119.cpp.obj), min ~3.2 s. 176 TUs sequential ~= 33 min CPU
+#     (176 x 11.4 s); on this 20-core host wall is minutes (ninja -j20), but a
+#     clean reconfigure+build is still the 10-25 min class on 8-core CI. /Od
+#     per-TU compile is typically FASTER (less optimizer work) -- the 20-minute
+#     "Debug slower" claim is about RUNTIME, not compile (see F2).
+#   * Object/exe mass at /O2 (this build, RelWithDebInfo): generated objs
+#     225,535,789 B (215.1 MB) + src/ objs 201,453,197 B (192.1 MB, host
+#     subsystems: kernel/GPU/FS) + thirdparty/research 72,764,043 B (69.4 MB)
+#     ~= 476 MB objs; mcla.exe 64,401,408 B; mcla.pdb 169,963,520 B; mcla.map
+#     22,141,169 B / 165,723 lines. Subsystem overhead notes: /subsystem:console
+#     (build.ninja LINK_FLAGS "/subsystem:console") is constant across profiles;
+#     host src/ is 192 MB objs (40% of compile/link load) -- profiles do not
+#     shrink it, they only strip symbols. /Od would inflate objs further
+#     (no dead-code elimination across the 176 TUs) + RTC runtime + debug CRT.
+#   * Soak consequence: a 120 s soak (e.g. timeout 120 build/mcla.exe) cannot
+#     reach the same boot gate under /Od: the guest spends its budget in
+#     unoptimized dispatch instead of advancing markers (BOOTPATH/DISCCHK etc.
+#     stay 0 while /O2 advances). That is the falsifiable meaning of "unusable"
+#     (F1 below). The fork avoids this by keeping /O2.
+#
+# Copy-pasteable invocations (do NOT use raw Debug for emulation):
+#   Release lean (no symbols):
+#     cmake -S . -B build -G Ninja -DCMAKE_C_COMPILER=clang-cl -DCMAKE_CXX_COMPILER=clang-cl -DCMAKE_BUILD_TYPE=Release -DMCLA_KEEP_SYMBOLS=OFF
+#     ninja -C build mcla.exe
+#   mcla-debug fork (Release speed + PDB + MAP for offline resolution):
+#     cmake -S . -B build -G Ninja -DCMAKE_C_COMPILER=clang-cl -DCMAKE_CXX_COMPILER=clang-cl -DCMAKE_BUILD_TYPE=RelWithDebInfo -DMCLA_KEEP_SYMBOLS=ON
+#     ninja -C build mcla.exe   # same as configure.bat today
+#   True single-step Debug (host code only; guest will crawl; opt-in only):
+#     cmake -S . -B build -G Ninja -DCMAKE_C_COMPILER=clang-cl -DCMAKE_CXX_COMPILER=clang-cl -DCMAKE_BUILD_TYPE=Debug -DMCLA_KEEP_SYMBOLS=ON -DMCLA_DEBUG_USE_O2=OFF
+#     ninja -C build mcla.exe
+#
+# Bloat risks (measured above): mcla-debug adds ~192 MB disk (PDB 170 MB + MAP
+# 22 MB) vs lean + larger link RAM (ld must write PDB). A SECOND executable
+# target (e.g. add_executable mcla_debug enumerating the 176 TUs again) would
+# DOUBLE this (~+476 MB objs + second 64 MB exe + second PDB) and BREAK GATE 1
+# (the drift check counts 4-space-indented generated/ppc_xenon/ppc_recomp.N.cpp
+# lines in THIS file and expects exactly MCLA_EXPECTED_TU_COUNT=176). This file
+# therefore does NOT add a second add_executable: the fork is a profile on the
+# single mcla target (selected at configure time), not a second exe. Do not add
+# a second TU list. Additional validators (shader_pipeline_validator etc.)
+# follow the same BUILD_TYPE; they are small vs the 176 TUs.
+#
+# Falsifier notes (what would disprove this design; all unmeasured, run AFTER
+# this configure-only change -- no ninja/cmake/mcla.exe was run for this task):
+#   F1 (runtime): build Release lean and mcla-debug from the same tree, run the
+#       same 120 s soak to BOOTPATH/DISCCHK. Falsifier: /Od (true Debug,
+#       MCLA_DEBUG_USE_O2=OFF) reaches the same marker count in the same wall
+#       time as /O2 (i.e. <2x, not the predicted 10-100x). Then this comment's
+#       "unusable" claim is wrong and true Debug becomes a usable default.
+#   F2 (20-minute timing): time `ninja -C build mcla.exe` from `ninja clean`
+#       (or fresh -B) for each profile on ONE machine (same -j). Falsifier:
+#       Debug/O2-off clean build is NOT slower per-TU by >20% OR total wall
+#       differs by <2 min between lean and debug (then the "Debug from zero
+#       slower due to no optimization" framing is wrong for COMPILE time; slow-
+#       ness is runtime-only). Record `Get-Item build/mcla.exe,Pdb,Map | Length`
+#       + ninja wall in the soak log to close F1/F2 together.
+#   F3 (symbols): after mcla-debug build, `tools/host_rva_resolve.py
+#       build/mcla.map` must resolve a known host RIP to a function at +0x0
+#       (controls in AGENTS.md tools table). Falsifier: map missing/different
+#       base in RelWithDebInfo, or Release lean still emits mcla.map (then the
+#       KEEP_SYMBOLS conditional below is broken / cache-stale).
+# ---------------------------------------------------------------------------
+set(CMAKE_CXX_FLAGS_RELEASE "/MT /O2 /Ob2 /DNDEBUG")
+set(CMAKE_C_FLAGS_RELEASE "/MT /O2 /Ob2 /DNDEBUG")
 set(CMAKE_CXX_FLAGS_RELWITHDEBINFO "/MT /O2 /Ob1 /DNDEBUG")
 set(CMAKE_C_FLAGS_RELWITHDEBINFO "/MT /O2 /Ob1 /DNDEBUG")
+
+# Release lean is the default only when the user asks for Release; every other
+# BUILD_TYPE (RelWithDebInfo per configure.bat, empty, MinSizeRel) keeps symbols
+# so existing trees do not silently lose mcla.map on reconfigure.
+if(CMAKE_BUILD_TYPE STREQUAL "Release")
+    set(_MCLA_KEEP_DEFAULT OFF)
+else()
+    set(_MCLA_KEEP_DEFAULT ON)
+endif()
+option(MCLA_KEEP_SYMBOLS "Keep PDB + linker /MAP (mcla.map) for offline host symbol resolution (OFF = release-lean; ON = mcla-debug fork)" ${_MCLA_KEEP_DEFAULT})
+option(MCLA_DEBUG_USE_O2 "Force /O2 for CMAKE_BUILD_TYPE=Debug (emulation needs optimization; /Od is unusable) -- ON = mcla-debug fork, OFF = true single-step Debug (guest crawls)" ON)
+
+# True Debug (/Od /RTC1 /MTd) is kept only when the user explicitly opts out
+# (MCLA_DEBUG_USE_O2=OFF) to step host code; otherwise Debug is aliased to the
+# fork (/O2, /MT) so a bare -DCMAKE_BUILD_TYPE=Debug cannot produce an
+# unusable guest with no warning. Single-config Ninja only (guarded on
+# CMAKE_BUILD_TYPE); multi-config generators ignore this block (use separate
+# build dirs per profile, as Ninja requires anyway).
+if(CMAKE_BUILD_TYPE STREQUAL "Debug" AND MCLA_DEBUG_USE_O2)
+    message(WARNING "MCLA: CMAKE_BUILD_TYPE=Debug with MCLA_DEBUG_USE_O2=ON aliases to the mcla-debug fork (/O2 /MT + symbols). For true single-step Debug (guest unusably slow) reconfigure with -DMCLA_DEBUG_USE_O2=OFF.")
+    set(CMAKE_CXX_FLAGS_DEBUG "/MT /O2 /Ob1 /DNDEBUG")
+    set(CMAKE_C_FLAGS_DEBUG "/MT /O2 /Ob1 /DNDEBUG")
+    set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded")
+endif()
 
 target_compile_options(mcla PRIVATE /GS- /EHa)
 # F-119 follow-up: the boot-thread sampler reports HOST rips, and with no PDB in
@@ -577,8 +748,27 @@ target_compile_options(mcla PRIVATE /GS- /EHa)
 # "where is the main thread parked" question. /MAP is link-time only (no recompile
 # flags change) and emits build/mcla.map with symbol addresses, so an RVA from a
 # log line resolves to a function offline.
-target_link_options(mcla PRIVATE /OPT:NOREF /MAP)
+# Lean vs fork is decided here (configure time, single-config Ninja):
+#   KEEP_SYMBOLS=ON (mcla-debug): explicit /Zi + /MAP + /DEBUG. The explicit
+#     flags make Release+ON equivalent to RelWithDebInfo (fork = Release +
+#     symbols); in RelWithDebInfo they are duplicates of CMake's defaults
+#     (harmless, keeps the intent visible if CMake defaults drift).
+#   KEEP_SYMBOLS=OFF (release-lean): no /MAP (and no added /Zi//DEBUG). PDB
+#     follows BUILD_TYPE via CMake defaults (Release has none; RelWithDebInfo
+#     intrinsically keeps a PDB -- to get truly lean, use Release, not
+#     RelWithDebInfo+OFF). Existing RelWithDebInfo trees keep symbols by default.
+if(MCLA_KEEP_SYMBOLS)
+    target_compile_options(mcla PRIVATE /Zi)
+    target_link_options(mcla PRIVATE /OPT:NOREF /MAP /DEBUG)
+else()
+    target_link_options(mcla PRIVATE /OPT:NOREF)
+endif()
 target_compile_definitions(mcla PRIVATE $<$<NOT:$<CONFIG:Debug>>:NDEBUG>)
+if(MCLA_KEEP_SYMBOLS)
+    message(STATUS "MCLA profile: mcla-debug (O2 + PDB + MAP) -- BUILD_TYPE=${CMAKE_BUILD_TYPE} MCLA_KEEP_SYMBOLS=ON MCLA_DEBUG_USE_O2=${MCLA_DEBUG_USE_O2}")
+else()
+    message(STATUS "MCLA profile: release-lean (O2, no PDB/MAP) -- BUILD_TYPE=${CMAKE_BUILD_TYPE} MCLA_KEEP_SYMBOLS=OFF MCLA_DEBUG_USE_O2=${MCLA_DEBUG_USE_O2}")
+endif()
 
 # ---------------------------------------------------------------------------
 # Pre-compiled guest shader cache (docs/SHADER_TRANSLATION_PLAN.md).
@@ -602,11 +792,17 @@ else()
 endif()
 
 # Offline validators
+# `pipeline_cache.cpp` calls into grc_fvf_decode (BuildGrcFvfLayout /
+# HashGrcFvfDeclaration) to build the D3D12 input layout from a FVF declaration, so
+# that TU is a hard dependency of every target that compiles the IR set. It was not
+# in this list, which is why shader_pipeline_validator and xenos_decode_validator
+# stopped LINKING (undefined symbol, not a compile error) when the call was added.
 set(RENDERER_IR_TUS
     src/renderer/xenos_microcode.cpp
     src/renderer/xenos_shader_ir.cpp
     src/renderer/shader_translator.cpp
     src/renderer/precompiled_shaders.cpp
+    src/renderer/grc_fvf_decode.cpp
     tools/validators/shader_dxc_compile.cpp
     src/renderer/dxc_runtime.cpp
     src/renderer/pipeline_cache.cpp
@@ -1095,6 +1291,31 @@ add_executable(texture_import_validator
     src/renderer/grc_fvf_decode.cpp
     src/renderer/resource_cache.cpp
     src/renderer/texture_decode.cpp)
+# The validator includes a GENERATED header (texture_quad_shaders_gen.h), which is
+# produced by tools/validators/gen_texture_quad_shaders.py and is not committed.
+# Without this rule the target fails at compile time on a fresh checkout; with it,
+# ninja regenerates it first. DXC comes from the vendored .research tree, the same
+# binary the generator itself hard-codes.
+set(TEXTURE_QUAD_SHADERS_GEN "${CMAKE_CURRENT_SOURCE_DIR}/tools/validators/texture_quad_shaders_gen.h")
+set(TEXTURE_QUAD_DXC "${CMAKE_CURRENT_SOURCE_DIR}/.research/XenosRecomp/thirdparty/dxc-bin/bin/x64/dxc.exe")
+# The project does not call find_package(Python). Resolve one interpreter here so
+# the rule works without adding a configure-time requirement to every target.
+find_program(MCLA_PYTHON NAMES python python3 py)
+if(NOT MCLA_PYTHON)
+    message(WARNING "no python interpreter found: texture_import_validator will fail to build "
+                    "(it needs the generated tools/validators/texture_quad_shaders_gen.h)")
+endif()
+add_custom_command(
+    OUTPUT "${TEXTURE_QUAD_SHADERS_GEN}"
+    COMMAND "${CMAKE_COMMAND}" -E env "PATH=${CMAKE_CURRENT_SOURCE_DIR}/.research/XenosRecomp/thirdparty/dxc-bin/bin/x64;$ENV{PATH}"
+            "${MCLA_PYTHON}" "${CMAKE_CURRENT_SOURCE_DIR}/tools/validators/gen_texture_quad_shaders.py"
+    DEPENDS tools/validators/gen_texture_quad_shaders.py
+            tools/validators/shaders/texture_quad_vs.hlsl
+            tools/validators/shaders/texture_quad_ps.hlsl
+    COMMENT "Generating texture_quad_shaders_gen.h (vendored DXC)"
+    VERBATIM)
+add_custom_target(texture_quad_shaders_gen DEPENDS "${TEXTURE_QUAD_SHADERS_GEN}")
+add_dependencies(texture_import_validator texture_quad_shaders_gen)
 target_include_directories(texture_import_validator PRIVATE ${VALIDATOR_INCLUDE_DIRS})
 target_compile_definitions(texture_import_validator PRIVATE
     ${VALIDATOR_COMPILE_DEFS}

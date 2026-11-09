@@ -6,7 +6,7 @@
 #include "renderer/shader_translator.h"
 #include "renderer/pipeline_cache.h"
 #include "renderer/xenos_shader_ir.h"
-#include "renderer/grc_fvf_decode.h"
+#include "renderer/texture_decode.h"  // F-899: DecodeGuestTextureDescriptor, PlanTextureImport, UntileTexture2D/3D, ConvertTextureEndianness
 #include "d3d12_backend.h"
 #include "gpu_cp.h"  // F-647: CpReadGuestRegisters + the Xenos register indices
 #include "boot_host.h"  // F-640: TranslatePhysViewToPoolVa - the ONE view->pool rule
@@ -14,6 +14,8 @@
 #include "render_queue.h"
 #include <array>   // F-647: the fixed 4,096-byte constant-bank buffer
 #include <atomic>
+#include <cstdio>  // F-900: snprintf for the VERTEX-V0 diagnostic
+#include <cstdlib> // F-900: getenv for MCLA_SKIP_PRIM8 discriminator
 #include <cstring> // F-652: std::memcpy for the kFloat register reinterpretation
 #include <chrono>
 #include <thread>
@@ -58,6 +60,24 @@ static_assert(kQueueDepthDrop == CommandQueue::kShedDepth,
 // reads as "not fresh" so the first beats still fire — a guest that never
 // presents must not produce a dead window.
 static std::atomic<int64_t> g_lastGuestPresentNs{0};
+
+// F-902 STALL-WATCHDOG (temporary state, kept cheap): the DRAW_CAPTURED
+// handler stamps the captured draw's ordinal + NowNs() every draw; the
+// heartbeat thread (already awake every 33 ms) reports when the consumer has
+// not advanced for > 10 s while work is pending. Distinguishes STUCK
+// (seq frozen, depth high) from IDLE (seq frozen, depth 0) and SLOW
+// (seq advances). Seq 0 = no draw consumed yet.
+static std::atomic<uint32_t> g_consumerDrawSeq{0};
+static std::atomic<int64_t> g_consumerDrawNs{0};
+// F-902b: phase stamp. Each handler phase stores a static string here (no
+// log volume); the watchdog prints it, naming the exact phase the stuck
+// draw died in. Static strings only -- never a pointer into a draw.
+static std::atomic<const char*> g_consumerStage{"-"};
+
+// F-902b helper: stamp + optional log (log only when verbose!=0 to keep the
+// hot path quiet; the watchdog is what reports).
+#define STALL_STAGE(s) \
+    (g_consumerStage.store((s), std::memory_order_relaxed))
 
 static int64_t NowNs() {
     return std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -120,6 +140,13 @@ void RenderThread::threadMain() {
             d3d12Initialized_ = true;
             MCLA_LOG_INFO("RenderThread: D3D12 initialized on thread start ({}x{})",
                           pendingWidth_, pendingHeight_);
+            // F-899: the guest draws its frame as a BURST and swaps once.
+            // Batching must be enabled HERE (thread start), not in the
+            // INIT_D3D12 command case, because D3D12 is initialized on thread
+            // start and INIT_D3D12 never runs (measured: g920.log has 0
+            // "INIT_D3D12" rows and 0 "D3D12-DRAW-BATCH" rows despite the call
+            // sitting at render_thread.cpp:1286).
+            backend_.SetBatchDrawFrames(true);
             // Start the pipeline cache async compilation worker
             backend_.GetPipelineCache().StartWorker(
                 backend_.GetDevice(), backend_.GetRootSignature());
@@ -134,19 +161,9 @@ void RenderThread::threadMain() {
             // paint over a guest frame — the guest-content latch in the PRESENT
             // case below is what guarantees that.
             if (backend_.BeginFrame()) {
-                backend_.ClearAndPresent(0.06f, 0.10f, 0.22f, 1.0f);
-                // 2026-10-02: the FIRST of four sites in this file that could
-                // wedge the whole backend. BeginFrame() sets the backend's
-                // m_inFrame latch; ClearAndPresent can return false BEFORE its
-                // own BeginFrame (its !m_initialized test and its F-650 arbiter
-                // refusal both precede it), and on that path nothing is
-                // presented and the latch is still set -- so every later
-                // BeginFrame() refuses on already-in-frame forever.
-                // AbandonFrame is guarded on m_inFrame and so is a no-op when
-                // the clear did present. It releases state; it does not make the
-                // clear succeed and it does not bypass a gate.
+                backend_.ClearAndPresent(0.0f, 0.0f, 0.0f, 1.0f);
                 backend_.AbandonFrame("startup-clear");
-                MCLA_LOG_INFO("RenderThread: initial clear+present (dark blue)");
+                MCLA_LOG_INFO("RenderThread: initial clear+present (pure black)");
             }
             // F-758: THE W6 ONE-SHOT GRADIENT IS DELETED too. It is the same
             // synthetic image as the fallback that stood at :1733, painted once at
@@ -201,6 +218,39 @@ void RenderThread::threadMain() {
                                           "guestFresh={} depth={}",
                                           skipped, ticks,
                                           static_cast<int>(guestFresh), depth);
+                        // F-902 STALL-WATCHDOG report (inside the already-gated
+                        // skip branch, so no new log volume): if the consumer
+                        // has not stamped a draw in > 10 s while commands are
+                        // pending, it is STUCK (not idle, not slow).
+                        {
+                            static uint64_t s_lastWatchSeq = 0;
+                            static int64_t s_lastWatchNs = 0;
+                            static uint32_t s_stallRows = 0;
+                            const uint32_t cseq =
+                                g_consumerDrawSeq.load(std::memory_order_relaxed);
+                            const int64_t clast =
+                                g_consumerDrawNs.load(std::memory_order_relaxed);
+                            const int64_t ageMs =
+                                (clast != 0) ? (NowNs() - clast) / 1000000 : -1;
+                            if (cseq != 0 && (cseq != s_lastWatchSeq || clast != s_lastWatchNs)) {
+                                s_lastWatchSeq = cseq;
+                                s_lastWatchNs = clast;
+                                s_stallRows = 0;
+                            } else if (depth > 0 && ageMs > 10000) {
+                                if (s_stallRows < 6 || (s_stallRows % 50) == 0) {
+                                    MCLA_LOG_WARN("STALL-WATCH consumerSeq={} "
+                                                  "ageMs={} queueDepth={} "
+                                                  "stage={} -- consumer has not "
+                                                  "advanced while work is pending",
+                                                  cseq,
+                                                  static_cast<long long>(ageMs),
+                                                  depth,
+                                                  g_consumerStage.load(
+                                                      std::memory_order_relaxed));
+                                }
+                                ++s_stallRows;
+                            }
+                        }
                         continue;
                     }
                     // push() is non-blocking and refuses sheddable commands past
@@ -586,6 +636,57 @@ std::atomic<uint32_t> s_cpDrawnSkipped{0};
 // the draws that DID issue were correctly shaped or merely few.
 std::atomic<uint32_t> s_cpTopologyAssigned{0};
 
+static std::atomic<uint32_t> s_1sConsumed[16] = {};
+static std::atomic<uint32_t> s_1sDrawn[16] = {};
+static std::atomic<uint32_t> s_1sSkipped[16] = {};
+static std::atomic<uint32_t> s_1sFlushOk{0};
+static std::atomic<uint32_t> s_1sFlushEmpty{0};
+static std::atomic<uint32_t> s_1sClearOk{0};
+static std::atomic<uint32_t> s_1sClearRefused{0};
+static std::atomic<uint32_t> s_1sLastOtherPrim{0};
+static std::atomic<int64_t> s_1sLastLogNs{0};
+static std::atomic<uint32_t> s_1sSecIdx{0};
+
+static void MaybeLogRender1s() {
+    const int64_t now = NowNs();
+    int64_t prev = s_1sLastLogNs.load(std::memory_order_relaxed);
+    if (prev == 0) {
+        s_1sLastLogNs.compare_exchange_strong(prev, now);
+        return;
+    }
+    if (now - prev < 1000000000LL) return;
+    if (!s_1sLastLogNs.compare_exchange_strong(prev, now)) return;
+    const uint32_t sec = s_1sSecIdx.fetch_add(1, std::memory_order_relaxed) + 1;
+    uint32_t c4 = s_1sConsumed[4].exchange(0, std::memory_order_relaxed);
+    uint32_t c6 = s_1sConsumed[6].exchange(0, std::memory_order_relaxed);
+    uint32_t c8 = s_1sConsumed[8].exchange(0, std::memory_order_relaxed);
+    uint32_t d4 = s_1sDrawn[4].exchange(0, std::memory_order_relaxed);
+    uint32_t d6 = s_1sDrawn[6].exchange(0, std::memory_order_relaxed);
+    uint32_t d8 = s_1sDrawn[8].exchange(0, std::memory_order_relaxed);
+    uint32_t k4 = s_1sSkipped[4].exchange(0, std::memory_order_relaxed);
+    uint32_t k6 = s_1sSkipped[6].exchange(0, std::memory_order_relaxed);
+    uint32_t k8 = s_1sSkipped[8].exchange(0, std::memory_order_relaxed);
+    uint32_t cOth = 0, dOth = 0, kOth = 0;
+    for (int i = 0; i < 16; ++i) {
+        if (i == 4 || i == 6 || i == 8) continue;
+        cOth += s_1sConsumed[i].exchange(0, std::memory_order_relaxed);
+        dOth += s_1sDrawn[i].exchange(0, std::memory_order_relaxed);
+        kOth += s_1sSkipped[i].exchange(0, std::memory_order_relaxed);
+    }
+    uint32_t flOk = s_1sFlushOk.exchange(0, std::memory_order_relaxed);
+    uint32_t flEm = s_1sFlushEmpty.exchange(0, std::memory_order_relaxed);
+    uint32_t clOk = s_1sClearOk.exchange(0, std::memory_order_relaxed);
+    uint32_t clRf = s_1sClearRefused.exchange(0, std::memory_order_relaxed);
+    uint32_t othPrim = s_1sLastOtherPrim.load(std::memory_order_relaxed);
+    MCLA_LOG_ERROR("TEMP-RENDER-1S s={} cons[p4={} p6={} p8={} oth={}(p={})] "
+                   "drawn[p4={} p6={} p8={} oth={}] skip[p4={} p6={} p8={} oth={}] "
+                   "present[FlushDrawFrame={} FlushEmpty={} ClearAndPresent={} ClearRefused={}]",
+                   sec, c4, c6, c8, cOth, othPrim, d4, d6, d8, dOth, k4, k6, k8, kOth,
+                   flOk, flEm, clOk, clRf);
+}
+
+
+
 // ---------------------------------------------------------------------------
 // F-652: pipeline-state DERIVATION, counted on the live path.
 // ---------------------------------------------------------------------------
@@ -806,22 +907,26 @@ std::atomic<uint32_t> s_cpIssuedLogged{0};
 // the point that owns it. ReadBytes is chosen over a ReadU32BE loop precisely
 // because a loop would make this file look like a second endian site.
 //
-// ALL-OR-NOTHING: either the whole 4,096-byte bank is read and both descriptor
-// fields are set, or the read is abandoned, the reason is counted, and BOTH
+// ALL-OR-NOTHING: either the whole 4,096-byte bank is built and both descriptor
+// fields are set, or the build is abandoned, the reason is counted, and BOTH
 // fields are left at their zero-initialised value (nullptr / 0) so the backend
 // takes its existing no-bank path and reports `src=ZEROS`. A half-filled bank is
 // worse than a zero one because it is partly right, so the packer is called by
 // the backend with a size this function chose; the size is either the full
 // kShaderConstantBankBytes or zero, never something in between.
 //
-// BOUNDED READ: the whole bank is one 4,096-byte read at (va, va+4095). A guest
-// VA plus 4 KB can leave the 4 GiB window, so the range is checked BEFORE the
-// read and the read itself is the checked helper. There is no clamp: a short
-// read is a refusal, not a partial bank.
+// SOURCE, CORRECTED 2026-10-27. The bank is BUILT from the Xenos ALU
+// register-file array (registers 0x4000..0x47FF), not read from guest memory:
+// SQ_VS_CONST/SQ_PS_CONST are (base,size) pairs, and the previous producer's
+// guest-memory read at the raw register value (w842: vsVa=000FF000) handed
+// shaders arbitrary bytes as constants. See FillGuestConstantBank below and
+// gpu_cp.h:240-302 for the console model the builder implements.
 
 // The one buffer. 4,096 bytes = 256 Xenos float4 = kShaderConstantBankBytes.
 static std::array<uint8_t, mcla::renderer::kShaderConstantBankBytes>
     s_constBank{};
+static std::array<uint8_t, mcla::renderer::kShaderConstantBankBytes>
+    s_constBankPs{};  // F-932: the pixel stage's bank
 
 // F-647 census: attempts and each named outcome, counted separately so a soak
 // can read "the producer never ran" and "the producer ran and the guest address
@@ -910,8 +1015,23 @@ static uint32_t ReadPsNumRegField() {
 
 // Fills `out` (a DynamicMeshDesc) with the Xenos constant bank, or leaves it
 // untouched. Returns true when a bank was handed over.
+//
+// THE CONSOLE MODEL (gpu_cp.h:240-302). SQ_VS_CONST (0x2307) / SQ_PS_CONST
+// (0x2308) are (base,size) PAIRS, not addresses: base = bits 0..8, size = bits
+// 12..20 (vec4 count MINUS ONE). A shader's `cN` reads the ALU register-file
+// array at 0x4000 + 4*(base+N), zeros outside the stage's window. The producer
+// is therefore CpBuildShaderConstantBank -- the builder that implements exactly
+// that model -- and NOT a guest-memory read. The previous producer read 4096
+// bytes of guest memory at the RAW register value (w842: vsVa=000FF000), which
+// is not a constant bank at all; shaders consumed arbitrary guest bytes as
+// constants. The builder writes BIG-ENDIAN float4, which is what the backend's
+// single endian site (PackXenosConstantBank, pipeline_cache.cpp:1341-1348)
+// expects and swaps.
 bool FillGuestConstantBank(D3D12Backend::DynamicMeshDesc& out) {
     using mcla::gpu::CpReadGuestRegisters;
+    using mcla::gpu::CpBuildShaderConstantBank;
+    using mcla::gpu::CpShaderConstantInfo;
+    using mcla::gpu::CpShaderStage;
     using mcla::gpu::kCpRegSqVsConst;
     using mcla::gpu::kCpRegSqPsConst;
     constexpr uint32_t kBankBytes = mcla::renderer::kShaderConstantBankBytes;
@@ -932,46 +1052,59 @@ bool FillGuestConstantBank(D3D12Backend::DynamicMeshDesc& out) {
     // Named refusal, bounded log, one row per attempt for the first 8 then
     // every 200th (house pattern). `filled` and `reason` are on the SAME row so
     // an outcome and its cause can never be read from different lines.
+    //
+    // The only refusal the register-file model can still produce is
+    // `vs-reg-absent`: the guest has never written SQ_VS_CONST, so no (base,
+    // size) window has ever been configured. The four memory-read refusals
+    // below it (vs-addr-zero / vs-wrap-4g / vs-unmapped / vs-read-failed) were
+    // properties of the OLD memory-read producer; CpBuildShaderConstantBank
+    // reads the register file through atomics and cannot fail for those
+    // reasons, so those counters now hold permanently 0 and the row keeps
+    // printing them so a soak comparing against w842-era logs still parses.
     const char* reason = nullptr;
-    std::atomic<uint32_t>* counter = nullptr;
-    uint32_t vsVa = val[0];
+    uint32_t vsReg = val[0];
 
     if (!pres[0]) {
         reason = "vs-reg-absent";
-        counter = &s_constBankRefNoRegister;
-    } else if (vsVa == 0u) {
-        reason = "vs-addr-zero";
-        counter = &s_constBankRefNoAddr;
-    } else if (static_cast<uint64_t>(vsVa) + static_cast<uint64_t>(kBankBytes) >
-               0x100000000ull) {
-        // Guest VA + 4 KB leaves the 32-bit window. Same test the index buffer
-        // uses (DRAW_CAPTURED's `ib-wrap` gate): refuse, never wrap.
-        reason = "vs-wrap-4g";
-        counter = &s_constBankRefWrap;
-    }
-
-    auto& mem = mcla::kernel::GuestMemoryHeap::Instance();
-    if (!reason && !mem.IsValid(vsVa, kBankBytes)) {
-        reason = "vs-unmapped";
-        counter = &s_constBankRefUnmapped;
-    }
-    if (!reason && !mem.ReadBytes(vsVa, s_constBank.data(), kBankBytes)) {
-        // The range was validated and the read still failed: the page was
-        // unmapped between the two calls, or the SEH guard tripped. Either way
-        // the buffer now holds PARTIAL guest bytes, so it must not be handed
-        // over -- which is why this returns without touching `out`.
-        reason = "vs-read-failed";
-        counter = &s_constBankRefReadFailed;
+        s_constBankRefNoRegister.fetch_add(1, std::memory_order_relaxed);
     }
 
     if (reason) {
-        counter->fetch_add(1, std::memory_order_relaxed);
         if (n <= 8u || (n % 200u) == 0u) {
             MCLA_LOG_WARN("CONST-BANK-PRODUCE #{} filled=0 reason={} vsRegPresent={} "
-                          "vsVa={:08X} psRegPresent={} psVa={:08X} bankBytes={} "
+                          "vsReg={:08X} psRegPresent={} psReg={:08X} bankBytes={} "
                           "| totals attempts={} filled={} noReg={} noAddr={} "
                           "wrap={} unmapped={} readFailed={} psPresent={}",
-                          n, reason, pres[0], vsVa, pres[1], val[1], kBankBytes,
+                          n, reason, pres[0], vsReg, pres[1], val[1], kBankBytes,
+                          s_constBankAttempts.load(std::memory_order_relaxed),
+                          s_constBankFilled.load(std::memory_order_relaxed),
+                          s_constBankRefNoRegister.load(std::memory_order_relaxed),
+                          s_constBankRefNoAddr.load(std::memory_order_relaxed),
+                          s_constBankRefWrap.load(std::memory_order_relaxed),
+                          s_constBankRefUnmapped.load(std::memory_order_relaxed),
+                          s_constBankRefReadFailed.load(std::memory_order_relaxed),
+                          s_constBankPsPresent.load(std::memory_order_relaxed));
+        }
+        return false;
+    }
+
+    // THE CONSOLE MODEL: build the vertex stage's bank out of the ALU
+    // register-file array (0x4000 + 4*(base+N)), zeros outside the stage's
+    // (base,size) window -- shader_interpreter.cc:260-284, implemented by
+    // CpBuildShaderConstantBank (gpu_cp.cpp:7378). The builder cannot fail for
+    // a non-null out and outBytes >= 16, but the refusal arm is kept so a
+    // future contract change cannot turn into a silent zero bank.
+    CpShaderConstantInfo info{};
+    if (!CpBuildShaderConstantBank(CpShaderStage::kVertex, s_constBank.data(),
+                                   kBankBytes, &info)) {
+        s_constBankRefReadFailed.fetch_add(1, std::memory_order_relaxed);
+        if (n <= 8u || (n % 200u) == 0u) {
+            MCLA_LOG_WARN("CONST-BANK-PRODUCE #{} filled=0 reason=vs-build-failed "
+                          "vsRegPresent={} vsReg={:08X} psRegPresent={} "
+                          "psReg={:08X} bankBytes={} | totals attempts={} "
+                          "filled={} noReg={} noAddr={} wrap={} unmapped={} "
+                          "readFailed={} psPresent={}",
+                          n, pres[0], vsReg, pres[1], val[1], kBankBytes,
                           s_constBankAttempts.load(std::memory_order_relaxed),
                           s_constBankFilled.load(std::memory_order_relaxed),
                           s_constBankRefNoRegister.load(std::memory_order_relaxed),
@@ -988,17 +1121,27 @@ bool FillGuestConstantBank(D3D12Backend::DynamicMeshDesc& out) {
     // backend can never see a pointer without its size.
     out.guestConstBytes = s_constBank.data();
     out.guestConstBytesSize = kBankBytes;
-    if (pres[1] && val[1] != 0u) {
+    // F-932: build and deliver the pixel stage's bank with the same builder.
+    CpShaderConstantInfo psInfo{};
+    if (CpBuildShaderConstantBank(CpShaderStage::kPixel, s_constBankPs.data(),
+                                  kBankBytes, &psInfo)) {
+        out.guestPsConstBytes = s_constBankPs.data();
+        out.guestPsConstBytesSize = kBankBytes;
+    } else if (pres[1] && val[1] != 0u) {
         s_constBankPsDroppedNoSlot.fetch_add(1, std::memory_order_relaxed);
     }
     s_constBankFilled.fetch_add(1, std::memory_order_relaxed);
     if (n <= 8u || (n % 200u) == 0u) {
         MCLA_LOG_WARN("CONST-BANK-PRODUCE #{} filled=1 reason=- vsRegPresent={} "
-                      "vsVa={:08X} psRegPresent={} psVa={:08X} bankBytes={} "
-                      "(big-endian, packed by PackXenosConstantBank) "
+                      "vsReg={:08X} psRegPresent={} psReg={:08X} bankBytes={} "
+                      "vsBase={} vsSize={} entriesFilled={} aluDwordsPresent={} "
+                      "(big-endian from the ALU register file, packed by "
+                      "PackXenosConstantBank) "
                       "| totals attempts={} filled={} noReg={} noAddr={} "
                       "wrap={} unmapped={} readFailed={} psDroppedNoSlot={}",
-                      n, pres[0], vsVa, pres[1], val[1], kBankBytes,
+                      n, pres[0], vsReg, pres[1], val[1], kBankBytes,
+                      info.vsBase, info.vsSize, info.entriesFilled,
+                      info.aluDwordsPresent,
                       s_constBankAttempts.load(std::memory_order_relaxed),
                       s_constBankFilled.load(std::memory_order_relaxed),
                       s_constBankRefNoRegister.load(std::memory_order_relaxed),
@@ -1091,14 +1234,13 @@ constexpr uint32_t kEnvShaderHdrLen = 24u;           // xenos_shader_ir.cpp kSha
 // element table is skipped rather than invented.
 constexpr uint32_t kEnvVirtualSize  = kEnvShaderHdrOff + kEnvShaderHdrLen;  // 60
 
-// One stage's program CODE BYTES, in the byte order ParseShaderProgram reads
-// (big-endian, ReadBE32 at xenos_shader_ir.cpp:9-11), plus the name of where
-// they came from. Returns 0 and sets `sourceOut` to a refusal reason when this
-// stage has no usable bytes; the caller refuses by that name.
+// One stage's captured program dwords serialized in the byte order
+// ParseShaderProgram reads (big-endian, ReadBE32 at xenos_shader_ir.cpp:9-11),
+// plus the source form that originally supplied them. Returns 0 and sets
+// `sourceOut` to a refusal reason when this stage has no usable bytes.
 static size_t ResolveStageCode(const CpShaderProgram& p,
                               std::vector<uint8_t>& codeOut,
-                              const char*& sourceOut,
-                              mcla::kernel::GuestMemoryHeap& mem) {
+                              const char*& sourceOut) {
     sourceOut = "absent";
     if (p.present == 0u) {
         sourceOut = "no-im-load";
@@ -1111,40 +1253,19 @@ static size_t ResolveStageCode(const CpShaderProgram& p,
         return 0;
     }
     const size_t useDwords = p.captured;
-    if (p.embedded != 0u) {
-        // PM4_IM_LOAD_IMMEDIATE (0x2B): the body is in the packet, i.e. here.
-        // body[] holds LOGICAL dwords in HOST order (render_queue.h:297-299), so
-        // the wire order is written out big-endian by hand rather than memcpy'd.
-        codeOut.resize(useDwords * 4u);
-        for (size_t i = 0; i < useDwords; ++i) {
-            const uint32_t v = p.body[i];
-            codeOut[i * 4 + 0] = static_cast<uint8_t>(v >> 24);
-            codeOut[i * 4 + 1] = static_cast<uint8_t>(v >> 16);
-            codeOut[i * 4 + 2] = static_cast<uint8_t>(v >> 8);
-            codeOut[i * 4 + 3] = static_cast<uint8_t>(v);
-        }
-        sourceOut = "embedded";
-        return codeOut.size();
-    }
-    // PM4_IM_LOAD (0x27): the body is in guest memory at `guestAddr`, and it is
-    // read through the checked helper, never reinterpret_cast. Per the reference
-    // (command_processor.cc:1542-1544) that address holds RAW MICROCODE, so the
-    // bytes come out in wire order already and are copied verbatim.
-    if (p.guestAddr == 0u) {
-        sourceOut = "no-address";
-        return 0;
-    }
-    const uint64_t want = static_cast<uint64_t>(useDwords) * 4ull;
-    if (static_cast<uint64_t>(p.guestAddr) + want > 0x100000000ull) {
-        sourceOut = "address-wraps";
-        return 0;
-    }
+    // CpExecImLoad reads both PM4_IM_LOAD forms with ReadU32BE, then
+    // CpSnapshotDrawState carries those host-order dwords with the queued draw.
+    // guestAddr is the packet's physical address and is not necessarily the
+    // readable kernel-VA alias that the producer used.
     codeOut.resize(useDwords * 4u);
-    if (!mem.ReadBytes(p.guestAddr, codeOut.data(), codeOut.size())) {
-        sourceOut = "read-failed";
-        return 0;
+    for (size_t i = 0; i < useDwords; ++i) {
+        const uint32_t v = p.body[i];
+        codeOut[i * 4 + 0] = static_cast<uint8_t>(v >> 24);
+        codeOut[i * 4 + 1] = static_cast<uint8_t>(v >> 16);
+        codeOut[i * 4 + 2] = static_cast<uint8_t>(v >> 8);
+        codeOut[i * 4 + 3] = static_cast<uint8_t>(v);
     }
-    sourceOut = "guest-memory";
+    sourceOut = p.embedded != 0u ? "embedded" : "guest-memory";
     return codeOut.size();
 }
 
@@ -1279,6 +1400,11 @@ void RenderThread::processCommand(const RenderCommand& cmd) {
             if (!d3d12Initialized_) {
                 if (backend_.Initialize(static_cast<HWND>(init.hwnd), init.width, init.height)) {
                     d3d12Initialized_ = true;
+                    // F-899: the guest draws its frame as a BURST and swaps once.
+                    // Batching is what makes the burst land in one command list
+                    // instead of being refused 552,600 times by BeginFrame's
+                    // latch (measured, build/g919.log).
+                    backend_.SetBatchDrawFrames(true);
                     MCLA_LOG_INFO("RenderThread: D3D12 initialized ({}x{})", init.width, init.height);
                 } else {
                     MCLA_LOG_ERROR("RenderThread: D3D12 initialization failed");
@@ -1300,11 +1426,11 @@ void RenderThread::processCommand(const RenderCommand& cmd) {
 
             if (d.vbAddr == 0 || d.vbSize == 0 || d.ibAddr == 0 || d.ibSize == 0 || d.indexCount == 0) break;
 
-            auto& mem = mcla::kernel::GuestMemoryHeap::Instance();
+            auto& guestMem = mcla::kernel::GuestMemoryHeap::Instance();
             std::vector<uint8_t> vb(d.vbSize);
             std::vector<uint8_t> ib(d.ibSize);
-            if (!mem.ReadBytes(d.vbAddr, vb.data(), d.vbSize)) break;
-            if (!mem.ReadBytes(d.ibAddr, ib.data(), d.ibSize)) break;
+            if (!guestMem.ReadBytes(d.vbAddr, vb.data(), d.vbSize)) break;
+            if (!guestMem.ReadBytes(d.ibAddr, ib.data(), d.ibSize)) break;
 
             // Attempt PSO lookup from shader programs
             ID3D12PipelineState* pipeline = nullptr;
@@ -1312,16 +1438,18 @@ void RenderThread::processCommand(const RenderCommand& cmd) {
 
             if (d.vsProgram != 0 && d.psProgram != 0) {
                 // Read shader containers from guest memory
-                auto vsContainer = ReadShaderContainer(mem, d.vsProgram);
-                auto psContainer = ReadShaderContainer(mem, d.psProgram);
+                auto vsContainer = ReadShaderContainer(guestMem, d.vsProgram);
+                auto psContainer = ReadShaderContainer(guestMem, d.psProgram);
 
                 if (!vsContainer.empty() && !psContainer.empty()) {
                     // Translate shaders to HLSL
+                    // This legacy command carries no raster-register snapshot;
+                    // do not infer a per-draw clip rescale here.
                     mcla::renderer::TranslatedShader vsOut, psOut;
                     bool vsOk = mcla::renderer::TranslateShader(
-                        vsContainer.data(), vsContainer.size(), {}, vsOut);
+                        vsContainer.data(), vsContainer.size(), {}, vsOut, false);
                     bool psOk = mcla::renderer::TranslateShader(
-                        psContainer.data(), psContainer.size(), {}, psOut);
+                        psContainer.data(), psContainer.size(), {}, psOut, false);
 
                     if (vsOk && psOk && !vsOut.hlsl.empty() && !psOut.hlsl.empty()) {
                         // Parse VS IR for vertex input layout
@@ -1393,6 +1521,8 @@ void RenderThread::processCommand(const RenderCommand& cmd) {
                                 // Compute pipeline key
                                 mcla::renderer::PipelineKey key = mcla::renderer::ComputePipelineKey(
                                     vsOut.programHash, psOut.programHash,
+                                    mcla::renderer::HashShaderBytecode(vsOut.hlsl),
+                                    mcla::renderer::HashShaderBytecode(psOut.hlsl),
                                     vertexDeclHash, state);
 
                                 // Look up or compile PSO
@@ -1433,16 +1563,56 @@ void RenderThread::processCommand(const RenderCommand& cmd) {
                               s_psoTranslateFailures.load());
             }
 
+            // kQuadList (0x0D) has no D3D12 primitive; expand each 4-index quad
+            // into 2 triangles (6 indices) so the draw renders as a triangle list.
+            const bool isQuadList = (d.primitiveTopology == 0x0Du);
+            std::vector<uint8_t> expandedIb;
+            uint32_t expandedIndexCount = d.indexCount;
+            if (isQuadList && d.indexCount >= 4 && (d.indexCount % 4 == 0)) {
+                const uint32_t bytesPerIdx = (d.ibFormat & 1) ? 4u : 2u;
+                expandedIb.resize(static_cast<size_t>((d.indexCount / 4) * 6) * bytesPerIdx);
+                for (uint32_t q = 0; q < d.indexCount / 4; ++q) {
+                    uint32_t i0, i1, i2, i3;
+                    const uint8_t* src = ib.data() + q * 4 * bytesPerIdx;
+                    if (bytesPerIdx == 2) {
+                        i0 = *reinterpret_cast<const uint16_t*>(src + 0);
+                        i1 = *reinterpret_cast<const uint16_t*>(src + 2);
+                        i2 = *reinterpret_cast<const uint16_t*>(src + 4);
+                        i3 = *reinterpret_cast<const uint16_t*>(src + 6);
+                    } else {
+                        i0 = *reinterpret_cast<const uint32_t*>(src + 0);
+                        i1 = *reinterpret_cast<const uint32_t*>(src + 4);
+                        i2 = *reinterpret_cast<const uint32_t*>(src + 8);
+                        i3 = *reinterpret_cast<const uint32_t*>(src + 12);
+                    }
+                    uint8_t* dst = expandedIb.data() + q * 6 * bytesPerIdx;
+                    auto put = [&](int slot, uint32_t v) {
+                        if (bytesPerIdx == 2)
+                            *reinterpret_cast<uint16_t*>(dst + slot * 2) = static_cast<uint16_t>(v);
+                        else
+                            *reinterpret_cast<uint32_t*>(dst + slot * 4) = v;
+                    };
+                    put(0, i0); put(1, i1); put(2, i2);
+                    put(3, i0); put(4, i2); put(5, i3);
+                }
+                expandedIndexCount = (d.indexCount / 4) * 6;
+            }
+
             D3D12Backend::DynamicMeshDesc desc = {};
             desc.vertexBytes = vb.data();
             desc.vertexBytesSize = d.vbSize;
             desc.vertexStride = d.vbStride;
             desc.vertexCount = (d.vbStride > 0) ? (d.vbSize / d.vbStride) : 0;
             desc.indexed = true;
-            desc.indexBytes = ib.data();
-            desc.indexBytesSize = d.ibSize;
+            if (isQuadList && !expandedIb.empty()) {
+                desc.indexBytes = expandedIb.data();
+                desc.indexBytesSize = static_cast<uint32_t>(expandedIb.size());
+            } else {
+                desc.indexBytes = ib.data();
+                desc.indexBytesSize = d.ibSize;
+            }
             desc.indexFormat = (d.ibFormat & 1) ? DXGI_FORMAT_R32_UINT : DXGI_FORMAT_R16_UINT;
-            desc.indexCount = d.indexCount;
+            desc.indexCount = isQuadList ? expandedIndexCount : d.indexCount;
             // F-648: desc.topology is DELIBERATELY still unset on this path, and
             // that is not an oversight. The DRAW_CAPTURED path sets it from
             // VGT_DRAW_INITIATOR.prim_type (the architected xenos::PrimitiveType,
@@ -1524,6 +1694,36 @@ void RenderThread::processCommand(const RenderCommand& cmd) {
             // render_queue.h, shared with the queue's shed policy so the two
             // cannot drift and disagree about which PRESENT is which.
             const bool heartbeat = IsHeartbeatPresent(cmd);
+            if (!heartbeat) mcla::native::D3D12Backend::ClearFrameTextures();
+            // F-899: THE GUEST'S SWAP IS WHERE THE FRAME ENDS.
+            //
+            // MEASURED, build/g919.log: CP-DRAW-CENSUS enqueued=553,926 draw
+            // commands, CP: XE_SWAP-EMIT #3400, and the host had presented 500
+            // times in the WHOLE run with `drawn=1` -- because BeginFrame() was
+            // called once per draw and its already-in-frame latch refused
+            // 552,600 of them. The frame never ended, so nothing the guest drew
+            // could reach the window.
+            //
+            // This is the boundary the backend never had: the accumulated list
+            // (every draw since the last swap) is closed, resolved into the
+            // scan-out surface and presented exactly once, HERE, where the
+            // guest itself swaps. A heartbeat present is our own 33 ms timer,
+            // not a guest frame, so it does not end the guest's frame.
+            // F-610: one-way latch, declared ahead of present/blit so the success
+            // path can set it. Once any real guest content has been drawn or blitted,
+            // no synthetic fallback may ever paint again.
+            static std::atomic<bool> s_guestContentSeen{false};
+
+            if (!heartbeat) {
+                if (backend_.FlushDrawFrame())
+                    s_1sFlushOk.fetch_add(1, std::memory_order_relaxed);
+                else
+                    s_1sFlushEmpty.fetch_add(1, std::memory_order_relaxed);
+                // Subagent 1 fix: latch guest content seen so subsequent heartbeat
+                // ticks do not paint fallback clears over the drawn frame (ga058).
+                s_guestContentSeen.store(true, std::memory_order_relaxed);
+            }
+            MaybeLogRender1s();
             if (n <= 10 || (n % 120) == 0) {
                 // T43.18 (2026-10-13): mainwait=* is the TAIL-LIGHT for the
                 // main thread's latest park (published uncapped by the
@@ -1572,7 +1772,7 @@ void RenderThread::processCommand(const RenderCommand& cmd) {
             // the guest framebuffer when swapInfo is a high guest VA.
             // W7: if swapInfo is a swap-table slot (C71D81xx family or
             // samples as near-zero), use the resolved surface VA instead.
-            float cr = 0.06f, cg = 0.10f, cb = 0.22f;
+            float cr = 0.0f, cg = 0.0f, cb = 0.0f;
             bool blitOk = false;
             // F-762: set when the whole-surface census refused this VA. It is
             // separate from blitOk on purpose: blitOk=false means "no guest
@@ -1583,10 +1783,7 @@ void RenderThread::processCommand(const RenderCommand& cmd) {
             bool surfaceRefused = false;
             bool coherent = false;
 
-            // F-610: one-way latch, declared ahead of the blit so the success
-            // path below can set it. Once any real guest framebuffer has been
-            // blitted, no synthetic fallback may ever paint again.
-            static std::atomic<bool> s_guestContentSeen{false};
+            // F-610: s_guestContentSeen is declared above ahead of FlushDrawFrame.
 
             // =================================================================
             // F-XXX (2026-10-21, fix_present2): WHICH SURFACE DOES THE GUEST'S
@@ -1717,7 +1914,7 @@ void RenderThread::processCommand(const RenderCommand& cmd) {
             // Note: the heartbeat leaves blitVA=0 -> clear-only, as before.
 
             if (blitVA != 0) {
-                auto& mem = mcla::kernel::GuestMemoryHeap::Instance();
+                auto& guestMem = mcla::kernel::GuestMemoryHeap::Instance();
                 // Prefer full 1280x720 linear 32bpp; fall back to 640x360 if
                 // the larger ReadBytes is not valid (page still uncommitted).
                 static std::vector<uint8_t> fbBuf;
@@ -1728,10 +1925,10 @@ void RenderThread::processCommand(const RenderCommand& cmd) {
                 if (fbBuf.size() < kFullBytes) fbBuf.resize(kFullBytes);
 
                 uint32_t fbW = 0, fbH = 0;
-                if (mem.ReadBytes(blitVA, fbBuf.data(), kFullBytes)) {
+                if (guestMem.ReadBytes(blitVA, fbBuf.data(), kFullBytes)) {
                     fbW = kFullW;
                     fbH = kFullH;
-                } else if (mem.ReadBytes(blitVA, fbBuf.data(), kHalfBytes)) {
+                } else if (guestMem.ReadBytes(blitVA, fbBuf.data(), kHalfBytes)) {
                     fbW = kHalfW;
                     fbH = kHalfH;
                 }
@@ -2075,7 +2272,10 @@ void RenderThread::processCommand(const RenderCommand& cmd) {
                     // m_inFrame -- so it never needed a caller-side pair, and
                     // calling it bare is correct whether the clear is allowed or
                     // refused.
-                    backend_.ClearAndPresent(cr, cg, cb, 1.0f);
+                    if (backend_.ClearAndPresent(cr, cg, cb, 1.0f))
+                        s_1sClearOk.fetch_add(1, std::memory_order_relaxed);
+                    else
+                        s_1sClearRefused.fetch_add(1, std::memory_order_relaxed);
                     break;
                 }
                 // F-758: THE SYNTHETIC GRADIENT IS DELETED, not gated.
@@ -2117,7 +2317,10 @@ void RenderThread::processCommand(const RenderCommand& cmd) {
                 static std::atomic<uint32_t> noSurface{0};
                 const uint32_t ns = noSurface.fetch_add(1) + 1;
                 if (backend_.BeginFrame()) {
-                    backend_.ClearAndPresent(cr, cg, cb, 1.0f);
+                    if (backend_.ClearAndPresent(cr, cg, cb, 1.0f))
+                        s_1sClearOk.fetch_add(1, std::memory_order_relaxed);
+                    else
+                        s_1sClearRefused.fetch_add(1, std::memory_order_relaxed);
                     // Reached whenever the clear itself is refused, so this is a
                     // refusal-shaped path and the frame latch must be released on it
                     // explicitly -- the same reasoning the deleted gradient block gave.
@@ -2138,8 +2341,21 @@ void RenderThread::processCommand(const RenderCommand& cmd) {
         case RenderCommand::DRAW_CAPTURED: {
             if (!d3d12Initialized_) break;
             const auto& dc = std::get<DrawCapturedCommand>(cmd.data);
+            mcla::renderer::PipelineState derived{};
+            bool applyClipDisableRescaleForDraw = false;
             static std::atomic<uint32_t> drawCount{0};
             const uint32_t n = drawCount.fetch_add(1) + 1;
+            // F-902 STALL-WATCHDOG stamp: every consumed draw records its
+            // producer ordinal + time. The heartbeat thread reports when this
+            // stops advancing while the queue is non-empty (stuck, not idle).
+            g_consumerDrawSeq.store(dc.cpSeq, std::memory_order_relaxed);
+            g_consumerDrawNs.store(NowNs(), std::memory_order_relaxed);
+            const uint32_t primSlot = (dc.primitiveTopology < 16u) ? dc.primitiveTopology : 15u;
+            if (primSlot != 4u && primSlot != 6u && primSlot != 8u)
+                s_1sLastOtherPrim.store(dc.primitiveTopology, std::memory_order_relaxed);
+            s_1sConsumed[primSlot].fetch_add(1, std::memory_order_relaxed);
+            MaybeLogRender1s();
+            STALL_STAGE("draw-top");
             if (n <= 10 || (n % 500) == 0)
                 MCLA_LOG_INFO("RenderThread: DRAW_CAPTURED #{} op=0x{:02X} src={} "
                               "prim={} ib={:08X}+{}B fmt={}B swap={} numIdx={} "
@@ -2153,7 +2369,7 @@ void RenderThread::processCommand(const RenderCommand& cmd) {
                               dc.vbFormat.bytes, dc.vbFullCount, dc.vbDescCount,
                               dc.psoHash);
 
-            auto& mem = mcla::kernel::GuestMemoryHeap::Instance();
+            auto& guestMem = mcla::kernel::GuestMemoryHeap::Instance();
 
             // --- F-652: program + raster-state census, before every gate ----
             // Placed with the rest of the census block, above every refusal
@@ -2191,13 +2407,43 @@ void RenderThread::processCommand(const RenderCommand& cmd) {
             // can count the reason (F-609, native-only charter).
             auto refuse = [&](const char *what, std::atomic<uint32_t> &c,
                               const char *detail) {
+                s_1sSkipped[primSlot].fetch_add(1, std::memory_order_relaxed);
                 const uint32_t k = c.fetch_add(1, std::memory_order_relaxed) + 1;
-                if (k <= 8 || (k % 200) == 0)
+                if (k <= 8 || (k % 200) == 0) {
+                    MCLA_LOG_ERROR("TEMP-DRAW-REFUSE #{} what={} draw={} prim={} ib={:08X}+{}B "
+                                   "numIdx={} vb={:08X}+{}B stride={} {}",
+                                   k, what, n, dc.primitiveTopology, dc.ibBase, dc.ibSize, dc.numIndices,
+                                   dc.vbBase, dc.vbSize, dc.vbStride, detail);
                     MCLA_LOG_WARN("DRAW-CP-REFUSE #{} what={} draw={} ib={:08X}+{}B "
                                   "numIdx={} vb={:08X}+{}B stride={} {}",
                                   k, what, n, dc.ibBase, dc.ibSize, dc.numIndices,
                                   dc.vbBase, dc.vbSize, dc.vbStride, detail);
+                }
             };
+
+            // F-900 DISCRIMINATOR (env-gated, default DRAWS): prim=8
+            // rectangle-list draws (draw #1 class: embedded VS, fullscreen?
+            // background). The F-917 mitigation SKIPPED these by default to
+            // hide a black quarter-screen box. With the CPU expansion below
+            // they draw, so the default is now to draw. Set
+            // MCLA_SKIP_PRIM8=1 explicitly to skip them (opt-out).
+            {
+                static int s_skipPrim8 = -1;
+                if (s_skipPrim8 < 0) {
+                    const char* e = std::getenv("MCLA_SKIP_PRIM8");
+                    // Default draws. =1 skips (old F-917 behaviour on demand);
+                    // unset or =0 draws. =0 must not crash: it just draws, the
+                    // same as the default.
+                    s_skipPrim8 = (e && e[0] == '1') ? 1 : 0;
+                }
+                if (s_skipPrim8 && dc.primitiveTopology == 8u) {
+                    static std::atomic<uint32_t> s_cpRefuseSkipPrim8{0};
+                    refuse("skip-prim8-debug", s_cpRefuseSkipPrim8,
+                           "- MCLA_SKIP_PRIM8=1: prim=8 draw skipped to test "
+                           "whether the rect background covers the quads.");
+                    break;
+                }
+            }
 
             // F-648: the AUTHORITATIVE total row for this gate. Every counter
             // the DRAW_CAPTURED path keeps is printed here, including the ones
@@ -2411,7 +2657,7 @@ void RenderThread::processCommand(const RenderCommand& cmd) {
                                  "index buffer; the draw would read past its own end.");
                     break;
                 }
-                if (!mem.IsValid(dc.ibBase, dc.ibSize)) {
+                if (!guestMem.IsValid(dc.ibBase, dc.ibSize)) {
                     refuse("ib-unreadable", s_cpRefuseIbUnreadable,
                            "- resolved index buffer is outside the guest window.");
                     break;
@@ -2428,7 +2674,7 @@ void RenderThread::processCommand(const RenderCommand& cmd) {
                 // narrowed before an IBV can describe it at all.
                 static std::vector<uint8_t> ibRaw;
                 if (ibRaw.size() < dc.ibSize) ibRaw.resize(dc.ibSize);
-                if (!mem.ReadBytes(dc.ibBase, ibRaw.data(), dc.ibSize)) {
+                if (!guestMem.ReadBytes(dc.ibBase, ibRaw.data(), dc.ibSize)) {
                     refuse("ib-read-failed", s_cpRefuseIbUnreadable,
                            "- ReadBytes on the validated index buffer failed.");
                     break;
@@ -2520,12 +2766,372 @@ void RenderThread::processCommand(const RenderCommand& cmd) {
             // denormal no guest writes as a position; read as the guest wrote it
             // it is 0xBF000000 = -0.5. The probe in the backend prints that row
             // verbatim, so the next soak answers it directly.
+            // F-899 (2026-10-27): guest texture descriptors, carried from the CP
+            // (dc.textureDescriptorBytes, 24 big-endian bytes per descriptor, up
+            // to kCpMaxTextureDescriptors). For each descriptor we decode it,
+            // plan the import, read the tiled payload from guest memory, untile
+            // it, convert endianness, and hand the linear bytes to the backend
+            // via GuestTextureEntry::mipPayloads[0]. This mirrors the vertex
+            // buffer path (ReadBytes + swap) plus the untile step that the
+            // texture_decode module already implements.
+            //
+            // A failure at any step leaves mipPayloads[0] null, which makes
+            // BindGuestTextures refuse honestly ("no untiled payload from the
+            // producer") and write a null SRV -- the same state the heap
+            // already held, but now the capture census (CP-TEXDESC-CAPTURE) and
+            // the bind-refusal census both move, so the two halves of the gap
+            // are independently observable.
             static std::vector<uint8_t> vb;
+            static std::vector<mcla::native::D3D12Backend::GuestTextureEntry>
+                guestTextures;
+            // Static payload buffers, one per texture slot. BindGuestTextures
+            // copies the bytes into the upload heap during the draw call, so a
+            // buffer scoped to this handler is sufficient (same lifetime as vb).
+            static std::vector<std::vector<uint8_t>> texPayloads;
+            static std::vector<uint32_t> texW;
+            static std::vector<uint32_t> texH;
+            guestTextures.clear();
+            texPayloads.clear();
+            texW.clear();
+            texH.clear();
+            guestTextures.reserve(dc.textureCount);
+            texPayloads.reserve(dc.textureCount);
+            texW.reserve(dc.textureCount);
+            texH.reserve(dc.textureCount);
+
+
+            // guestMem is already declared at the top of the DRAW_CAPTURED handler
+            // (line ~2199); reuse it rather than re-declaring.
+
+            for (uint32_t ti = 0; ti < dc.textureCount; ++ti) {
+                if (ti == 0) STALL_STAGE("tex-loop");
+                mcla::native::D3D12Backend::GuestTextureEntry e{};
+                e.descriptorIndex = (ti < 4u) ? ti : ti;  // 0..15; bind refuses >=4
+                for (uint32_t b = 0; b < 24u; ++b) {
+                    e.descriptorBytes[b] = dc.textureDescriptorBytes[ti][b];
+                }
+                e.mipPayloads[0] = nullptr;
+                e.mipBytes[0] = 0;
+                e.mipCount = 0;  // plan.mipCount
+
+                // Decode the 24-byte descriptor.
+                mcla::native::GuestTextureDesc gtd{};
+                if (!mcla::native::DecodeGuestTextureDescriptor(e.descriptorBytes, gtd) ||
+                    !gtd.valid) {
+                    guestTextures.push_back(e);
+                    texPayloads.push_back({});
+                    texW.push_back(0);
+                    texH.push_back(0);
+                    continue;
+                }
+
+                // Bind by the shader's register dimension: t0=1D, t1=2D, t2=3D, t3=cube.
+                e.descriptorIndex = static_cast<uint32_t>(gtd.dimension);
+                if (mcla::native::D3D12Backend::HasFrameTexture(e.descriptorBytes)) {
+                    guestTextures.push_back(e);
+                    texPayloads.push_back({});
+                    texW.push_back(0);
+                    texH.push_back(0);
+                    continue;
+                }
+
+                // TEMP DIAGNOSTIC (F-900): the shader picks its t-register from
+                // the FETCH instruction's dimension (t1D=t0, t2D=t1, t3D=t2,
+                // tCube=t3 -- shader_translator.cpp:1296-1299,1309-1311), while
+                // this loop binds at heap slot kTexture2DSlot+descriptorIndex
+                // (= 1 + descriptorIndex). Measured: the dumped PS samples tCube
+                // (t3) yet descriptorIndex=ti=0 lands at slot 1 (t1) -> the
+                // shader reads a NULL SRV -> black. Log the descriptor's own
+                // dimension so the correct descriptorIndex can be derived.
+                //
+                // F-914: unthrottled this row printed once per texture slot per
+                // draw -- 170,136 rows in ga062 (~9% of the log, the #2 marker).
+                // House cadence (d3d12_backend.cpp:263-269: first 8, then every
+                // 200th) keeps the marker firing (a zero would be vacuous, rule
+                // 19) without the flood. The `#{}` argument is now the row
+                // counter; the old format passed `ti`, i.e. `#0` on all 170,136
+                // rows. `drawSeq` still carries `n`, exactly as before.
+                static std::atomic<uint32_t> s_texSlotDecide{0};
+                const uint32_t tsdN =
+                    s_texSlotDecide.fetch_add(1, std::memory_order_relaxed) + 1u;
+                if (tsdN <= 8u || (tsdN % 200u) == 0u) {
+                    MCLA_LOG_INFO("TEX-SLOT-DECIDE #{} drawSeq={} ti={} dim={} fmt={} {}x{} "
+                                  "curIdx={} curSlot={} poolVa={:08X} needForCube=2",
+                                  tsdN, n, ti, static_cast<uint32_t>(gtd.dimension),
+                                  gtd.xenosFormat, gtd.width, gtd.height,
+                                  e.descriptorIndex, 1u + e.descriptorIndex,
+                                  dc.texturePoolVa[ti]);
+                }
+
+                // Block-compressed (DXT) textures on Xenos store their 16-bit
+                // endpoints and lookup tables in guest endianness (typically
+                // k8in16 = 1), which Xenia's load shaders swap via
+                // XeEndianSwap32(..., load_info.endian_32) before unpacking
+                // (.research/xenia/src/xenia/gpu/shaders/texture_load_dxt3_rgba8.cs.xesl:37,
+                // texture_load_dxt5_rgba8.cs.xesl:37). Do NOT zero gtd.endianness
+                // here: ConvertTextureEndianness below performs the k8in16 byte-pair
+                // swap on the untiled linear buffer before DecodeBc1/2/3Block reads it.
+                const bool is3D = (gtd.dimension == mcla::native::GuestTextureDimension::ThreeD);
+                const bool isDS = (gtd.dimension == mcla::native::GuestTextureDimension::TwoDOrStacked &&
+                                   gtd.stacked && gtd.depth > 1);
+                const mcla::native::TextureImportPlan plan = mcla::native::PlanTextureImport(
+                    gtd.xenosFormat, gtd.width, gtd.height, gtd.depthOrArraySize,
+                    gtd.mipMaxLevel, gtd.endianness, gtd.tiled, gtd.packedMips,
+                    is3D, isDS);
+                if (!plan.ok) {
+                    guestTextures.push_back(e);
+                    texPayloads.push_back({});
+                    texW.push_back(0);
+                    texH.push_back(0);
+                    continue;
+                }
+
+                // Compute the tiled surface size (bytes of tiled guest memory).
+                //
+                // 32-BLOCK STORAGE ALIGNMENT (measured): Xenia aligns BOTH the
+                // block pitch and the row count up to 32 blocks before computing
+                // storage (texture_util.cc:324-327 row pitch, :339-342 row
+                // count), and GetTiledOffset2D internally asserts pitch&31==0
+                // (texture_address.h:196). A 320x256 DXT (80 blocks wide) needs
+                // 96*64*8 = 49,152 B of storage but the unaligned math below
+                // would pass 80*64*8 = 40,960 B, silently skipping 512 of 5,120
+                // blocks (white band on the right). 256x256 is already aligned
+                // (64 blocks), so this did not fire on the measured texture --
+                // it is a correctness fix for every other width.
+                const uint32_t bpb = mcla::native::GetTextureBytesPerBlock(gtd.xenosFormat);
+                const uint32_t blocksX = (gtd.width + plan.blockWidth - 1) / plan.blockWidth;
+                const uint32_t blocksY = (gtd.height + plan.blockHeight - 1) / plan.blockHeight;
+                uint32_t inputPitch = (gtd.pitchTexels > 0)
+                    ? ((gtd.pitchTexels + plan.blockWidth - 1) / plan.blockWidth)
+                    : blocksX;
+                if (inputPitch < blocksX) inputPitch = blocksX;
+                uint32_t inputHeight = (gtd.height > 0)
+                    ? ((gtd.height + plan.blockHeight - 1) / plan.blockHeight)
+                    : blocksY;
+                // Xenia's storage extent: both dimensions 32-block aligned.
+                auto align32 = [](uint32_t v) { return (v + 31u) & ~31u; };
+                const uint32_t storedPitch = align32(inputPitch);
+                const uint32_t storedRows = align32(inputHeight);
+                inputPitch = storedPitch;      // the untile guard sees the real grid
+                inputHeight = storedRows;
+                uint32_t tiledSize = storedPitch * storedRows * bpb;
+                if (tiledSize == 0) tiledSize = plan.linearByteSize;
+                if (tiledSize > plan.linearByteSize * 4) tiledSize = plan.linearByteSize * 4;
+                // F-900 STALL-GUARD (2026-10-28): garbage fetch descriptors
+                // name GB surfaces (measured: consumer stops ~60k draws with a
+                // full queue and no crash/log -- consistent with UntileTexture2D
+                // looping billions of blocks or multi-GB vector zero-fills).
+                // The flat guest window validates almost any range, so IsValid
+                // below cannot catch it. Refuse sizes the host cannot upload:
+                // backend refuses payloads > 64 MiB anyway, so anything bigger
+                // can never bind. Counted; first 4 + every 200th print dims.
+                {
+                    static std::atomic<uint32_t> s_tsizeRef{0};
+                    const uint64_t lin = plan.linearByteSize;
+                    // Extents first: plan math is uint32 and can WRAP garbage
+                    // dims to a small linearByteSize (which would pass the byte
+                    // cap below while info.width/height stay huge and the untile
+                    // loops spin for billions of blocks). Xenos max is 8192;
+                    // 16384 leaves headroom without letting garbage through.
+                    const bool dimsWild =
+                        gtd.width > 16384u || gtd.height > 16384u ||
+                        gtd.pitchTexels > 16384u;
+                    if (dimsWild || lin > 67108864ull || tiledSize > 268435456u) {
+                        const uint32_t n = s_tsizeRef.fetch_add(1) + 1;
+                        if (n <= 4 || (n % 200) == 0) {
+                            MCLA_LOG_ERROR("RENDER-TEX-SIZE-REFUSE #{} ti={} "
+                                           "fmt={} {}x{} pitch={} tiled={} "
+                                           "linear={} -- NULL payload (bind refuses)",
+                                           n, ti, gtd.xenosFormat, gtd.width,
+                                           gtd.height, gtd.pitchTexels, tiledSize,
+                                           lin);
+                        }
+                        guestTextures.push_back(e);
+                        texPayloads.push_back({});
+                        texW.push_back(0);
+                        texH.push_back(0);
+                        continue;
+                    }
+                }
+
+                // The pool VA was translated at enqueue time (CpBridgeDraw) and
+                // carried in dc.texturePoolVa[ti]. Use it directly -- the consumer
+                // does not re-translate (the helpers are not declared in headers).
+                uint32_t poolVa = dc.texturePoolVa[ti];
+
+                // Read guest memory.
+                std::vector<uint8_t> tiledBuf(tiledSize, 0);
+                if (!guestMem.IsValid(poolVa, tiledSize) ||
+                    !guestMem.ReadBytes(poolVa, tiledBuf.data(), tiledSize)) {
+                    guestTextures.push_back(e);
+                    texPayloads.push_back({});
+                    texW.push_back(0);
+                    texH.push_back(0);
+                    continue;
+                }
+
+                // Untile + convert endianness.
+                std::vector<uint8_t> linearBuf(plan.linearByteSize, 0);
+                if (gtd.tiled) {
+                    mcla::native::TextureUntileInfo info{};
+                    info.format = mcla::native::GetTextureFormatInfo(gtd.xenosFormat);
+                    info.offsetX = 0;
+                    info.offsetY = 0;
+                    info.width = plan.blocksX;
+                    info.height = plan.blocksY;
+                    info.inputPitch = inputPitch;
+                    info.inputHeight = inputHeight;
+                    info.outputPitch = plan.blocksX;
+                    info.srcBytes = tiledSize;
+                    info.dstBytes = plan.linearByteSize;
+                    mcla::native::TextureUntileRefusal refusal = mcla::native::TextureUntileRefusal::None;
+                    if (is3D) {
+                        mcla::native::UntileTexture3D(tiledBuf.data(), linearBuf.data(), info,
+                                                     gtd.depthOrArraySize, &refusal);
+                    } else {
+                        mcla::native::UntileTexture2D(tiledBuf.data(), linearBuf.data(), info, &refusal);
+                    }
+                    if (refusal != mcla::native::TextureUntileRefusal::None) {
+                        // Untile failed -- leave payload null (BindGuestTextures refuses).
+                        // F-902: keep texW/texH ALIGNED with texPayloads (push zeros
+                        // like every other refusal path). Omitting them misaligns
+                        // texW[i]/texH[i] from texPayloads[i] for all later slots,
+                        // and the TEXEL-FLIP probe reads texPayloads[0] at
+                        // texW/H[0]-derived offsets -- a short/empty payload with
+                        // foreign dims AVs the render thread (ga020: parked).
+                        guestTextures.push_back(e);
+                        texPayloads.push_back({});
+                        texW.push_back(0);
+                        texH.push_back(0);
+                        continue;
+                    }
+                } else {
+                    if (tiledSize >= plan.linearByteSize) {
+                        std::memcpy(linearBuf.data(), tiledBuf.data(), plan.linearByteSize);
+                    } else {
+                        std::memcpy(linearBuf.data(), tiledBuf.data(), tiledSize);
+                    }
+                }
+
+                // Convert endianness.
+                mcla::native::ConvertTextureEndianness(gtd.endianness, linearBuf.data(),
+                    plan.linearByteSize, plan.texelBytes);
+
+                // Store the untiled, endian-converted bytes.
+                texPayloads.push_back(std::move(linearBuf));
+                texW.push_back(gtd.width);
+                texH.push_back(gtd.height);
+                e.mipPayloads[0] = texPayloads.back().data();
+                e.mipBytes[0] = static_cast<uint32_t>(texPayloads.back().size());
+                e.mipCount = 1;
+                guestTextures.push_back(e);
+            }
+
             if (vb.size() < dc.vbSize) vb.resize(dc.vbSize);
-            if (!mem.ReadBytes(dc.vbBase, vb.data(), dc.vbSize)) {
+
+            // F-914 (d) moved (tofu-regression.md Fix 3): the force-to-white now
+            // runs AFTER the guest copy + endian transform (see below), so the
+            // forced bytes survive into desc.vertexBytes. This site is removed.
+
+            // F-902 STALL-GUARD (same shape as RENDER-TEX-SIZE-REFUSE): vbSize
+            // is guest-controlled and this ReadBytes precedes all validation.
+            // A garbage size stalls the consumer in a multi-GB copy.
+            // Cap: 64 MiB (generous -- 1M verts x 64 B). Counted + logged.
+            if (dc.vbSize > 67108864u) {
+                static std::atomic<uint32_t> s_vbSizeRef{0};
+                const uint32_t n = s_vbSizeRef.fetch_add(1) + 1;
+                if (n <= 4 || (n % 200) == 0) {
+                    MCLA_LOG_ERROR("RENDER-VB-SIZE-REFUSE #{} vbBase={:08X} "
+                                   "vbSize={} -- NULL draw (bind refuses)",
+                                   n, dc.vbBase, dc.vbSize);
+                }
+                refuse("vb-size-wild", s_cpRefuseVbMissing,
+                       "- vertex buffer size exceeds the 64 MiB host cap; "
+                       "refused rather than copied.");
+                break;
+            }
+            STALL_STAGE("vb-fill");
+            if (!guestMem.ReadBytes(dc.vbBase, vb.data(), dc.vbSize)) {
                 refuse("vb-unreadable", s_cpRefuseVbMissing,
                        "- vertex buffer range validated but ReadBytes failed.");
                 break;
+            }
+
+            // F-917 VB-RAW: raw capture of the REAL vertex bytes, after the copy
+            // and BEFORE any endianness transform, together with the fetch-element
+            // table in the log row. Purpose: the legals tofu proved the atlas
+            // decodes correctly (texdump_13BCC000), so the failure must be in the
+            // quads we replay -- positions/UVs. This dump makes them measurable.
+            // Toggle off with env MCLA_VB_DUMP=0.
+            {
+                static const bool s_vbDumpEnabled = [](){
+                    const char* e = std::getenv("MCLA_VB_DUMP");
+                    return !(e != nullptr && e[0] == '0');
+                }();
+                static std::atomic<uint32_t> s_vbDump{0};
+                if (s_vbDumpEnabled) {
+                    const uint32_t dn = s_vbDump.fetch_add(1) + 1;
+                    if (dn <= 900 && dc.vbSize <= 65536u && dc.vbStride > 0 &&
+                        (dc.vbSize % dc.vbStride) == 0u) {
+                        char name[96];
+                        std::snprintf(name, sizeof(name), "vb_raw_%04d_%08X_s%02u_%u.bin",
+                                      dn, dc.vbBase, dc.vbStride, dc.vbSize);
+                        if (std::FILE* f = std::fopen(name, "wb")) {
+                            std::fwrite(vb.data(), 1, dc.vbSize, f);
+                            std::fclose(f);
+                        }
+                        if (dn <= 8 || (dn % 200) == 0) {
+                            char els[280] = {0};
+                            size_t w = 0;
+                            for (uint32_t fe = 0u;
+                                 fe < dc.vbElementCount && fe < mcla::native::kCpVertexElementMax &&
+                                 w + 48 < sizeof(els); ++fe) {
+                                w += static_cast<size_t>(std::snprintf(
+                                    els + w, sizeof(els) - w,
+                                    "e%u:off%u,st%u,xs%u,b%u,en%u,",
+                                    dc.vbElements[fe].elementIndex,
+                                    dc.vbElements[fe].offsetBytes,
+                                    dc.vbElements[fe].strideBytes,
+                                    dc.vbElements[fe].fmt.xenos,
+                                    dc.vbElements[fe].fmt.bytes,
+                                    dc.vbElements[fe].endianness));
+                            }
+                            MCLA_LOG_WARN("VB-DUMP #{} base={:08X} size={} stride={} nelem={} nverts={} [{}]",
+                                          dn, dc.vbBase, dc.vbSize, dc.vbStride, dc.vbElementCount,
+                                          (dc.vbStride > 0) ? (dc.vbSize / dc.vbStride) : 0u, els);
+                            // F-919 TEXTURE-BIND: for the captured draws, decode the
+                            // carried texture descriptors the SAME way the backend
+                            // does, so the row names the guest texture THIS draw
+                            // samples. Alignment: one group of rows directly below
+                            // the dn row.
+                            for (uint32_t tb = 0u;
+                                 tb < dc.textureCount && tb < 4u; ++tb) {
+                                mcla::native::GuestTextureDesc bt{};
+                                const uint8_t* bts = dc.textureDescriptorBytes[tb];
+                                if (mcla::native::DecodeGuestTextureDescriptor(
+                                        bts, bt) && bt.valid) {
+                                    MCLA_LOG_WARN(
+                                        "TEXTURE-BIND #{} ti={} dim={} "
+                                        "baseAddress={:08X} {}x{} "
+                                        "xenos={} endianness={} "
+                                        "tiled={} poolVa={:08X}",
+                                        dn, tb,
+                                        static_cast<uint32_t>(bt.dimension),
+                                        bt.baseAddress, bt.width, bt.height,
+                                        bt.xenosFormat,
+                                        bt.endianness, bt.tiled,
+                                        dc.texturePoolVa[tb]);
+                                } else {
+                                    MCLA_LOG_WARN(
+                                        "TEXTURE-BIND #{} ti={} "
+                                        "DECODE-REFUSED(first4={:02X}{:02X}"
+                                        "{:02X}{:02X})",
+                                        dn, tb, bts[0], bts[1], bts[2], bts[3]);
+                                }
+                            }
+                        }
+                    }
+                }
             }
 
             // F-751: read the selector, then APPLY IT. Everything above is the
@@ -2614,7 +3220,35 @@ void RenderThread::processCommand(const RenderCommand& cmd) {
                     raw = mcla::gpu::CpGpuSwap32(raw, vbEndianness);
                     std::memcpy(p, &raw, 4);
                 }
-            }            // F-633: the VERTEX count. For kAutoIndex it is
+            }
+            // F-914 (d) moved (tofu-regression.md Fix 3): vertex color at offset 24
+            // MEASURED from GFX-2D-VERT: The high byte of the vertex color is the guest's
+            // animated ALPHA CHANNEL for fading (e.g. 0x03777777 -> 0xDF777777 -> 0xFF777777 for text,
+            // 0x0FF4CC04 -> 0xFFF4CC04 for Rockstar yellow, and 0xFF000000 for black background quads).
+            // Guest writes [AA, RR, GG, BB] on PPC big-endian. CpGpuSwap32 reverses the dword (k8in32)
+            // into [BB, GG, RR, AA]. For DXGI_FORMAT_R8G8B8A8_UNORM, swap byte 0 and 2 so that
+            // [RR, GG, BB, AA] maps correctly to Red, Green, Blue, Alpha.
+            bool hasColorAt24 = false;
+            for (uint32_t fe = 0u; fe < dc.vbElementCount &&
+                                    fe < mcla::native::kCpVertexElementMax; ++fe) {
+                if (dc.vbElements[fe].offsetBytes == 24u &&
+                    dc.vbElements[fe].fmt.dxgi == 28u) {
+                    hasColorAt24 = true;
+                    break;
+                }
+            }
+            if (hasColorAt24 && dc.vbSize >= 28u) {
+                const uint32_t numVerts = dc.vbSize / 36u;
+                for (uint32_t v = 0; v < numVerts; ++v) {
+                    uint8_t* col = vb.data() + v * 36u + 24u;
+                    std::swap(col[0], col[2]); // Swap BB and RR -> [RR, GG, BB, AA]
+                }
+            }
+            // F-914 (b) DISABLED: the UV flip (1-U) was tested and did not fix
+            // the tofu -- both original and flipped UVs sample transparent texels
+            // (alpha=0), and with blend on both are invisible. The defect is not
+            // a simple mirror; it requires decompiling the guest's vertex generator
+            // to find the correct UV scale/offset. Reverted to original UVs.            // F-633: the VERTEX count. For kAutoIndex it is
             // VGT_DRAW_INITIATOR.num_indices, which is what IssueDraw is handed
             // upstream (:1381) - deriving it from vbSize/vbStride instead would
             // invent a count the guest never stated, and the two are not required
@@ -2750,6 +3384,146 @@ void RenderThread::processCommand(const RenderCommand& cmd) {
             desc.vertexBytesSize = dc.vbSize;
             desc.vertexStride = dc.vbStride;
             desc.vertexCount = vertexCount;
+            // TEMP DIAGNOSTIC (F-900): dump vert-0 UV words. The PS samples at
+            // r0.xy (= iTexCoord0.xy = element2 R32G32_FLOAT at offB=28). The
+            // TEXCENTER probe (fixed 0.5,0.5) returned white but TEXONLY
+            // (vertex UVs) and SATURATE(vertex UVs) both return black --
+            // saturate() cannot fix NaN, so suspect NaN payload words.
+            {
+                static uint32_t s_uvDiag = 0;
+                const uint32_t ud = ++s_uvDiag;
+                if (dc.vbSize >= 36 && (ud <= 4 || (ud % 500) == 0)) {
+                    // TEMP F-900 FULL-VERT0 (remove after UV/layout overlap is
+                    // settled): the three-dword read below assumed TEXCOORD0 at
+                    // off28/32 (stride-36 layout). Some draws show insane values
+                    // there (-653.95: ga001 #2) and some sane (0.207: ga001 #3)
+                    // under the SAME layout, so the question is what the whole
+                    // first vertex holds and where the sane floats actually sit.
+                    // Dump vert-0..2 raw (up to 84B = 3 stride-28 verts) + as
+                    // floats, with vbBase so a stale/unwritten buffer can be told
+                    // from a misdecoded one. Extended 2026-10-28: prim-8's v0 UV
+                    // is (0,0,0,1) (ga012 #1) -- need v1/v2 to tell constant
+                    // black (all verts ~0) from a gradient (varying UVs).
+                    {
+                        char hex[253] = {};
+                        char flt[353] = {};
+                        const uint32_t avail =
+                            (dc.vbSize < 84u) ? dc.vbSize : 84u;
+                        for (uint32_t k = 0; k < avail; ++k) {
+                            std::snprintf(hex + k * 2, 3, "%02X",
+                                          vb.data()[k]);
+                        }
+                        for (uint32_t k = 0; k + 4 <= avail && k < 84; k += 4) {
+                            float fv = 0;
+                            std::memcpy(&fv, vb.data() + k, 4);
+                            char tmp[32] = {};
+                            std::snprintf(tmp, sizeof(tmp), "%.3g,",
+                                          static_cast<double>(fv));
+                            std::strncat(flt, tmp,
+                                         sizeof(flt) - std::strlen(flt) - 1);
+                        }
+                        MCLA_LOG_INFO("VERTEX-V0 #{} vbBase={:08X} stride={} "
+                                      "bytes={} floats=[{}]",
+                                      ud, dc.vbBase, dc.vbStride, hex, flt);
+                    }
+                    uint32_t w6 = 0, w7 = 0, w8 = 0;
+                    float f6 = 0, f7 = 0, f8 = 0;
+                    std::memcpy(&w6, vb.data() + 24, 4);
+                    std::memcpy(&w7, vb.data() + 28, 4);
+                    std::memcpy(&w8, vb.data() + 32, 4);
+                    std::memcpy(&f6, &w6, 4);
+                    std::memcpy(&f7, &w7, 4);
+                    std::memcpy(&f8, &w8, 4);
+                    MCLA_LOG_INFO("VERTEX-UV #{} stride={} off24={:08X}({:.4f}) "
+                                  "off28={:08X}({:.4f}) off32={:08X}({:.4f})",
+                                  ud, dc.vbStride, w6, f6, w7, f7, w8, f8);
+                    // F-900: CPU-side texel probe. Samples ti=0's linear payload
+                    // at vert-0's own UV -- the exact texel the GPU SampleLevel
+                    // would read (modulo filtering). Settles content-vs-pipeline
+                    // without touching the GPU: non-zero here + black on screen
+                    // = pipeline fault; zero here = UVs point at empty atlas.
+                    if (!texPayloads.empty() && !texPayloads[0].empty() &&
+                        texW.size() > 0 && texH.size() > 0 && texW[0] > 0 &&
+                        f7 >= 0.0f && f7 < 1.0f && f8 >= 0.0f && f8 < 1.0f) {
+                        uint32_t tw = texW[0], th = texH[0];
+                        uint32_t tx = static_cast<uint32_t>(f7 * tw);
+                        uint32_t ty = static_cast<uint32_t>(f8 * th);
+                        if (tx >= tw) tx = tw - 1;
+                        if (ty >= th) ty = th - 1;
+                        const uint8_t* px = texPayloads[0].data() +
+                                            (static_cast<size_t>(ty) * tw + tx) * 4u;
+                        // Guard against short payloads (shouldn't happen:
+                        // linearByteSize == w*h*4 for RGBA8).
+                        if ((static_cast<size_t>(ty) * tw + tx + 1u) * 4u <=
+                            texPayloads[0].size()) {
+                            MCLA_LOG_INFO("TEXEL-AT-UV #{} u={:.4f} v={:.4f} "
+                                          "tex={}x{} xy={}x{} rgba=({},{},{},{})",
+                                          ud, f7, f8, tw, th, tx, ty,
+                                          px[0], px[1], px[2], px[3]);
+                            // TEMP F-900 Y-FLIP probe (remove after overlap is
+                            // settled): sample the VERTICALLY MIRRORED texel too.
+                            // If the guest's v=0 is the image BOTTOM, content in
+                            // rows 0-63 is really at v 0.75-1.0 and every direct
+                            // sample misses while the mirror hits.
+                            // F-902: BOUND the mirror read like the direct one
+                            // above. An untile refusal once left texW/texH
+                            // misaligned with texPayloads (fixed at the push
+                            // site), so tw/th can describe a LARGER texture
+                            // than payload[0] holds; sampling (fy*tw+tx) then
+                            // reads OOB and AVs the render thread (ga020:
+                            // parked at TEXEL-FLIP after TEXEL-AT-UV #68500).
+                            uint32_t fy = (th - 1) - ty;
+                            if ((static_cast<size_t>(fy) * tw + tx + 1u) * 4u <=
+                                texPayloads[0].size()) {
+                                const uint8_t* fx = texPayloads[0].data() +
+                                                    (static_cast<size_t>(fy) * tw + tx) * 4u;
+                                MCLA_LOG_INFO("TEXEL-FLIP #{} u={:.4f} v={:.4f} "
+                                              "xy={}x{} rgba=({},{},{},{})",
+                                              ud, f7, f8, tx, fy,
+                                              fx[0], fx[1], fx[2], fx[3]);
+                            }
+                        }
+                    }
+                }
+            }
+            // F-897 (2026-10-25): THE VERTEX DATA DUMP -- what the GPU is
+            // actually asked to rasterise, in the bytes the backend uploads.
+            // WHY: after F-896 the 2D UI's draws stopped being empty (573,717
+            // triangle-class draws, prim0=0, emptyIdx=0, build/g914.log) and
+            // the framebuffer is STILL one uniform colour, rgba=(5,8,13,255).
+            // The remaining candidates are (a) the vertex bytes are not what the
+            // guest wrote, (b) the layout/PSO makes the shader emit a constant,
+            // (c) the viewport/scissor. This row separates (a) from the rest by
+            // printing the first eight dwords of the TRANSFORMED buffer (the
+            // byte-order selector has already been applied at :2531-2582) and
+            // the same words read as floats. Sane screen-space positions in the
+            // first dwords would rule (a) out; garbage would name it.
+            // Log-only: nothing is written, nothing is skipped, the upload that
+            // follows is untouched.
+            {
+              static std::atomic<uint32_t> s_vdump{0};
+              const uint32_t vn =
+                  s_vdump.fetch_add(1, std::memory_order_relaxed) + 1u;
+              if (vn <= 12u || (vn % 500u) == 0u) {
+                uint32_t dw[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+                float fl[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+                const uint32_t avail = (dc.vbSize < 32u) ? dc.vbSize : 32u;
+                if (avail > 0u) {
+                  std::memcpy(dw, vb.data(), avail);
+                }
+                std::memcpy(fl, dw, sizeof(fl));
+                MCLA_LOG_WARN(
+                    "DRAW-CP-VERTEX #{} vbBase={:08X} vbSize={} stride={} fmtB={} "
+                    "descs={}/{} numIdx={} vtxCount={} | dword[0..7]=[{:08X} "
+                    "{:08X} {:08X} {:08X} {:08X} {:08X} {:08X} {:08X}] "
+                    "float[0..7]=[{:.4f} {:.4f} {:.4f} {:.4f} {:.4f} {:.4f} "
+                    "{:.4f} {:.4f}]",
+                    vn, dc.vbBase, dc.vbSize, dc.vbStride, dc.vbFormat.bytes,
+                    dc.vbDescCount, dc.vbFullCount, dc.numIndices, vertexCount,
+                    dw[0], dw[1], dw[2], dw[3], dw[4], dw[5], dw[6], dw[7], fl[0],
+                    fl[1], fl[2], fl[3], fl[4], fl[5], fl[6], fl[7]);
+              }
+            }
             // F-633: the index half exists only for kDMA. For kAutoIndex these
             // stay at their zero-initialised values and the backend takes its
             // non-indexed branch, DrawInstanced(desc.vertexCount, 1, 0, 0)
@@ -2765,6 +3539,194 @@ void RenderThread::processCommand(const RenderCommand& cmd) {
                 // The old handler derived it from the buffer length, which
                 // over-drew every real index buffer by its unused tail.
                 desc.indexCount = tc.count;
+            } else if (dc.primitiveTopology == 13u && dc.numIndices >= 4u &&
+                       (dc.numIndices % 4u) == 0u && dc.vbSize >=
+                           static_cast<uint32_t>(dc.numIndices) * dc.vbStride) {
+                // kAutoIndex quad list: every 4 sequential vertices form one
+                // quad, implicit indices 0..n-1. Non-indexed TRIANGLE_LIST
+                // would draw diagonal triangles. Expand the SAME geometry to
+                // indexed triangles (0,1,2)(0,2,3) per quad.
+                static std::vector<uint16_t> quadIbAuto;
+                const uint32_t quadCount = dc.numIndices / 4u;
+                const uint32_t expIdx = quadCount * 6u;
+                if (quadIbAuto.size() < expIdx) quadIbAuto.resize(expIdx);
+                for (uint32_t q = 0u; q < quadCount; ++q) {
+                    const uint16_t b = static_cast<uint16_t>(q * 4u);
+                    quadIbAuto[q * 6u + 0u] = static_cast<uint16_t>(b + 0u);
+                    quadIbAuto[q * 6u + 1u] = static_cast<uint16_t>(b + 1u);
+                    quadIbAuto[q * 6u + 2u] = static_cast<uint16_t>(b + 2u);
+                    quadIbAuto[q * 6u + 3u] = static_cast<uint16_t>(b + 0u);
+                    quadIbAuto[q * 6u + 4u] = static_cast<uint16_t>(b + 2u);
+                    quadIbAuto[q * 6u + 5u] = static_cast<uint16_t>(b + 3u);
+                }
+                desc.indexed = true;
+                desc.indexBytes = quadIbAuto.data();
+                desc.indexBytesSize = expIdx * 2u;
+                desc.indexFormat = DXGI_FORMAT_R16_UINT;
+                desc.indexCount = expIdx;
+            }
+            // Rect-list CPU expansion (prim=8, kAutoIndex): 3 guest verts per
+            // rectangle -> 4 verts + 6 indices, drawn as an indexed
+            // TRIANGLE_LIST through the existing dynamic-mesh path. The
+            // reference expands in a geometry shader; this draw carries a
+            // non-GS pipeline (see psi.primType below), so the expansion must
+            // happen here or the draw would rasterise as one triangle (half
+            // the quad) against a GS-less PSO (F-609). The math is the
+            // parallelogram completion over the whole vertex (position and
+            // every float interpolator with the same combination), and the
+            // quad is (0,1,2)+(0,2,3) per rect. Restricted to the measured
+            // class: non-indexed, num_indices a multiple of 3, float-only
+            // vertex formats (dxgi 2/6/16/41/34/10). Anything else falls
+            // through to the GS path unchanged (or its honest refusal).
+            bool rectCpuExpanded = false;
+            bool quadCpuExpanded = false;
+            if (!indexed && dc.primitiveTopology == 8u && dc.numIndices >= 3u &&
+                (dc.numIndices % 3u) == 0u && dc.vbStride > 0u &&
+                dc.vbStride % 4u == 0u) {
+                bool floatOnly = true;
+                for (uint32_t fe = 0u; fe < dc.vbElementCount &&
+                                      fe < mcla::native::kCpVertexElementMax; ++fe) {
+                    const uint32_t dx = dc.vbElements[fe].fmt.dxgi;
+                    if (dx != 2u && dx != 6u && dx != 16u && dx != 41u &&
+                        dx != 34u && dx != 10u) {
+                        floatOnly = false;
+                        break;
+                    }
+                }
+                if (dc.vbElementCount == 0u) floatOnly = false;
+                const uint32_t rectCount = dc.numIndices / 3u;
+                const uint64_t expVerts64 = static_cast<uint64_t>(rectCount) * 4ull;
+                if (floatOnly && expVerts64 <= 65535ull &&
+                    static_cast<uint64_t>(dc.numIndices) * dc.vbStride <= dc.vbSize) {
+                    const uint32_t expVerts = static_cast<uint32_t>(expVerts64);
+                    const uint32_t expIdx = rectCount * 6u;
+                    static std::vector<uint8_t> rectVbExp;
+                    static std::vector<uint16_t> rectIbExp;
+                    const size_t needVb = static_cast<size_t>(expVerts) * dc.vbStride;
+                    if (rectVbExp.size() < needVb) rectVbExp.resize(needVb);
+                    if (rectIbExp.size() < expIdx) rectIbExp.resize(expIdx);
+                    const uint32_t lanes = dc.vbStride / 4u;
+                    for (uint32_t q = 0u; q < rectCount; ++q) {
+                        const uint8_t* v0 = vb.data() +
+                            static_cast<size_t>(q * 3u) * dc.vbStride;
+                        const uint8_t* v1 = v0 + dc.vbStride;
+                        const uint8_t* v2 = v0 + 2u * dc.vbStride;
+                        uint8_t* out0 = rectVbExp.data() +
+                            static_cast<size_t>(q * 4u) * dc.vbStride;
+                        uint8_t* out1 = out0 + dc.vbStride;
+                        uint8_t* out2 = out0 + 2u * dc.vbStride;
+                        uint8_t* out3 = out0 + 3u * dc.vbStride;
+                        std::memcpy(out0, v0, dc.vbStride);
+                        std::memcpy(out1, v1, dc.vbStride);
+                        std::memcpy(out2, v2, dc.vbStride);
+                        for (uint32_t l = 0u; l < lanes; ++l) {
+                            float f0 = 0.0f, f1 = 0.0f, f2 = 0.0f;
+                            std::memcpy(&f0, v0 + static_cast<size_t>(l) * 4u, 4);
+                            std::memcpy(&f1, v1 + static_cast<size_t>(l) * 4u, 4);
+                            std::memcpy(&f2, v2 + static_cast<size_t>(l) * 4u, 4);
+                            // Guest emits each rect as (TL, TR, BR): see
+                            // build/vb_raw_*_s28_84.bin and *_s08_24.bin, e.g.
+                            // (-0.5,-0.5),(1279.5,-0.5),(1279.5,719.5). The
+                            // missing corner BL is the diagonal midpoint:
+                            // BL = v0 + v2 - v1. The previously coded
+                            // v1 + v2 - v0 put the 4th corner at x=2559.5
+                            // (2x screen width) -- the giant diagonal
+                            // triangle across the legal screen.
+                            const float f3 = f0 + f2 - f1;
+                            std::memcpy(out3 + static_cast<size_t>(l) * 4u, &f3, 4);
+                        }
+                        const uint16_t b = static_cast<uint16_t>(q * 4u);
+                        rectIbExp[q * 6u + 0u] = static_cast<uint16_t>(b + 0u);
+                        rectIbExp[q * 6u + 1u] = static_cast<uint16_t>(b + 1u);
+                        rectIbExp[q * 6u + 2u] = static_cast<uint16_t>(b + 2u);
+                        rectIbExp[q * 6u + 3u] = static_cast<uint16_t>(b + 0u);
+                        rectIbExp[q * 6u + 4u] = static_cast<uint16_t>(b + 2u);
+                        rectIbExp[q * 6u + 5u] = static_cast<uint16_t>(b + 3u);
+                    }
+                    desc.vertexBytes = rectVbExp.data();
+                    desc.vertexBytesSize = static_cast<uint32_t>(needVb);
+                    desc.vertexCount = expVerts;
+                    desc.indexed = true;
+                    desc.indexBytes = rectIbExp.data();
+                    desc.indexBytesSize = expIdx * 2u;
+                    desc.indexFormat = DXGI_FORMAT_R16_UINT;
+                    desc.indexCount = expIdx;
+                    rectCpuExpanded = true;
+                    s_rectListExpanded.fetch_add(1, std::memory_order_relaxed);
+                }
+            }
+            // Quad-list CPU expansion (prim=13, indexed): 4 indices per quad ->
+            // (0,1,2),(0,2,3) indexed triangles, drawn as TRIANGLE_LIST. The
+            // reference expands in a geometry shader; this draw carries a non-GS
+            // pipeline here, so expand on the host (same as DrawIndexed path
+            // lines 1610-1643). numIdx=32 = 8 quads in the measured logo draws.
+            if (indexed && dc.primitiveTopology == 13u && tc.count >= 4u &&
+                (tc.count % 4u) == 0u) {
+                const uint32_t quadCount = tc.count / 4u;
+                const uint32_t expIdx = quadCount * 6u;
+                static std::vector<uint16_t> quadIbExpNarrow;
+                static std::vector<uint32_t> quadIbExpWide;
+                if (tc.isWide) {
+                    if (quadIbExpWide.size() < expIdx) quadIbExpWide.resize(expIdx);
+                    for (uint32_t q = 0u; q < quadCount; ++q) {
+                        const uint32_t i0 = tc.wide[q * 4u + 0u];
+                        const uint32_t i1 = tc.wide[q * 4u + 1u];
+                        const uint32_t i2 = tc.wide[q * 4u + 2u];
+                        const uint32_t i3 = tc.wide[q * 4u + 3u];
+                        quadIbExpWide[q * 6u + 0u] = i0;
+                        quadIbExpWide[q * 6u + 1u] = i1;
+                        quadIbExpWide[q * 6u + 2u] = i2;
+                        quadIbExpWide[q * 6u + 3u] = i0;
+                        quadIbExpWide[q * 6u + 4u] = i2;
+                        quadIbExpWide[q * 6u + 5u] = i3;
+                    }
+                    desc.indexBytes = quadIbExpWide.data();
+                    desc.indexBytesSize = expIdx * 4u;
+                    desc.indexFormat = DXGI_FORMAT_R32_UINT;
+                } else {
+                    if (quadIbExpNarrow.size() < expIdx) quadIbExpNarrow.resize(expIdx);
+                    for (uint32_t q = 0u; q < quadCount; ++q) {
+                        const uint16_t i0 = tc.narrow[q * 4u + 0u];
+                        const uint16_t i1 = tc.narrow[q * 4u + 1u];
+                        const uint16_t i2 = tc.narrow[q * 4u + 2u];
+                        const uint16_t i3 = tc.narrow[q * 4u + 3u];
+                        quadIbExpNarrow[q * 6u + 0u] = i0;
+                        quadIbExpNarrow[q * 6u + 1u] = i1;
+                        quadIbExpNarrow[q * 6u + 2u] = i2;
+                        quadIbExpNarrow[q * 6u + 3u] = i0;
+                        quadIbExpNarrow[q * 6u + 4u] = i2;
+                        quadIbExpNarrow[q * 6u + 5u] = i3;
+                    }
+                    desc.indexBytes = quadIbExpNarrow.data();
+                    desc.indexBytesSize = expIdx * 2u;
+                    desc.indexFormat = DXGI_FORMAT_R16_UINT;
+                }
+                desc.indexCount = expIdx;
+                quadCpuExpanded = true;
+            }
+            if (!indexed && dc.primitiveTopology == 13u && dc.numIndices >= 4u &&
+                (dc.numIndices % 4u) == 0u && dc.vbStride > 0u) {
+                // kAutoIndex quad list: every 4 sequential vertices form one
+                // quad (0,1,2)(0,2,3), no index bytes on the wire.
+                static std::vector<uint16_t> quadIbAuto;
+                const uint32_t quadCount = dc.numIndices / 4u;
+                const uint32_t expIdx = quadCount * 6u;
+                if (quadIbAuto.size() < expIdx) quadIbAuto.resize(expIdx);
+                for (uint32_t q = 0u; q < quadCount; ++q) {
+                    const uint16_t b = static_cast<uint16_t>(q * 4u);
+                    quadIbAuto[q * 6u + 0u] = static_cast<uint16_t>(b + 0u);
+                    quadIbAuto[q * 6u + 1u] = static_cast<uint16_t>(b + 1u);
+                    quadIbAuto[q * 6u + 2u] = static_cast<uint16_t>(b + 2u);
+                    quadIbAuto[q * 6u + 3u] = static_cast<uint16_t>(b + 0u);
+                    quadIbAuto[q * 6u + 4u] = static_cast<uint16_t>(b + 2u);
+                    quadIbAuto[q * 6u + 5u] = static_cast<uint16_t>(b + 3u);
+                }
+                desc.indexed = true;
+                desc.indexBytes = quadIbAuto.data();
+                desc.indexBytesSize = expIdx * 2u;
+                desc.indexFormat = DXGI_FORMAT_R16_UINT;
+                desc.indexCount = expIdx;
+                quadCpuExpanded = true;
             }
             // F-647: hand the backend the guest's real constant bank. A refusal
             // here is NOT fatal to the draw: the descriptor keeps its
@@ -2772,7 +3734,23 @@ void RenderThread::processCommand(const RenderCommand& cmd) {
             // its own CONST-BANK row, which is the honest state. The draw still
             // issues, because refusing the whole draw over a constant bank would
             // hide the pixels the index buffer already proved are real.
+            STALL_STAGE("constbank");
             (void)FillGuestConstantBank(desc);
+
+            // F-899 (2026-10-27): carry the guest's texture descriptors through
+            // to the backend. The descriptors are snapshotted at enqueue time
+            // (CpBridgeDraw, CP-TEXDESC-CAPTURE); the payload (untiled guest
+            // pixels) is not yet produced here, so guestTextures entries carry
+            // null mipPayloads[0] and BindGuestTextures refuses them honestly
+            // ("no untiled payload from the producer") -- the same null SRV the
+            // heap already held, but now the capture census (CP-TEXDESC-CAPTURE)
+            // and the bind-refusal census both move, so the two halves of the gap
+            // are independently observable. The untile + guest-memory read lands
+            // once the memory-location report confirms where the tiled data lives.
+            if (!guestTextures.empty()) {
+                desc.guestTextures = guestTextures.data();
+                desc.guestTextureCount = static_cast<uint32_t>(guestTextures.size());
+            }
 
             // --- step 4: the vertex INPUT LAYOUT, on the LIVE path ------------
             //
@@ -2885,6 +3863,8 @@ void RenderThread::processCommand(const RenderCommand& cmd) {
             uint32_t pipeVsElements = 0;     // the VS's OWN vertex-element table size
             uint32_t pipeVsInstructions = 0, pipeVsInterpolants = 0;
             uint64_t pipeVsHash = 0, pipePsHash = 0;
+            bool pipeVsPrecompiledAvail = false, pipePsPrecompiledAvail = false;
+            uint64_t pipeVsPrecompiledHash = 0, pipePsPrecompiledHash = 0;
             const char *pipeVsSrc = "absent", *pipePsSrc = "absent";
             std::string pipeVsHlsl, pipePsHlsl;
             std::string pipeTranslateError;
@@ -2975,9 +3955,9 @@ void RenderThread::processCommand(const RenderCommand& cmd) {
                     // the omission as deliberate) nor SQ_INTERPOLATOR_CNTL.
                     std::vector<uint8_t> vsCode, psCode, vsEnv, psEnv;
                     pipeVsCodeBytes = static_cast<uint32_t>(
-                        ResolveStageCode(dc.vsProgram, vsCode, pipeVsSrc, mem));
+                        ResolveStageCode(dc.vsProgram, vsCode, pipeVsSrc));
                     pipePsCodeBytes = static_cast<uint32_t>(
-                        ResolveStageCode(dc.psProgram, psCode, pipePsSrc, mem));
+                        ResolveStageCode(dc.psProgram, psCode, pipePsSrc));
                     if (pipeVsCodeBytes != 0u)
                         s_pipeVsCode.fetch_add(1, std::memory_order_relaxed);
                     if (pipePsCodeBytes != 0u)
@@ -2995,11 +3975,90 @@ void RenderThread::processCommand(const RenderCommand& cmd) {
                                 pipeVsInstructions = static_cast<uint32_t>(vsProg.instructions.size());
                                 pipeVsInterpolants = static_cast<uint32_t>(vsProg.interpolators.size());
                                 if (pipeVsElements == 0u) {
-                                    // Every semantic ReferencedVertexInputs could
-                                    // return is the POSITION fallback. Refuse.
-                                    s_pipeLayoutNoVertexElements.fetch_add(
-                                        1, std::memory_order_relaxed);
-                                    layoutRefusal = "no-vertex-elements";
+                                    // F-897: the embedded VS carries no
+                                    // vertexElements table (measured empty), but
+                                    // the CP may have captured fetch descriptors
+                                    // (dc.vbElementCount > 0). Those descriptors
+                                    // ARE the guest's own vertex declaration, so
+                                    // build the D3D12 input layout from them
+                                    // instead of refusing.
+                                    if (dc.vbElementCount > 0u &&
+                                        dc.vbElementCount <=
+                                            mcla::native::kCpVertexElementMax) {
+                                      static const uint32_t kUsageByElement[] = {
+                                          0u,  // POSITION (0)
+                                          3u,  // NORMAL (3)
+                                          6u,  // TANGENT (6)
+                                          5u,  // TEXCOORD (5, index 0)
+                                          5u,  // TEXCOORD (5, index 1)
+                                          10u, // COLOR (10)
+                                          1u,  // BLENDWEIGHT (1)
+                                          2u,  // BLENDINDICES (2)
+                                      };
+                                      for (uint32_t ae = 0u; ae < dc.vbElementCount;
+                                           ++ae) {
+                                        const auto& el = dc.vbElements[ae];
+                                        if (el.fmt.known == 0u || el.fmt.dxgi == 0u)
+                                          continue;
+                                        // F-900: PER-USAGE ORDINAL as the semantic
+                                        // index. The old code hardcoded
+                                        // SemanticIndex = 0 for every element, so
+                                        // element 0 AND elements 3..7 all resolved to
+                                        // POSITION0 (kUsageByElement maps 0,3,4,5,6,7
+                                        // -> 0): two POSITION/0 entries in one layout
+                                        // = "input layout does not match shader" at
+                                        // PSO creation. Never fired in a recorded
+                                        // soak only because the arm has never seen
+                                        // >3 elements (max measured 3; dormant since
+                                        // g932). The per-usage ordinal is
+                                        // byte-identical to the old output for every
+                                        // <=3-element layout (usageSeen yields
+                                        // 0,0,0 for three DISTINCT usages), so no
+                                        // measured draw changes; it only makes the
+                                        // (name,index) pair unique BY CONSTRUCTION
+                                        // for any vbElementCount <= 8. The table's
+                                        // own values (NORMAL/BLENDWEIGHT/... -> 0u)
+                                        // are deliberately NOT changed here: that
+                                        // mapping is unmeasured and the ordinal alone
+                                        // closes the duplicate.
+                                        uint32_t usageSeen[14] = {};
+                                        for (uint32_t ae2 = 0u; ae2 < ae; ++ae2) {
+                                          const auto& el2 = dc.vbElements[ae2];
+                                          if (el2.fmt.known == 0u || el2.fmt.dxgi == 0u)
+                                            continue;
+                                          const uint32_t u2 =
+                                              ae2 < 8u ? kUsageByElement[ae2] : 0u;
+                                          if (u2 < 14u) ++usageSeen[u2];
+                                        }
+                                        uint32_t usage =
+                                            ae < 8u ? kUsageByElement[ae] : 0u;
+                                        if (usage >= 14u) usage = 0u;
+                                        const uint32_t semanticIndex = usageSeen[usage];
+                                        D3D12_INPUT_ELEMENT_DESC e = {};
+                                        e.SemanticName =
+                                            mcla::renderer::VertexUsageSemanticName(
+                                                usage);
+                                        e.SemanticIndex = semanticIndex;
+                                        e.Format =
+                                            static_cast<DXGI_FORMAT>(el.fmt.dxgi);
+                                        e.InputSlot = 0;
+                                        e.InputSlotClass =
+                                            D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA;
+                                        e.AlignedByteOffset = el.offsetBytes;
+                                        inputLayout.push_back(e);
+                                        mcla::renderer::VertexInputSemantic sem;
+                                        sem.usage = usage;
+                                        sem.usageIndex = semanticIndex;
+                                        pinnedLayout.push_back(sem);
+                                      }
+                                    }
+                                    if (inputLayout.empty()) {
+                                      s_pipeLayoutNoVertexElements.fetch_add(
+                                          1, std::memory_order_relaxed);
+                                      layoutRefusal = "no-vertex-elements";
+                                    } else {
+                                      layoutRefusal = "none";
+                                    }
                                 } else {
                                     // A REAL element table. Build the layout from
                                     // the guest's own declaration and PROVE it is
@@ -3051,6 +4110,18 @@ void RenderThread::processCommand(const RenderCommand& cmd) {
                                     // place: a refusal that names its blocker beats a
                                     // pipeline that lies (charter F-609).
                                     layoutRefusal = "none";
+                                    // F-897 FALLBACK NOT REACHABLE HERE: a copy of
+                                    // the descriptor-built layout arm used to sit at
+                                    // this spot guarded on
+                                    // vsProg.vertexElements.empty(), but this is
+                                    // the else arm of `pipeVsElements == 0` (the
+                                    // assignment reads that same vector's size), so
+                                    // the guard was always false and the copy never
+                                    // executed (dead-code audit, 2026-10-27; the
+                                    // live arm is inside that if). Removed so it is
+                                    // not re-added -- it carried the same
+                                    // SemanticIndex=0 duplicate-POSITION0 defect
+                                    // the live arm was just fixed for (F-900).
                                     //
                                     // FIELD PROVENANCE, one line per field, because
                                     // a wrong layout is a fake and this is where
@@ -3446,6 +4517,18 @@ void RenderThread::processCommand(const RenderCommand& cmd) {
                         s_layoutBuilt.load(std::memory_order_relaxed),
                         s_layoutNoDecl.load(std::memory_order_relaxed),
                         s_layoutDeclRefused.load(std::memory_order_relaxed));
+                    // F-900: per-element semantics. The summary row cannot show
+                    // whether POSITION/COLOR/TEXCOORD map to the shader's
+                    // POSITION0/TEXCOORD0/TEXCOORD1. Log each bound element.
+                    for (size_t li = 0; li < inputLayout.size(); ++li) {
+                        MCLA_LOG_WARN("DRAW-CP-LAYOUT-ELEM #{} draw={} elem={}/{} "
+                                      "sem={}{} offB={} dxgi={}",
+                                      lb, n, li, inputLayout.size(),
+                                      inputLayout[li].SemanticName ? inputLayout[li].SemanticName : "?",
+                                      inputLayout[li].SemanticIndex,
+                                      inputLayout[li].AlignedByteOffset,
+                                      static_cast<uint32_t>(inputLayout[li].Format));
+                    }
                 }
             }
             // inputLayout / inputDeclHash are the seam step 5 consumes. They are
@@ -3591,7 +4674,13 @@ void RenderThread::processCommand(const RenderCommand& cmd) {
                 psi.paSuScModeCntl =
                     rs.regs[CpSnapshotReg::kCpSnapPaSuScModeCntl];
                 psi.paClVteCntl = rs.regs[CpSnapshotReg::kCpSnapPaClVteCntl];
-                psi.primType = static_cast<uint8_t>(dc.primitiveTopology);
+                // Expanded rect lists are drawn as triangle lists, so the key
+                // must name the triangle pipeline (no geometry stage), not
+                // the guest's rectangle primitive. The guest's 0x08 is kept
+                // in desc.xenosPrimType below; this field is what the PSO is
+                // built for.
+                psi.primType = static_cast<uint8_t>(
+                    rectCpuExpanded ? 0x04u : dc.primitiveTopology);
                 // haveRegisters is the DERIVATION's precondition, not the
                 // guest's: it says "these three values are the guest's", which is
                 // only true when all three presence bits are set. Any subset and
@@ -3634,6 +4723,15 @@ void RenderThread::processCommand(const RenderCommand& cmd) {
                          : mcla::renderer::kGuestRegNone) |
                     ((rs.presentMask & (1u << CpSnapshotReg::kCpSnapDepthInfo))
                          ? mcla::renderer::kGuestRegDepthInfo
+                         : mcla::renderer::kGuestRegNone) |
+                    // F-904: blend control + write mask. Two bits because a
+                    // lone control with an unmeasured mask (or vice versa)
+                    // must not read as "measured blend".
+                    ((rs.presentMask & (1u << CpSnapshotReg::kCpSnapBlendControl0))
+                         ? mcla::renderer::kGuestRegBlendControl
+                         : mcla::renderer::kGuestRegNone) |
+                    ((rs.presentMask & (1u << CpSnapshotReg::kCpSnapColorMask))
+                         ? mcla::renderer::kGuestRegColorMask
                          : mcla::renderer::kGuestRegNone);
                 // kFloat registers: the file's register values are the LOGICAL
                 // dwords (a big-endian READ produced them, which is byte-for-byte
@@ -3660,12 +4758,21 @@ void RenderThread::processCommand(const RenderCommand& cmd) {
                     (psi.registersPresent & mcla::renderer::kGuestRegDepthInfo)
                         ? ((rs.regs[CpSnapshotReg::kCpSnapDepthInfo] >> 16) & 1u)
                         : 0u;
-                // The Xenos ztest lives in RB_DEPTHCONTROL, which this tree does
-                // not capture (pipeline_cache.h:435-446). The caller therefore
-                // does NOT demand measured depth state here, so the derivation
-                // emits its DOCUMENTED always-pass/no-write placeholder and flags
-                // it kStateFlagUnmeasuredDepth rather than refusing every draw -
-                // a stated placeholder is countable, an unbuildable PSO is not.
+                // Viewport extents: RB_SURFACE_INFO carries surface_pitch (the
+                // guest's render-target width in pixels, measured 1280) but no
+                // height field (registers.h:670-680). Height defaults to the
+                // back-buffer height, exactly as d3d12_backend.cpp:3653-3656
+                // does (guestH = m_height when no guest height exists).
+                const auto grt = gpu::CpGuestRenderTargetInfo();
+                psi.viewportWidth = backend_.GetWidth();
+                psi.viewportHeight = backend_.GetHeight();
+                // Depth/stencil wiring: RB_DEPTHCONTROL (0x2200) captured from snapshot.
+                if (rs.presentMask & (1u << mcla::native::CpSnapshotReg::kCpSnapDepthControl)) {
+                    psi.registersPresent |= mcla::renderer::kGuestRegDepthControl;
+                    psi.depthControl = rs.regs[mcla::native::CpSnapshotReg::kCpSnapDepthControl];
+                }
+                // Wire DXGI_FORMAT_D24_UNORM_S8_UINT so 3D pipelines can enable depth testing.
+                psi.depthStencilFormat = DXGI_FORMAT_D24_UNORM_S8_UINT;
 
                 // --- F-723: the render-target format, from RB_COLOR_INFO ------
                 //
@@ -3768,9 +4875,54 @@ void RenderThread::processCommand(const RenderCommand& cmd) {
                     }
                 }
 
+                // F-904: RT0 blend control + write mask, raw dwords. Decoded in
+                // DerivePipelineState only when kGuestRegBlendControl is set;
+                // the mask nibble (bits 0-3) is used when kGuestRegColorMask is
+                // set, else 0xF (all channels = today's behaviour). Zero here
+                // means "never presented", never a blend equation -- see the
+                // presence discipline at kCpSnapBlendControl0/kCpSnapColorMask.
+                psi.blendControl0 = rs.regs[CpSnapshotReg::kCpSnapBlendControl0];
+                psi.blendColorMask = rs.regs[CpSnapshotReg::kCpSnapColorMask];
+
+                // F-914 option (a): this draw samples the font atlas if any bound
+                // texture's pool VA maps to guest base 0x13BCC000 (pool VA =
+                // guest + 0xA0000000 per F-640), or baseAddress == 0x13BCC000.
+                // Used to gate blend-on for text and 2D UI quads.
+                {
+                    bool samplesFontAtlas = false;
+                    for (uint32_t _ti = 0; _ti < dc.textureCount; ++_ti) {
+                        const uint32_t poolVa = dc.texturePoolVa[_ti];
+                        if (poolVa == 0xB3BCC000u || poolVa == 0x13BCC000u ||
+                            (poolVa & 0x1FFFFFFFu) == 0x13BCC000u) {
+                            samplesFontAtlas = true;
+                            break;
+                        }
+                        if (_ti < 4u) {
+                            mcla::native::GuestTextureDesc td{};
+                            if (mcla::native::DecodeGuestTextureDescriptor(
+                                    dc.textureDescriptorBytes[_ti], td) && td.valid) {
+                                if (td.baseAddress == 0x13BCC000u ||
+                                    (td.baseAddress & 0x1FFFFFFFu) == 0x13BCC000u) {
+                                    samplesFontAtlas = true;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    psi.samplesFontAtlas = samplesFontAtlas;
+                    psi.is2DQuad = (dc.vbStride == 36u || dc.primitiveTopology == 8u || samplesFontAtlas);
+                }
+
                 uint32_t refuseMask = mcla::renderer::kRefuseNone;
-                const mcla::renderer::PipelineState derived =
-                    mcla::renderer::DerivePipelineState(psi, refuseMask);
+                mcla::renderer::DecodedXenosRenderState decodedRenderState;
+                derived =
+                    mcla::renderer::DerivePipelineState(
+                        psi, refuseMask, &decodedRenderState);
+                applyClipDisableRescaleForDraw =
+                    decodedRenderState.clPresent &&
+                    decodedRenderState.clipDisable &&
+                    decodedRenderState.vtePresent &&
+                    !decodedRenderState.vportTransformApplied;
                 if (refuseMask != mcla::renderer::kRefuseNone) {
                     s_deriveRefused.fetch_add(1, std::memory_order_relaxed);
                     // The run-wide OR of every refusal mask, so the PC-DERIVE row
@@ -3867,6 +5019,13 @@ void RenderThread::processCommand(const RenderCommand& cmd) {
                            "NOT drawn on the returned state.");
                     break;
                 }
+
+                // F-914 (a) REVERTED: blend override (src_alpha/inv_src_alpha) made
+                // the halo invisible but also made ink invisible (UVs sample
+                // transparent texels -> alpha=0 -> contribution 0). The halo fix
+                // (making halo black-transparent) works with blend OFF: halo writes
+                // black (invisible), ink writes white (visible). So blend stays off.
+                (void)0;
 
                 // The state derived. Two things can still legitimately stop the
                 // draw, and both are NAMED rather than defaulted past:
@@ -3976,10 +5135,10 @@ void RenderThread::processCommand(const RenderCommand& cmd) {
                     {
                         std::vector<uint8_t> vsCode, vsEnv;
                         const char *vsSrc = "absent";
-                        (void)ResolveStageCode(dc.vsProgram, vsCode, vsSrc, mem);
+                        (void)ResolveStageCode(dc.vsProgram, vsCode, vsSrc);
                         std::vector<uint8_t> psCode, psEnv;
                         const char *psSrc = "absent";
-                        (void)ResolveStageCode(dc.psProgram, psCode, psSrc, mem);
+                        (void)ResolveStageCode(dc.psProgram, psCode, psSrc);
                         if (!BuildProgramEnvelope(vsCode.data(), vsCode.size(), true, vsEnv) ||
                             !BuildProgramEnvelope(psCode.data(), psCode.size(), false, psEnv)) {
                             pipeStop = "envelope-refused";
@@ -3991,16 +5150,36 @@ void RenderThread::processCommand(const RenderCommand& cmd) {
                         }
                         mcla::renderer::TranslatedShader vsOut;
                         pipeTrStage = "vs";
-                        if (!mcla::renderer::TranslateShaderPinned(
-                                vsEnv.data(), vsEnv.size(), pinnedLayout.data(),
-                                pinnedLayout.size(), vsOut, pipeTranslateError)) {
-                            pipeStop = "vs-translate-refused";
-                            pipeRow();
-                            refuse("no-translated-pso", s_cpRefuseNoPso,
-                                   "- TranslateShaderPinned refused the vertex "
-                                   "shader. See DRAW-CP-PIPE. NOT drawn on a "
-                                   "default shader.");
-                            break;
+                        STALL_STAGE("translate-vs");
+                        // Shader translation cache: avoid re-translating identical shaders.
+                        // Key = FNV hash of (vsEnv bytes + inputDeclHash).
+                        static std::unordered_map<uint64_t, mcla::renderer::TranslatedShader> s_vsCache;
+                        uint64_t vsCacheKey = 0xcbf29ce484222325ULL;
+                        for (size_t i = 0; i < vsEnv.size(); ++i) {
+                            vsCacheKey ^= static_cast<uint64_t>(vsEnv[i]);
+                            vsCacheKey *= 0x100000001b3ULL;
+                        }
+                        vsCacheKey ^= inputDeclHash;
+                        vsCacheKey *= 0x100000001b3ULL;
+                        vsCacheKey ^= (applyClipDisableRescaleForDraw ? 1ULL : 0ULL);
+                        vsCacheKey *= 0x100000001b3ULL;
+                        auto vsCacheIt = s_vsCache.find(vsCacheKey);
+                        if (vsCacheIt != s_vsCache.end()) {
+                            vsOut = vsCacheIt->second;
+                        } else {
+                            if (!mcla::renderer::TranslateShaderPinned(
+                                    vsEnv.data(), vsEnv.size(), pinnedLayout.data(),
+                                    pinnedLayout.size(), vsOut, pipeTranslateError,
+                                    applyClipDisableRescaleForDraw)) {
+                                pipeStop = "vs-translate-refused";
+                                pipeRow();
+                                refuse("no-translated-pso", s_cpRefuseNoPso,
+                                       "- TranslateShaderPinned refused the vertex "
+                                       "shader. See DRAW-CP-PIPE. NOT drawn on a "
+                                       "default shader.");
+                                break;
+                            }
+                            s_vsCache[vsCacheKey] = vsOut;
                         }
                         s_pipeTranslatedVs.fetch_add(1, std::memory_order_relaxed);
                         // HOISTED HERE, immediately after the stage that
@@ -4020,6 +5199,8 @@ void RenderThread::processCommand(const RenderCommand& cmd) {
                         // What changes is only WHEN the row is told.
                         pipeVsHlsl = vsOut.hlsl;
                         pipeVsHash = vsOut.programHash;
+                        pipeVsPrecompiledAvail = vsOut.precompiledAvailable;
+                        pipeVsPrecompiledHash = vsOut.precompiledCacheHash;
                         // A pixel shader is not a vertex shader, so it is handed NO
                         // layout: TranslateShaderPinned returns false for exactly
                         // that mismatch (shader_translator.cpp:1311), and passing
@@ -4050,23 +5231,38 @@ void RenderThread::processCommand(const RenderCommand& cmd) {
                         // falls back to mask 0 rather than to an invented pairing.
                         mcla::renderer::TranslatedShader psOut;
                         pipeTrStage = "ps";
-                        // THE PAIRED VERTEX SHADER, which is a different thing from
-                        // the layout above and does not replace it. See the block
-                        // comment that follows this call.
-                        mcla::renderer::PixelShaderPairing psPairing;
-                        psPairing.vsContainer = vsEnv.data();
-                        psPairing.vsContainerSize = vsEnv.size();
-                        psPairing.psNumReg = ReadPsNumRegField();
-                        if (!mcla::renderer::TranslateShaderPinned(
-                                psEnv.data(), psEnv.size(), nullptr, 0, psOut,
-                                pipeTranslateError, &psPairing)) {
-                            pipeStop = "ps-translate-refused";
-                            pipeRow();
-                            refuse("no-translated-pso", s_cpRefuseNoPso,
-                                   "- TranslateShaderPinned refused the pixel "
-                                   "shader. See DRAW-CP-PIPE. NOT drawn on a "
-                                   "default shader.");
-                            break;
+                        // Pixel shader translation cache: key = FNV hash of (psEnv bytes + vsProgramHash + psNumReg).
+                        const uint32_t psNumReg = ReadPsNumRegField();
+                        static std::unordered_map<uint64_t, mcla::renderer::TranslatedShader> s_psCache;
+                        uint64_t psCacheKey = 0xcbf29ce484222325ULL;
+                        for (size_t i = 0; i < psEnv.size(); ++i) {
+                            psCacheKey ^= static_cast<uint64_t>(psEnv[i]);
+                            psCacheKey *= 0x100000001b3ULL;
+                        }
+                        psCacheKey ^= pipeVsHash;
+                        psCacheKey *= 0x100000001b3ULL;
+                        psCacheKey ^= static_cast<uint64_t>(psNumReg);
+                        psCacheKey *= 0x100000001b3ULL;
+                        auto psCacheIt = s_psCache.find(psCacheKey);
+                        if (psCacheIt != s_psCache.end()) {
+                            psOut = psCacheIt->second;
+                        } else {
+                            mcla::renderer::PixelShaderPairing psPairing;
+                            psPairing.vsContainer = vsEnv.data();
+                            psPairing.vsContainerSize = vsEnv.size();
+                            psPairing.psNumReg = psNumReg;
+                            if (!mcla::renderer::TranslateShaderPinned(
+                                    psEnv.data(), psEnv.size(), nullptr, 0, psOut,
+                                    pipeTranslateError, false, &psPairing)) {
+                                pipeStop = "ps-translate-refused";
+                                pipeRow();
+                                refuse("no-translated-pso", s_cpRefuseNoPso,
+                                       "- TranslateShaderPinned refused the pixel "
+                                       "shader. See DRAW-CP-PIPE. NOT drawn on a "
+                                       "default shader.");
+                                break;
+                            }
+                            s_psCache[psCacheKey] = psOut;
                         }
                         s_pipeTranslatedPs.fetch_add(1, std::memory_order_relaxed);
                         // HOISTED HERE, for the same reason and with the same
@@ -4077,6 +5273,50 @@ void RenderThread::processCommand(const RenderCommand& cmd) {
                                         // HLSL" from "the row was written first".
                         pipePsHlsl = psOut.hlsl;
                         pipePsHash = psOut.programHash;
+                        pipePsPrecompiledAvail = psOut.precompiledAvailable;
+                        pipePsPrecompiledHash = psOut.precompiledCacheHash;
+                        // F-900: dump on HASH CHANGE (up to 4), not once per
+                        // process. The PS hash flips mid-run (psNumReg 1->0:
+                        // 5DB4...->C4EC...), and the once-only gate meant the
+                        // dumped HLSL might not be the shader actually drawing
+                        // later frames. Dump each distinct (vsHash,psHash) pair
+                        // once so the live shader is always readable.
+                        static std::atomic<uint64_t> s_dumpedVsHash{0};
+                        static std::atomic<uint64_t> s_dumpedPsHash{0};
+                        static std::atomic<uint32_t> s_dumpedPairs{0};
+                        {
+                            uint64_t dvs = s_dumpedVsHash.load(std::memory_order_relaxed);
+                            uint64_t dps = s_dumpedPsHash.load(std::memory_order_relaxed);
+                            bool shapeMatch =
+                                ((pipeVsHash == 0x24FBD03D9258D324ull &&
+                                  pipePsHash == 0x9610B74CE942EAC6ull) ||
+                                 (pipeVsCodeBytes == 144 && pipePsCodeBytes == 48) ||
+                                 (pipeVsCodeBytes == 108 && pipePsCodeBytes == 36));
+                            if (shapeMatch && (pipeVsHash != dvs || pipePsHash != dps) &&
+                                s_dumpedPairs.load(std::memory_order_relaxed) < 6) {
+                            auto escapeHlsl = [](const std::string& source) {
+                                std::string escaped;
+                                escaped.reserve(source.size());
+                                for (const char ch : source) {
+                                    if (ch == '\n') {
+                                        escaped += "\\n";
+                                    } else if (ch != '\r') {
+                                        escaped.push_back(ch);
+                                    }
+                                }
+                                return escaped;
+                            };
+                            MCLA_LOG_WARN(
+                                "DRAW-CP-HLSL-DUMP vsHash={:016X} psHash={:016X} "
+                                "vsBytes={} psBytes={} vs={} ps={}",
+                                pipeVsHash, pipePsHash, pipeVsCodeBytes,
+                                pipePsCodeBytes, escapeHlsl(pipeVsHlsl),
+                                escapeHlsl(pipePsHlsl));
+                            s_dumpedVsHash.store(pipeVsHash, std::memory_order_relaxed);
+                            s_dumpedPsHash.store(pipePsHash, std::memory_order_relaxed);
+                            s_dumpedPairs.fetch_add(1, std::memory_order_relaxed);
+                        }
+                        }
                         if (vsOut.hlsl.empty() || psOut.hlsl.empty()) {
                             pipeStop = "empty-hlsl";
                             pipeRow();
@@ -4107,14 +5347,47 @@ void RenderThread::processCommand(const RenderCommand& cmd) {
                     // device is measured capable (0xB000/11.0, F-653), and would
                     // therefore be the F-609 fake.
                     {
+                        STALL_STAGE("derive-pso");
                         const mcla::renderer::PipelineKey key =
                             mcla::renderer::ComputePipelineKeyForLayout(
-                                pipeVsHash, pipePsHash, inputDeclHash, derived,
+                                pipeVsHash, pipePsHash,
+                                mcla::renderer::HashShaderBytecode(pipeVsHlsl),
+                                mcla::renderer::HashShaderBytecode(pipePsHlsl),
+                                inputDeclHash, derived,
                                 inputLayout);
                         s_pipePsoRequested.fetch_add(1, std::memory_order_relaxed);
-                        pipePso = backend_.GetPipelineCache().GetOrCompile(
-                            key, pipeVsHlsl, pipePsHlsl, inputLayout,
-                            "render_thread.cpp:F-716", &pipeHasGeomStage);
+
+                        // Precompiled PSO substitution: if both VS and PS are available in the
+                        // precompiled cache, substitute the precompiled PSO and flag the draw
+                        // to bind precompiled root signature and SharedConstants.
+                        static bool s_enablePrecompiledSubstitution = [] {
+                            const char* env = std::getenv("MCLA_USE_PRECOMPILED_PSO");
+                            return (env != nullptr && env[0] == '1'); // default OFF until precompiled path renders"
+                        }();
+                        if (s_enablePrecompiledSubstitution &&
+                            pipeVsPrecompiledAvail && pipePsPrecompiledAvail) {
+                            if (pipeVsPrecompiledHash == 0x015E705A375C3C99ull &&
+                                backend_.GetPrecompiledDrawPipeline()) {
+                                pipePso = backend_.GetPrecompiledDrawPipeline();
+                                desc.usePrecompiledPipeline = true;
+                            } else if (backend_.GetPrecompiledTestPipeline()) {
+                                pipePso = backend_.GetPrecompiledTestPipeline();
+                                desc.usePrecompiledPipeline = true;
+                            }
+                            if (desc.usePrecompiledPipeline) {
+                                static std::atomic<uint32_t> s_substitutions{0};
+                                const uint32_t subNo = s_substitutions.fetch_add(1, std::memory_order_relaxed) + 1;
+                                if (subNo <= 8 || (subNo % 200) == 0) {
+                                    MCLA_LOG_INFO("PRECOMP-PSO-SUBSTITUTED #{} vsHash={:016X} psHash={:016X} -- using precompiled PSO and root signature",
+                                                  subNo, pipeVsPrecompiledHash, pipePsPrecompiledHash);
+                                }
+                            }
+                        }
+                        if (!desc.usePrecompiledPipeline) {
+                            pipePso = backend_.GetPipelineCache().GetOrCompile(
+                                key, pipeVsHlsl, pipePsHlsl, inputLayout,
+                                "render_thread.cpp:F-716", &pipeHasGeomStage);
+                        }
                         if (!pipePso) {
                             pipeStop = "pso-refused";
                             pipeRow();
@@ -4166,7 +5439,10 @@ void RenderThread::processCommand(const RenderCommand& cmd) {
             // rectangle with nothing in the log saying so. That is the F-609 fake
             // this call is built to make impossible, and it is why the flag is
             // CARRIED per-draw rather than read from a device-wide property.
-            if (!D3D12Backend::MapXenosPrimType(dc.primitiveTopology,
+            desc.xenosPrimType = dc.primitiveTopology;
+            // Expanded rect lists / quad lists map as the triangle list they now are.
+            if (!D3D12Backend::MapXenosPrimType(
+                (rectCpuExpanded || quadCpuExpanded) ? 0x04u : dc.primitiveTopology,
                                                  desc.topology,
                                                  pipeHasGeomStage)) {
                 // F-648: 0x08 kRectangleList is the case that matters here, so it
@@ -4346,7 +5622,8 @@ void RenderThread::processCommand(const RenderCommand& cmd) {
             uint64_t cpDrawCallsBefore = backend_.Stats().drawsIssued;
             bool cpIssuedDrawCall = false;
             {
-                const bool beganFrame = backend_.BeginFrame();
+                STALL_STAGE("drawcall");
+                const bool beganFrame = backend_.BeginFrameForDraw();
                 // 2026-10-02: `drew` is the backend's own return value, and it
                 // is NOT the same fact as "a draw call was issued". The backend
                 // increments m_stats.drawsIssued at exactly one place -- right
@@ -4550,9 +5827,16 @@ void RenderThread::processCommand(const RenderCommand& cmd) {
             // "the draw was refused" and "the draw was never attempted" stay
             // two different numbers and neither is lost.
             if (cpIssuedDrawCall) {
+                s_1sDrawn[primSlot].fetch_add(1, std::memory_order_relaxed);
+
                 const uint32_t dn =
                     s_cpDrawn.fetch_add(1, std::memory_order_relaxed) + 1;
-                if (dn <= 8 || (dn % 200) == 0)
+                if (dn <= 8 || (dn % 200) == 0) {
+                    MCLA_LOG_ERROR("TEMP-DRAW-DRAWN #{} prim={} topo={} vertices={} "
+                                   "indexed={} stride={}",
+                                   dn, dc.primitiveTopology,
+                                   static_cast<uint32_t>(desc.topology), vertexCount,
+                                   indexed ? 1u : 0u, dc.vbStride);
                     // F-633: tc.count / tc.maxIndex are the static transcode
                     // buffer's previous contents on a non-indexed draw - nothing
                     // wrote them - so they are reported as the guest's own
@@ -4566,7 +5850,14 @@ void RenderThread::processCommand(const RenderCommand& cmd) {
                                   indexed ? tc.maxIndex : 0u, dc.vbFormat.xenos,
                                   dc.vbFormat.dxgi, dc.vbFormat.bytes, dc.vbStride,
                                   dc.vbFullCount, dc.vbDescCount);
+                }
             } else {
+                s_1sSkipped[primSlot].fetch_add(1, std::memory_order_relaxed);
+                static std::atomic<uint32_t> s_drawSkipped{0};
+                const uint32_t sn = s_drawSkipped.fetch_add(1, std::memory_order_relaxed) + 1;
+                if (sn <= 8 || (sn % 200) == 0) {
+                    MCLA_LOG_ERROR("TEMP-DRAW-SKIPPED #{} pipeStop={}", sn, pipeStop);
+                }
                 // The new row. `pipeStop` is the reason, taken from the same
                 // string DRAW-CP-PIPE prints, so the two can be read together
                 // without a lookup table. begin-frame-false means the gate never

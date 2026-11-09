@@ -1,3 +1,4 @@
+#include <cpu/ppc_context.h>
 #include "app.h"
 #include "logging.h"
 #include "patches.h"
@@ -46,6 +47,12 @@ bool App::Initialize() {
 
     mcla::log::Initialize(m_name.c_str(), mcla::log::Level::Info,
                       (m_cacheRoot / "mcla.log").string().c_str());
+    // Quiet by default: a boot logged 1.7M lines / 400 MB and held Legals on screen for minutes.
+    // MCLA_LOG_LEVEL=2 restores the full census for diagnosis (0..6 = trace..off).
+    const char* logLevel = std::getenv("MCLA_LOG_LEVEL");
+    mcla::log::SetLevel(logLevel && logLevel[0] >= '0' && logLevel[0] <= '6'
+                            ? static_cast<mcla::log::Level>(logLevel[0] - '0')
+                            : mcla::log::Level::Error);
 
     MCLA_LOG_INFO("Initializing {}...", m_name);
 
@@ -293,6 +300,7 @@ void App::HandleEvents() {
     while (SDL_PollEvent(&event)) {
         switch (event.type) {
             case SDL_EVENT_QUIT:
+                MCLA_LOG_ERROR("APP-QUIT reason=SDL_EVENT_QUIT");
                 m_running = false;
                 break;
 
@@ -303,6 +311,7 @@ void App::HandleEvents() {
                 break;
 
             case SDL_EVENT_WINDOW_CLOSE_REQUESTED:
+                MCLA_LOG_ERROR("APP-QUIT reason=WINDOW_CLOSE_REQUESTED");
                 m_running = false;
                 break;
 

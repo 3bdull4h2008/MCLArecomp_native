@@ -222,11 +222,18 @@ public:
 
     // Record a completed upload. `entry.residentBytes` is the host cost.
     // Enforces the entry cap (a hard count) and the soft byte budget (a
-    // pressure valve): the returned keys are the entries the caller must now
+    // pressure valve): the returned entries are the ones the caller must now
     // release with the backend (it owns the ID3D12Resource and the descriptor
     // heap slot). They are already out of the map - do not call Erase on them.
-    std::vector<TextureCacheKey> Insert(const TextureCacheKey& key,
-                                        const TextureCacheEntry& entry);
+    // F-900: returns key+entry pairs (not keys alone). The entry holds the
+    // only copy of the backend handle; returning keys alone forced the caller
+    // to Find-after-erase (always a miss) and leaked every evicted pool slot.
+    struct EvictedTexture {
+        TextureCacheKey key;
+        TextureCacheEntry entry;
+    };
+    std::vector<EvictedTexture> Insert(const TextureCacheKey& key,
+                                       const TextureCacheEntry& entry);
 
     // Drop one entry. Returns true if it was present.
     bool Erase(const TextureCacheKey& key);

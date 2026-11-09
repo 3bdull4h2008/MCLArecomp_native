@@ -389,14 +389,29 @@ inline bool RangeOverlapsWatch(uint32_t guestAddr, uint32_t size)
 // marker demonstrably works, and the crash is cause (1).
 //
 // TWO THINGS THAT PRODUCE ROWS THAT ARE NOT THE CRASH -- read before interpreting a FABZERO:
-//   * `VerifyGuestMemoryViewForTests` (this file, ~line 750) deliberately calls ReadU32BE(0,
+//   * `VerifyGuestMemoryViewForTests` (this file, :1068) deliberately calls ReadU32BE(0,
 //     nullptr), ReadU32BE(0,&v) and ReadU32BE(0x100,&v) to prove the guard page refuses, and
-//     `InstallNativeRenderer` (src/native_renderer.cpp:502) runs it at boot. That is exactly 3
+//     `InstallNativeRenderer` (src/native_renderer.cpp:763) runs it at boot. That is exactly 3
 //     refusals, va=00000000 x2 and va=00000100, on the renderer-install thread. They are
 //     separable from the crash without guessing: the self-test runs on a LOCAL `GuestMemoryView`
 //     whose base is a 0x3000-byte stack array, so those three rows carry a `view_base` that is a
 //     stack address, while the recompiler's view is the real allocation (0x100000000 in w682.log,
 //     `rdx=0x100000000`). `caller_rva` + `tools/host_rva_resolve.py` names the caller as well.
+//     CONFIRMED 2026-11-08 from build/w12.log:7-12: resolving that log's first three `caller_rva`s
+//     -- 0x2945c4 / 0x2945e3 / 0x294608 -- returns
+//     `?VerifyGuestMemoryViewForTests@native@mcla@@YA_NXZ +0xb4/+0xd3/+0xf8`, the rows are exactly
+//     va=00000000, 00000000, 00000100 with `view_base=0x718C52C7B0 view_size=0x3000` (the local
+//     `testMem[0x3000]`), and the disassembly of build/mcla.exe at those RVAs is the three
+//     ReadU32BE calls in that order (`leaq 0x30(%rsp)` view, `edx` = 0, 0, 0x100).
+//     THOSE ROWS NOW CARRY `selftest=1`, AND THEY STAY AT ERROR LEVEL ON PURPOSE.
+//     `App::Initialize` sets the default level to `Level::Error` (src/app.cpp:53-55, "Quiet by
+//     default"), so INFO/WARN rows never reach a default soak log at all -- w12.log is 5,073
+//     `[error]` rows, 1 `[info]`, 0 `[warn]`. Demoting the probe to INFO would DELETE it from the
+//     only log the project reads. The tag, not the level, is what separates probe from fault: a
+//     census of `selftest=1` rows is the probe, `total - that` is the genuine count.
+//     Note also that the probe cannot ever exercise the `nullout` cause: `IsValidRange` rejects
+//     va<0x1000 before ReadU32BE looks at `outVal`, so ReadU32BE(0,nullptr) reports `why=range`.
+//     That is why every `by_why=[... nullout=0 ...]` in these logs is expected.
 //   * Host-side census/probe callers of ReadU32BE (src/boot_host.cpp, src/gpu_cp.cpp,
 //     src/capture_hooks.cpp) also drop the bool, so a probe of an absent guest address lands here
 //     too. They are NOT reccompiled `lwz`s and must not be read as guest evidence. Same key:
@@ -880,8 +895,23 @@ bool GuestMemoryView::WriteU32BE(uint32_t guestAddr, uint32_t val) const {
     }
     uint8_t* ptr = GetHostPtrMutable(guestAddr, sizeof(uint32_t));
     if (!ptr) return false;
-    if (const int wi = HeapInstanceStoreHit(guestAddr); wi >= 0)
+    if (const int wi = HeapInstanceStoreHit(guestAddr); wi >= 0) {
         ReportHeapInstanceStore("U32", guestAddr, val, _ReturnAddress(), (size_t)wi);
+        static std::atomic<uint32_t> s_heapStoreMitigationHits{0};
+        const uint32_t mh = s_heapStoreMitigationHits.fetch_add(1) + 1;
+        if (mh <= 16 || (mh % 500) == 0) {
+            MCLA_LOG_ERROR("MITIGATION-F374: refused guest store to heap instance guestAddr={:08X} val={:08X} hits={}", guestAddr, val, mh);
+        }
+        return false;
+    }
+    if (guestAddr == 0xA05A6680u || guestAddr == 0xA05A6684u) {
+        static std::atomic<uint32_t> s_a05aHits{0};
+        const uint32_t ah = s_a05aHits.fetch_add(1) + 1;
+        if (ah <= 32 || (ah % 200) == 0) {
+            MCLA_LOG_ERROR("TEMP-OBJ-WRITE #{} addr={:08X} val={:08X} hostRet={:p}",
+                           ah, guestAddr, val, _ReturnAddress());
+        }
+    }
     // F-784: T44 wipe watch -- address test + pre-copy snapshot of the dword
     // this store is about to replace, so the row can show header-was-live.
     const bool t44 = mcla::gpu::T44WipeOverlaps(guestAddr, sizeof(uint32_t));
@@ -909,8 +939,10 @@ bool GuestMemoryView::WriteU32BE(uint32_t guestAddr, uint32_t val) const {
 bool GuestMemoryView::WriteU64BE(uint32_t guestAddr, uint64_t val) const {
     uint8_t* ptr = GetHostPtrMutable(guestAddr, sizeof(uint64_t));
     if (!ptr) return false;
-    if (const int wi = HeapInstanceStoreHit(guestAddr); wi >= 0)
+    if (const int wi = HeapInstanceStoreHit(guestAddr); wi >= 0) {
         ReportHeapInstanceStore("U64", guestAddr, val, _ReturnAddress(), (size_t)wi);
+        return false;
+    }
     // F-784: T44 wipe watch -- the 8 bytes this store replaces.
     const bool t44 = mcla::gpu::T44WipeOverlaps(guestAddr, sizeof(uint64_t));
     uint64_t t44Pre = 0;
@@ -944,6 +976,7 @@ bool GuestMemoryView::WriteU64BE(uint32_t guestAddr, uint64_t val) const {
 bool GuestMemoryView::WriteBytes(uint32_t guestAddr, const void* src, uint32_t size) const {
     uint8_t* ptr = GetHostPtrMutable(guestAddr, size);
     if (!ptr || !src) return false;
+
     // F-784: T44 wipe watch. The span test runs BEFORE the copy so `pre` is the
     // true prior content of the first overlapped bytes, and this is the only
     // entry point that knows how many bytes the copy actually moved -- the
@@ -989,8 +1022,10 @@ bool GuestMemoryView::WriteBytes(uint32_t guestAddr, const void* src, uint32_t s
     // destination, length, and how much of the length overlapped the window. Placed after the
     // `__except` so it reports only copies that actually landed, and before the `size >= 4` block
     // so it does not depend on the copy being long enough to have endpoints.
-    if (const int wi = HeapWindowOverlaps(guestAddr, size); wi >= 0)
+    if (const int wi = HeapWindowOverlaps(guestAddr, size); wi >= 0) {
         ReportHeapWindowExtent("bulk", guestAddr, size, _ReturnAddress(), (size_t)wi);
+        return false;
+    }
     if (size >= 4)
     {
         // Watch coverage for bulk copies of ANY size: check first + last

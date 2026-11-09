@@ -34,6 +34,20 @@ uint32_t XamInputGetCapabilities(uint32_t userIndex, uint32_t flags, XAMINPUT_CA
 uint32_t XamInputGetState(uint32_t userIndex, uint32_t flags, XAMINPUT_STATE* state);
 uint32_t XamInputSetState(uint32_t userIndex, uint32_t flags, XAMINPUT_VIBRATION* vibration);
 
+// Host keystroke queue (b-3). Fed from the main-thread keyboard path
+// (XamInputPoll -> SampleKeyboard); drained one stroke per guest call by
+// VoiPortXamInputGetKeystrokeEx. Thread-safe: main thread enqueues, guest
+// thread dequeues. Stroke is 8 bytes (BE): vk, unicode, flags, user, hid.
+struct XAMINPUT_KEYSTROKE_HOST {
+    uint16_t vk;
+    uint16_t unicode;
+    uint16_t flags;
+    uint8_t user_index;
+    uint8_t hid_code;
+};
+void XamInputKeystrokeEnqueue(const XAMINPUT_KEYSTROKE_HOST& ks);
+bool XamInputKeystrokeDequeue(XAMINPUT_KEYSTROKE_HOST* out);   // false when empty
+
 // Guest controller-port plumbing (F-609). App owns the SDL event pump, so the
 // host side is split into a main-thread half (Init / Added / Removed / Poll /
 // Shutdown) and a read-only port map any caller can query. See the

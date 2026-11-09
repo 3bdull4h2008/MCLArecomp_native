@@ -146,6 +146,13 @@ enum GuestRegisterPresent : uint32_t {
     kGuestRegPolyOffsetBack  = 1u << 4,  // 0x2382 + 0x2383 (back  SCALE+OFFSET)
     // D1: RB_DEPTH_INFO 0x2002, for depth_format only (the bias conversion).
     kGuestRegDepthInfo       = 1u << 5,
+    // F-904: RT0 blend control + write mask. Set together only when BOTH
+    // registers arrived (0x2201 RB_BLENDCONTROL0 and 0x2104 RB_COLOR_MASK);
+    // a lone control with an unmeasured mask, or vice versa, is refused by
+    // NAME below rather than half-derived.
+    kGuestRegBlendControl    = 1u << 6,  // 0x2201 RB_BLENDCONTROL0 (RT0)
+    kGuestRegColorMask       = 1u << 7,  // 0x2104 RB_COLOR_MASK (RT0 in bits 0-3)
+    kGuestRegDepthControl    = 1u << 8,  // 0x2200 RB_DEPTHCONTROL
 };
 
 // ---------------------------------------------------------------------------
@@ -191,6 +198,13 @@ enum PipelineRefusal : uint32_t {
     kRefuseNoDepthInfo        = 1u << 18, // 0x2002 absent -> depth_format unknown, so
                                          // the absolute->relative bias conversion
                                          // has no factor (draw_util.h:206-215)
+    // F-904: the blend control arrived but asks for a CONSTANT blend factor
+    // (kConstantColor/kConstantAlpha and their complements, xenos.h:720-723).
+    // D3D12 binds those through OMSetBlendFactor, which is per-draw dynamic
+    // state the backend never sets -- baking them into the PSO would invent a
+    // factor of (1,1,1,1). Refused by name until blend-factor state is carried
+    // per draw; counted so a soak can say whether the game even uses them.
+    kRefuseBlendConstantFactor = 1u << 22, // 0x2201 mapped to BLEND_FACTOR
     // F-653: the rectangle-list geometry stage could not be built. Two distinct
     // causes, because the difference between them is a black screen and a
     // compile error respectively, and a soak must be able to read them apart:
@@ -221,9 +235,9 @@ enum PipelineRefusal : uint32_t {
 };
 
 // Number of named reasons; also the stride of
-// PipelineCacheStats::refusalsByReason. A new bit above 1u<<22 must not silently
+// PipelineCacheStats::refusalsByReason. A new bit above 1u<<23 must not silently
 // index past it.
-constexpr uint32_t kPipelineRefusalBitCount = 22u;
+constexpr uint32_t kPipelineRefusalBitCount = 23u;
 
 // The highest bit in use must be INSIDE the counted width, or a refusal would
 // increment a counter the name table never covers. The previous version of this
@@ -233,8 +247,10 @@ static_assert(kRefusePsoCreateFailed < (1u << kPipelineRefusalBitCount),
               "PipelineRefusal has a bit above kPipelineRefusalBitCount");
 static_assert(kRefuseGeometryShaderUnbuildable < (1u << kPipelineRefusalBitCount),
               "PipelineRefusal has a bit above kPipelineRefusalBitCount");
-static_assert(kPipelineRefusalBitCount == 22u,
-              "kPipelineRefusalBitCount must equal the number of assigned bits (0..21)");
+static_assert(kRefuseBlendConstantFactor < (1u << kPipelineRefusalBitCount),
+              "PipelineRefusal has a bit above kPipelineRefusalBitCount");
+static_assert(kPipelineRefusalBitCount == 23u,
+              "kPipelineRefusalBitCount must equal the number of assigned bits (0..22)");
 
 // Renders a refusal mask as "name|name" into `out` (never allocates).
 void FormatPipelineRefusal(uint32_t mask, char* out, size_t outBytes);
@@ -334,6 +350,15 @@ constexpr uint8_t kStateDerivedExplicit = 2; // caller supplied D3D12 state dire
 // Stamped into PipelineState::flags so a PSO built on the depth placeholder
 // stays countable (PipelineCacheStats::unmeasuredDepthState).
 constexpr uint8_t kStateFlagUnmeasuredDepth = 1u << 0;
+// F-898(f): the same idea for BLEND, refined by F-904. The blend-off baseline
+// in ApplyBaselineD3D12State is the DECLARED placeholder; DerivePipelineState
+// now overwrites slot 0 (and IndependentBlendEnable) from RB_BLENDCONTROL0 +
+// RB_COLOR_MASK whenever the packet presented them, so the flag below is set
+// ONLY on the absent-register path. "Blend is off" is therefore a measurement
+// of guest absence, not of guest intent -- still flagged rather than refused
+// (refusing would unbuild every PSO whose packet predates the blend write),
+// so it stays countable (PipelineCacheStats::unmeasuredBlendState).
+constexpr uint8_t kStateFlagUnmeasuredBlend = 1u << 1;
 
 inline bool operator==(const PipelineState& a, const PipelineState& b) {
     // Field-wise, never memcmp: PipelineState has always contained padding
@@ -422,6 +447,8 @@ inline bool operator==(const PipelineState& a, const PipelineState& b) {
 struct PipelineKey {
     uint64_t vsHash = 0;          // translated vertex shader program hash
     uint64_t psHash = 0;          // translated pixel shader program hash
+    uint64_t vsHlslHash = 0;      // FNV-1a hash of the generated vertex HLSL text
+    uint64_t psHlslHash = 0;      // FNV-1a hash of the generated pixel HLSL text
     uint64_t vertexDeclHash = 0;  // hash of the grcFvf declaration
     uint64_t inputLayoutHash = 0; // hash of the D3D12_INPUT_ELEMENT_DESC array
     PipelineState state;
@@ -434,6 +461,7 @@ struct PipelineKey {
 
 inline bool operator==(const PipelineKey& a, const PipelineKey& b) {
     return a.vsHash == b.vsHash && a.psHash == b.psHash &&
+           a.vsHlslHash == b.vsHlslHash && a.psHlslHash == b.psHlslHash &&
            a.vertexDeclHash == b.vertexDeclHash &&
            a.inputLayoutHash == b.inputLayoutHash && a.state == b.state &&
            a.refuseMask == b.refuseMask;
@@ -516,6 +544,20 @@ struct PipelineStateInputs {
     // not: RB_DEPTH_INFO holds the EDRAM tile base and the depth FORMAT, and
     // carries no enable, no write bit and no compare function.)
     bool requireMeasuredDepthState = false;
+    // F-904: RT0 blend control + write mask, raw register dwords. Decoded in
+    // DerivePipelineState only when kGuestRegBlendControl is set (control) --
+    // the mask nibble (bits 0-3) is used when kGuestRegColorMask is set, else
+    // 0xF (all channels, today's behaviour). Zero-initialised = the guest
+    // never wrote them, which the presence discipline (not the value) reports.
+    uint32_t blendControl0 = 0;  // 0x2201 RB_BLENDCONTROL0 (RT0)
+    uint32_t blendColorMask = 0; // 0x2104 RB_COLOR_MASK (RT0 in bits 0-3)
+    uint32_t depthControl = 0;   // 0x2200 RB_DEPTHCONTROL
+    // F-914 option (a): set when this draw's bound textures include the
+    // font atlas (guest base 0x13BCC000). Used to gate blend-on for text
+    // draws only, limiting blast radius vs a global flip.
+    bool samplesFontAtlas = false;
+    // 2D quads (stride 36, rect list) carrying animated opacity or UI elements.
+    bool is2DQuad = false;
 };
 
 // The decoded render state, with every field traceable to one Xenia register
@@ -610,7 +652,9 @@ DecodedXenosRenderState DecodeGuestRenderState(const PipelineStateInputs& in,
 // catch a width error. Callers should call this once and treat false as fatal.
 bool VerifyXenosRenderStateLayouts();
 
-PipelineState DerivePipelineState(const PipelineStateInputs& in, uint32_t& refuseMask);
+PipelineState DerivePipelineState(
+    const PipelineStateInputs& in, uint32_t& refuseMask,
+    DecodedXenosRenderState* decodedOut = nullptr);
 
 // Derives the state for a caller that already holds native D3D12 state (no
 // guest registers to map). Used by offline harnesses; still stamps
@@ -621,14 +665,21 @@ void SetDerivedPipelineState(PipelineState& state);
 // hash of the vertex stream layout (see vertex_decode in Phase 3); `state` must
 // carry a derivation != kStateDerivedNone, otherwise the key refuses itself.
 PipelineKey ComputePipelineKey(uint64_t vsHash, uint64_t psHash,
-                               uint64_t vertexDeclHash, const PipelineState& state);
+                              uint64_t vsHlslHash, uint64_t psHlslHash,
+                              uint64_t vertexDeclHash, const PipelineState& state);
+
+inline PipelineKey ComputePipelineKey(uint64_t vsHash, uint64_t psHash,
+                                      uint64_t vertexDeclHash, const PipelineState& state) {
+    return ComputePipelineKey(vsHash, psHash, 0, 0, vertexDeclHash, state);
+}
 
 // Same, but also folds in the hash of the input layout the worker will use, so
 // the key cannot claim one vertex declaration and hand the PSO another.
 PipelineKey ComputePipelineKeyForLayout(uint64_t vsHash, uint64_t psHash,
-                                        uint64_t vertexDeclHash,
-                                        const PipelineState& state,
-                                        const std::vector<D3D12_INPUT_ELEMENT_DESC>& inputLayout);
+                                       uint64_t vsHlslHash, uint64_t psHlslHash,
+                                       uint64_t vertexDeclHash,
+                                       const PipelineState& state,
+                                       const std::vector<D3D12_INPUT_ELEMENT_DESC>& inputLayout);
 
 // Deterministic 64-bit hash of a PipelineKey (for debug/trace reporting).
 uint64_t HashPipelineKey(const PipelineKey& key);
@@ -799,6 +850,10 @@ struct PipelineCacheStats {
     uint32_t dxcUnavailable = 0;      // DXC DLLs never loaded
     uint32_t nullInsertRejected = 0;  // Insert(key, nullptr) refused
     uint32_t unmeasuredDepthState = 0;// PSOs built on the depth placeholder
+    // F-898(f): PSOs built on the blend-off baseline
+    // (kStateFlagUnmeasuredBlend). Read NEXT TO unmeasuredDepthState -- the two
+    // placeholders are independent, so a PSO can be unmeasured on one axis only.
+    uint32_t unmeasuredBlendState = 0;// PSOs built on the blend placeholder
     uint32_t viewportUnresolved = 0;  // F-646: VTE transform on, extents absent
     uint32_t missingRegisters = 0;    // F-646: draws refused for an absent register
     // D1: draws refused because a depth-bias magnitude (0x2380-0x2383) or

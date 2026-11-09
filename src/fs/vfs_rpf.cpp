@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cctype>
+#include <cstdlib>
 #include <cstring>
 #include <map>
 
@@ -595,8 +596,20 @@ bool RpfVirtualFileSystem::OpenFile(const std::string& virtual_path, OpenFileHan
         const auto real_path = std::filesystem::path(m_extracted_root).parent_path() / norm;
         const uint64_t real_size = std::filesystem::file_size(real_path, size_ec);
         if (!size_ec) {
-            HANDLE h = CreateFileA(real_path.string().c_str(), GENERIC_READ, FILE_SHARE_READ,
-                                   nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+            const std::string cache_key = real_path.generic_string();
+            HANDLE h = INVALID_HANDLE_VALUE;
+            auto cache_it = m_real_handle_cache.find(cache_key);
+            if (cache_it != m_real_handle_cache.end()) {
+                h = static_cast<HANDLE>(cache_it->second.handle);
+                ++cache_it->second.refcount;
+            } else {
+                h = CreateFileA(real_path.string().c_str(), GENERIC_READ, FILE_SHARE_READ,
+                                nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+                if (h == INVALID_HANDLE_VALUE) {
+                    return false;
+                }
+                m_real_handle_cache[cache_key] = {h, 1};
+            }
             if (h != INVALID_HANDLE_VALUE) {
                 const uint64_t handle_id = m_next_handle++;
                 out_file.virtual_path = norm;
@@ -608,8 +621,15 @@ bool RpfVirtualFileSystem::OpenFile(const std::string& virtual_path, OpenFileHan
                 out_file.nested_rpf.reset();
                 out_file.handle_id = handle_id;
                 m_open_files[handle_id] = std::make_unique<OpenFileHandle>(out_file);
-                MCLA_LOG_INFO("VFS: opened REAL packfile '{}' ({} MB)", norm,
-                              static_cast<int>(real_size >> 20));
+                // F-882: printed per real-RPF open -- 164,087 rows in w902
+                // (one per ~2.2 failed member probes, 164,085 of them for
+                // xarchive_cache.rpf alone). Budget: first 16, then every
+                // 4096th; a count is a cadence, not the open total (F-054).
+                static std::atomic<uint32_t> s_realOpen{0};
+                const uint32_t vn = s_realOpen.fetch_add(1) + 1;
+                if (vn <= 16 || (vn % 4096) == 0)
+                  MCLA_LOG_INFO("VFS: opened REAL packfile '{}' ({} MB)", norm,
+                                static_cast<int>(real_size >> 20));
                 return true;
             }
         }
@@ -638,8 +658,20 @@ bool RpfVirtualFileSystem::OpenFile(const std::string& virtual_path, OpenFileHan
         return false;
     }
 
-    HANDLE handle = CreateFileA(it->second.physical_path.c_str(), GENERIC_READ, FILE_SHARE_READ,
-                                nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    const std::string cache_key = it->second.physical_path;
+    HANDLE handle = INVALID_HANDLE_VALUE;
+    auto cache_it = m_real_handle_cache.find(cache_key);
+    if (cache_it != m_real_handle_cache.end()) {
+        handle = static_cast<HANDLE>(cache_it->second.handle);
+        ++cache_it->second.refcount;
+    } else {
+        handle = CreateFileA(it->second.physical_path.c_str(), GENERIC_READ, FILE_SHARE_READ,
+                             nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (handle == INVALID_HANDLE_VALUE) {
+            return false;
+        }
+        m_real_handle_cache[cache_key] = {handle, 1};
+    }
     if (handle == INVALID_HANDLE_VALUE) {
         return false;
     }
@@ -839,6 +871,7 @@ namespace {
 // its mutex stay file-local; only the shape of one row is now shared.
 std::mutex g_expMtx;
 std::vector<ExpandedSpan> g_expSpans;
+std::unordered_map<std::string, std::vector<uint64_t>> g_tocStarts;  // F-926, sorted
 
 // F-720 (2026-10-01). One key per (owner, victim) pair already named by
 // MEMBER-SPAN-ALIAS, so that marker is a census line per collision and not a
@@ -1428,6 +1461,11 @@ void ApplyExpandedSpans(const std::string& physical_path, uint8_t* win,
                         uint64_t winOff, uint64_t winLen,
                         uint64_t readMemberOff) {
     if (win == nullptr || winLen == 0 || g_expSpans.empty()) return;
+    // F-928 experiment: MCLA_NO_EXPAND=1 serves the archive's own bytes, so the
+    // guest's packfile runs its own raw-deflate inflate (sub_821CCEA0 ->
+    // inflateInit2_(-15)) instead of reading a host-expanded image.
+    static const bool s_noExpand = [] { const char* e = std::getenv("MCLA_NO_EXPAND"); return e && e[0] == '1'; }();
+    if (s_noExpand) return;
     const std::string packKey = PackKeyOf(physical_path);
     const uint64_t winEnd = winOff + winLen;
     std::lock_guard<std::mutex> lk(g_expMtx);
@@ -2209,9 +2247,25 @@ TailClaim ClassifyTailClaim(const std::vector<ExpandedSpan>& spans,
     if (readMemberOff != 0 && head == readMemberOff && head > storedEnd) {
         return TailClaim::kReadMemberHead;
     }
+    // F-926: the same claim from the TOC itself, for reads that carry no
+    // readMemberOff (packfile block reads: boot.sco at 0x12D0000 was overlaid
+    // by member 0x12CFA96's 9402-byte expansion, C6b.log TEMP-C6-READ).
+    if (head > storedEnd) {
+        const auto it = g_tocStarts.find(packKey);
+        if (it != g_tocStarts.end() &&
+            std::binary_search(it->second.begin(), it->second.end(), head))
+            return TailClaim::kReadMemberHead;
+    }
     return TailClaim::kContinuation;
 }
 
+void RegisterTocMemberStarts(const std::string& packfile,
+                             std::vector<uint64_t> starts) {
+    std::sort(starts.begin(), starts.end());
+    starts.erase(std::unique(starts.begin(), starts.end()), starts.end());
+    std::lock_guard<std::mutex> lk(g_expMtx);
+    g_tocStarts[PackKeyOf(packfile)] = std::move(starts);
+}
 void MarkMemberExpanded(uint64_t offset, uint32_t storedLen) {
     MarkMemberExpandedIn(std::string(), offset, storedLen, storedLen);
 }
@@ -2276,6 +2330,14 @@ void MarkMemberExpandedIn(const std::string& packfile, uint64_t offset,
         if (!SpanMatchesPack(s, key)) continue;
         const uint64_t sEnd = s.off + s.storedLen;
         if (n.off >= sEnd || s.off >= nEnd) continue;
+        // F-882: this detector printed 74,364 rows from 2,849 insertions in
+        // w902. Budget: first 16 candidate pairs, then every 4096th; sn counts
+        // overlap CANDIDATES (post-filter), so a count is a cadence, not the
+        // candidate total (F-054). The gate also skips the O(N) winner scan
+        // on capped rows -- print-only work.
+        static std::atomic<uint32_t> s_spanOv{0};
+        const uint32_t sn = s_spanOv.fetch_add(1) + 1;
+        if (sn > 16 && (sn % 4096) != 0) continue;
         const uint64_t first = std::max(n.off, s.off);
         const ExpandedSpan* w = nullptr;
         for (const auto& t : g_expSpans) {
@@ -2425,16 +2487,10 @@ void RegisterNestedRpf(const std::string& packfile, const std::string& name,
     }
     auto archive = std::make_shared<NestedRpfArchive>(name, outer, storedOffset,
                                                      storedLen, logicalLen);
-    // Materialize eagerly so a bad offset is reported at registration with the
-    // census line that named it, not 20 frames later inside a read.
-    if (!archive->Materialize()) {
-        MCLA_LOG_WARN("NESTED-RPF-FAIL name='{}' outer='{}' off={:08X} "
-                      "stored={} logical={}: {}",
-                      name, outer, storedOffset, storedLen, logicalLen,
-                      archive->error());
-        // Keep it anyway: a later registration with a corrected contract can
-        // still succeed, and OpenFile will then serve the archive.
-    }
+    // DEFERRED (high-risk optimization): do not Materialize here. Materialize()
+    // is idempotent and is already called on first read (ReadFile/ReadFileAt),
+    // so inflation and header parsing happen only when the archive is used.
+    // Bad offsets surface on first read instead of at registration.
     g_nested[key] = std::move(archive);
 
     // Replay any inner members the census published before this archive was
@@ -2923,7 +2979,15 @@ bool RpfVirtualFileSystem::ReadFileAt(OpenFileHandle& file, uint64_t offset,
 bool RpfVirtualFileSystem::CloseFile(OpenFileHandle& file) {
     std::lock_guard<std::mutex> lock(m_mutex);
     if (file.handle) {
-        CloseHandle(static_cast<HANDLE>(file.handle));
+        auto cache_it = m_real_handle_cache.find(file.physical_path);
+        if (cache_it != m_real_handle_cache.end()) {
+            if (--cache_it->second.refcount == 0) {
+                CloseHandle(static_cast<HANDLE>(cache_it->second.handle));
+                m_real_handle_cache.erase(cache_it);
+            }
+        } else {
+            CloseHandle(static_cast<HANDLE>(file.handle));
+        }
         file.handle = nullptr;
     }
     // T43.20 (2026-10-13): remove from m_open_files to fix handle leak.

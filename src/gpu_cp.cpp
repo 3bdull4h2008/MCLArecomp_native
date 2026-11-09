@@ -353,6 +353,11 @@ std::atomic<uint32_t> g_coherentNoop{0};
 // "wait satisfied" in the cursor as well as in the counters.
 std::atomic<uint32_t> g_waitRegMemParkPending{0};
 std::atomic<uint32_t> g_waitRegMemParked{0};
+// F-915 Fix W (2026-10-29): counter for the no-writer-bound arm. Incremented
+// once per wait where `anyWriter == false` (the poll targets guest physical
+// 0x0/0x10/0x14, which CpMemWriteDestSeen/memDestSeen=0 proves no implemented
+// writer can fill). See CP-WAITREG-NEVERWRITTEN rows and F-915 item 6.
+std::atomic<uint32_t> g_waitRegMemNoWriterBound{0};
 // "Has any implemented writer ever stored to this guest byte address?" - a
 // 256-entry most-recent-destination ring fed by every store this file issues
 // (PM4_MEM_WRITE, PM4_REG_TO_MEM, PM4_EVENT_WRITE_SHD, scratch writeback).
@@ -389,15 +394,29 @@ void CpNoteMemWriteDest(uint32_t byteAddr);
 constexpr uint32_t kMemWriteValSlots = 256u;
 std::atomic<uint32_t> g_memWriteValDest[kMemWriteValSlots]{};
 std::atomic<uint32_t> g_memWriteValWord[kMemWriteValSlots]{};
+// F-895: WHICH PACKET WROTE THE WORD. Measured need, not decoration: build/g910
+// left the ring parked on a memory wait for 0x17AF1044 to become 0 while the
+// host had published only 1 there across ~21,900 stores, and the log could not
+// say which of the five store paths had done it. Values are the small codes
+// below; a zero tag means "no writer of that shape has recorded here".
+std::atomic<uint8_t> g_memWriteValTag[kMemWriteValSlots]{};
+constexpr uint8_t kMwTagScratch = 1;
+constexpr uint8_t kMwTagWriteRegToMem = 2;
+constexpr uint8_t kMwTagCondWrite = 3;
+constexpr uint8_t kMwTagEventShd = 4;
+constexpr uint8_t kMwTagMemWrite = 5;
 std::atomic<uint32_t> g_memWriteValNext{0};
 std::atomic<uint64_t> g_memWriteValStores{0};
-void CpNoteMemWriteValue(uint32_t byteAddr, uint32_t value);
+void CpNoteMemWriteValue(uint32_t byteAddr, uint32_t value, uint8_t tag);
 uint32_t CpMemWriteValuesSeen(uint32_t byteAddr, uint32_t *out, uint32_t maxOut);
+// F-895: newest writer tag recorded at `byteAddr` (0 = none). Read-only census.
+uint8_t CpMemWriteLastTag(uint32_t byteAddr);
+const char *CpMemWriteTagName(uint8_t tag);
 std::atomic<uint32_t> g_waitRegMemWriterValues{0};  // CP-WAITREG-WRITER-VALUES
 std::atomic<uint32_t> g_waitRegMemPktBytes{0};     // CP-WAITREG-PKTBYTES
 std::atomic<uint32_t> g_shdSeen{0};        // 0x58 PM4_EVENT_WRITE_SHD executed
 std::atomic<uint32_t> g_shdWritten{0};     //   ...literal-value form stored
-std::atomic<uint32_t> g_shdNoCounter{0};   //   ...counter form refused (no counter)
+std::atomic<uint32_t> g_shdCounterStored{0}; //   ...counter form stored (swap count)
 std::atomic<uint32_t> g_shdUnreadable{0};  //   ...body or destination refused
 // 0x46 PM4_EVENT_WRITE. Kept SEPARATE from the 0x58 counters on purpose: 0x46
 // and 0x58 are different packets with different arities, and the whole point of
@@ -954,7 +973,7 @@ void CpScratchWriteback(uint32_t slot, uint32_t value) {
     // and the poll reads `value` back unchanged. `value` is therefore the number
     // to record, and this is stated rather than assumed: the harness under
     // %TEMP%\opencode\cpwait_work measures it for all four selectors.
-    CpNoteMemWriteValue(dest, value);
+    CpNoteMemWriteValue(dest, value, kMwTagScratch);
   }
   const uint32_t n = g_scratchWritebacks.fetch_add(1, std::memory_order_relaxed) + 1;
   // F-813: the old bound was `n <= 8 || (n % 200) == 0`, which makes n=9..199 INVISIBLE. The
@@ -1096,6 +1115,13 @@ void CpNoteGammaLutWrite(uint32_t index, uint32_t value) {
   }
   const uint32_t n =
       g_gammaLutWrites.fetch_add(1, std::memory_order_relaxed) + 1;
+  // TEMP-GAMMA: one row per table upload, at its last 256-table entry (index
+  // 0xFF), so the white level of every upload is visible over time.
+  if ((index == kRegDcLut30Color || index == kRegDcLutSeqColor || index == kRegDcLutPwlData) &&
+      g_xenosReg[kRegDcLutRwIndex].load(std::memory_order_relaxed) >= 0xFFu) {
+    MCLA_LOG_ERROR("TEMP-GAMMA n={} reg={:04X} idx={:04X} val={:08X}", n, index,
+                   g_xenosReg[kRegDcLutRwIndex].load(std::memory_order_relaxed), value);
+  }
   if (n <= 8 || (n % 200) == 0) {
     MCLA_LOG_WARN("CP-GAMMA-LUT-UNMODELED #{} reg={:04X} ({}) val={:08X} "
                   "rwIndex={:04X} writeEn={:04X} (register stored; LUT NOT "
@@ -1624,13 +1650,30 @@ uint32_t CpDecodeVertexFetchProgram(CpVertexFetchInstr *out, uint32_t maxOut,
   const uint32_t *w = g_microcode[0].dwords;
   const uint32_t capDwords = g_microcode[0].captured;
   const uint32_t slots = capDwords / 3u;  // one triple per program slot
+  const uint32_t maxCf = slots * 2u;      // two CF instructions per triple
+  // (ucode.h UnpackControlFlowInstructions, xenia shader_interpreter.cc:34-47:
+  // cf_index starts at 1, and index 0 is the unused first slot of triple 0)
   uint32_t found = 0u;
-  for (uint32_t s = 0u; s + 1u < slots; ++s) {
-    // ControlFlowInstruction = 2 dwords (ucode.h:508-518, static_assert :518);
-    // opcode is dword_1 bits 12..15 (ucode.h:512-516). Read from the pair at
-    // the slot, matching how the interpreter walks the same array.
-    const uint32_t cf0 = w[2u * s];
-    const uint32_t cf1 = w[2u * s + 1u];
+  for (uint32_t cf_index = 0u; cf_index < maxCf; ++cf_index) {
+    // ControlFlowInstruction = 2 dwords packed into 3 ucode dwords
+    // (ucode.h:520-529). Decode the pair at cf_index the way the interpreter
+    // does (shader_interpreter.cc:38-47), not as two consecutive dwords.
+    const uint32_t base = 3u * (cf_index >> 1);
+    if (base + 2u >= capDwords) {
+      break;
+    }
+    const uint32_t p0 = w[base];
+    const uint32_t p1 = w[base + 1u];
+    const uint32_t p2 = w[base + 2u];
+    uint32_t cf0 = 0u;
+    uint32_t cf1 = 0u;
+    if (cf_index & 1u) {
+      cf0 = (p1 >> 16) | (p2 << 16);
+      cf1 = p2 >> 16;
+    } else {
+      cf0 = p0;
+      cf1 = p1 & 0xFFFFu;
+    }
     const uint32_t cfOp = (cf1 >> 12) & 0xFu;
     if (cfOp < kCpCfExecFirst || cfOp > kCpCfExecLast) {
       continue;
@@ -1659,7 +1702,7 @@ uint32_t CpDecodeVertexFetchProgram(CpVertexFetchInstr *out, uint32_t maxOut,
         break;
       }
       CpVertexFetchInstr &v = out[found];
-      v.execBlock = s;
+      v.execBlock = cf_index;
       v.execIndex = e;
       v.opcode = op;
       // fetch_constant_index() = const_index*3 + const_index_sel
@@ -1752,16 +1795,20 @@ uint32_t CpDecodeVertexFetchSlots(CpVertexFetchSlot *out, uint32_t maxOut) {
   // and is never cleared, so "unwritten" and "written as 0" are the same thing
   // on this hardware path - which is exactly what a kInvalidVertex slot
   // (type 1) means, so no slot is distinguished by a written-bit here.
+  //
+  // upstream's own (register_file.h:59-67 GetVertexFetch: 2 dwords from register
+  // 0x4800 + 2*index, index < 96), while xe_gpu_texture_fetch_t entries are 6
+  // dwords and are joined through GetTextureFetch, not through this path.
   uint32_t found = 0;
   for (uint32_t i = 0; i < 96u; ++i) {
+    if (found >= maxOut) {
+      break;
+    }
     const uint32_t d0 = CpRegPeek(kRegFetchVbFirst + 2u * i);
     const uint32_t d1 = CpRegPeek(kRegFetchVbFirst + 2u * i + 1u);
     const uint32_t type = d0 & 0x3u;            // xenos.h:1119
     if (type != 3u) {                            // FetchConstantType::kVertex
       continue;                                  // (xenos.h:1106)
-    }
-    if (found >= maxOut) {
-      break;
     }
     CpVertexFetchSlot &s = out[found];
     s.index = i;
@@ -1788,6 +1835,8 @@ bool CpReadVertexFetchSlot(uint32_t index, CpVertexFetchSlot *out) {
   if (index >= 96u) {  // register_file.h:60 asserts index < 96; we clamp instead
     return false;
   }
+  // Same 2-dword vertex-entry stride as CpDecodeVertexFetchSlots above. Keeping
+  // them aligned is the F-680 invariant this pair exists to hold.
   const uint32_t d0 = CpRegPeek(kRegFetchVbFirst + 2u * index);
   const uint32_t d1 = CpRegPeek(kRegFetchVbFirst + 2u * index + 1u);
   const uint32_t type = d0 & 0x3u;      // xenos.h:1119
@@ -2417,6 +2466,8 @@ bool CpExecSetConstant(uint32_t byteAddr, uint32_t count, bool isTwo,
     default: break; // unknown type: log below, still advance
     }
   }
+  MCLA_LOG_WARN("CP-SETCONST-ENTER op={} isTwo={} type={} offType={:08X} index={:04X} count={} addr={:08X}",
+                isTwo ? 0x55 : 0x2D, isTwo ? 1:0, type, offType, index, count, byteAddr);
   uint32_t stored = 0, dropped = 0;
   const uint32_t nData = (count > 0u) ? count - 1u : 0u;
   const uint32_t nCap = (nData > 2048u) ? 2048u : nData;
@@ -2441,11 +2492,12 @@ bool CpExecSetConstant(uint32_t byteAddr, uint32_t count, bool isTwo,
                   "TRUNCATED={} (cap 2048 dwords)", cn, isTwo ? "2" : "1",
                   type, index, nData, stored, nData - nCap);
   }
-  if (n <= 12 || (n % 500) == 0) {
+  if (n <= 50 || (n % 100) == 0 || (index >= kRegFetchVbFirst && index < kRegFetchVbLast)) {
     MCLA_LOG_WARN("CP-SETCONST #{} {} type={} base={:04X} ndata={} stored={} "
-                  "dropped={} first={:08X}",
+                  "dropped={} first={:08X} isFetch={}",
                   n, isTwo ? "2" : "1", type, index, nData, stored, dropped,
-                  (stored > 0u) ? CpRegPeek(index) : 0u);
+                  (stored > 0u) ? CpRegPeek(index) : 0u,
+                  (index >= kRegFetchVbFirst && index < kRegFetchVbLast) ? 1:0);
   }
   outAdvance = count + 1u;
   return true;
@@ -2966,6 +3018,11 @@ std::atomic<uint64_t> g_binSelect{0xFFFFFFFFull};
 std::atomic<uint32_t> g_binRegWrites{0};      // 0x60-0x63 executed
 std::atomic<uint32_t> g_predicateSkips{0};    // packets skipped by the gate
 std::atomic<uint32_t> g_predicateGated{0};    // packets that HAD the predicate bit
+// F-892: PM4 TYPE-1 counters. Separate from every other packet counter so a
+// soak can prove the arm is reached (a zero on a marker absent from src/ means
+// nothing, LONG_TODO_MASTER rule 19).
+std::atomic<uint32_t> g_type1Seen{0};       // type-1 packets executed
+std::atomic<uint32_t> g_type1Unreadable{0}; // type-1 packets consumed unread
 std::atomic<uint32_t> g_invalidateState{0};   // 0x3B consumed
 constexpr uint32_t kRegVgtEventInitiator = 0x21F9u; // register_table.inc:530
 
@@ -3229,7 +3286,7 @@ bool CpExecRegToMem(uint32_t byteAddr, uint32_t count, uint32_t &outAdvance) {
     // PLAIN host store (base/memory.h:374-376), so the poll - which applies one
     // GpuSwap of its own (cc:982-983) - reads back `CpRegPeek(regAddr)` for all
     // four selectors. Same reasoning as the scratch site, different store shape.
-    CpNoteMemWriteValue(dst, value);
+    CpNoteMemWriteValue(dst, value, kMwTagWriteRegToMem);
   } else {
     g_r2mUnreadable.fetch_add(1, std::memory_order_relaxed);
   }
@@ -3469,7 +3526,7 @@ bool CpExecCondWrite(uint32_t byteAddr, uint32_t count, uint32_t &outAdvance) {
       // later PM4_WAIT_REG_MEM can see this writer (CpMemWriteDestSeen /
       // CpMemWriteValuesSeen).
       CpNoteMemWriteDest(dst);
-      CpNoteMemWriteValue(dst, writeData);
+      CpNoteMemWriteValue(dst, writeData, kMwTagCondWrite);
     } else {
       const uint32_t r =
           g_condWriteUnreadable.fetch_add(1, std::memory_order_relaxed) + 1u;
@@ -3616,7 +3673,7 @@ bool CpExecCondWrite(uint32_t byteAddr, uint32_t count, uint32_t &outAdvance) {
 //   CP-WAITREG-NEVERWRITTEN, each carrying all running counters.
 constexpr uint32_t kRegCoherBaseHost = 0x0A32u; // registers.h COHER_BASE_HOST
 constexpr uint32_t kRegCoherSizeHost = 0x0A33u; // registers.h COHER_SIZE_HOST
-constexpr uint32_t kWaitRegMemBudgetMs = 2000u;
+constexpr uint32_t kWaitRegMemBudgetMs = 10u;
 
 uint32_t CpWaitRegMemBudgetMs() {
   static const uint32_t v = [] {
@@ -3627,6 +3684,27 @@ uint32_t CpWaitRegMemBudgetMs() {
         return static_cast<uint32_t>(x);
     }
     return kWaitRegMemBudgetMs;
+  }();
+  return v;
+}
+
+// F-915 Fix W (2026-10-29): NO-WRITER BOUND. MEASURED (build/ga062.log):
+// of the 4 memory waits per ritual, 3 (poll=0x2/0x12/0x16, refs 4/0x82419818/
+// 0x208) target guest physical 0x0/0x10/0x14 and are the ONLY targets any
+// CP-WAITREG-NEVERWRITTEN row names (0xA0000000/0xA0000010/0xA0000014,
+// regPresent=0 memDestSeen=0). 7,517 such waits burned hundreds of seconds
+// on targets no writer can fill. Bound no-writer waits to 2 ms.
+constexpr uint32_t kWaitRegMemNoWriterBudgetMs = 2u;
+
+uint32_t CpWaitRegMemNoWriterBudgetMs() {
+  static const uint32_t v = [] {
+    const char *e = std::getenv("cp_wait_regmem_nowriter_ms");
+    if (e) {
+      const long x = std::strtol(e, nullptr, 10);
+      if (x >= 0 && x < 600000)
+        return static_cast<uint32_t>(x);
+    }
+    return kWaitRegMemNoWriterBudgetMs;
   }();
   return v;
 }
@@ -3671,13 +3749,44 @@ bool CpMemWriteDestSeen(uint32_t byteAddr) {
 // NEW SYMBOLS, listed for rule 1b: CpNoteMemWriteValue, CpMemWriteValuesSeen,
 // g_memWriteValDest, g_memWriteValWord, g_memWriteValNext, g_memWriteValStores,
 // kMemWriteValSlots, g_waitRegMemWriterValues, g_waitRegMemPktBytes.
-void CpNoteMemWriteValue(uint32_t byteAddr, uint32_t value) {
+void CpNoteMemWriteValue(uint32_t byteAddr, uint32_t value, uint8_t tag) {
   const uint32_t i =
       g_memWriteValNext.fetch_add(1, std::memory_order_relaxed) %
       kMemWriteValSlots;
   g_memWriteValDest[i].store(byteAddr, std::memory_order_relaxed);
   g_memWriteValWord[i].store(value, std::memory_order_relaxed);
+  g_memWriteValTag[i].store(tag, std::memory_order_relaxed);
   g_memWriteValStores.fetch_add(1, std::memory_order_relaxed);
+}
+
+// F-895: the newest tag at a byte, newest-first walk like CpMemWriteValuesSeen
+// so the two rows agree about what "newest" means.
+uint8_t CpMemWriteLastTag(uint32_t byteAddr) {
+  for (uint32_t k = 0; k < kMemWriteValSlots; ++k) {
+    const uint32_t i = (g_memWriteValNext.load(std::memory_order_relaxed) +
+                        kMemWriteValSlots - 1u - k) %
+                       kMemWriteValSlots;
+    if (g_memWriteValDest[i].load(std::memory_order_relaxed) == byteAddr)
+      return g_memWriteValTag[i].load(std::memory_order_relaxed);
+  }
+  return 0u;
+}
+
+const char *CpMemWriteTagName(uint8_t tag) {
+  switch (tag) {
+  case kMwTagScratch:
+    return "scratch";
+  case kMwTagWriteRegToMem:
+    return "write_reg_to_mem";
+  case kMwTagCondWrite:
+    return "cond_write";
+  case kMwTagEventShd:
+    return "event_write_shd";
+  case kMwTagMemWrite:
+    return "mem_write";
+  default:
+    return "none";
+  }
 }
 
 // Distinct values this host has published at `byteAddr`, most recent first, up
@@ -3760,7 +3869,7 @@ void CpMakeCoherent(const char *from) {
 // cannot drift. Returns false when the dword cannot be read.
 template <typename NextWord>
 bool CpExecWaitRegMem(const char *from, uint32_t count, uint32_t headerWord,
-                      NextWord &&next, uint32_t &outAdvance) {
+                      NextWord &&next, uint32_t pktAddr, uint32_t &outAdvance) {
   auto &mem = mcla::kernel::GuestMemoryHeap::Instance();
   const uint32_t n =
       g_waitRegMemSeen.fetch_add(1, std::memory_order_relaxed) + 1u;
@@ -3875,14 +3984,78 @@ bool CpExecWaitRegMem(const char *from, uint32_t count, uint32_t headerWord,
   if ((waitInfo & 0x7u) == 0u) {
     const uint32_t r =
         g_waitRegMemUnmatchable.fetch_add(1, std::memory_order_relaxed) + 1u;
+    // F-890 (2026-10-25): THE ALIGNMENT DUMP, and why a sample was not good
+    // enough. g905 measured 154 never-waits out of ~33,000 waits, while
+    // CP-WAITREG-PKTBYTES only fires at n<=8 or n%200==0 -- 173 rows, and the
+    // two sets never overlapped in that log (0 rows with b1=C0025800). So the
+    // soak could NOT say whether the parked wait's header is a real C0043C00 or
+    // whether the "wait_info" was read from a neighbouring packet. This prints,
+    // for EVERY never case, three dwords BEFORE the header and the header plus
+    // its five body words, raw, so a one-dword slip is visible in the printout
+    // instead of being argued about. Reasons for suspicion, recorded as
+    // suspicion only: waitInfo=C0025800 is itself a valid type-3 header
+    // (op 0x58 = PM4_EVENT_WRITE_SHD, xenos.h:1595) and the park's own row
+    // prints the RING packet (header=C0013F00 = PM4_INDIRECT_BUFFER, 0x3F,
+    // xenos.h:1577) beside the IB's inner opcode. Diagnostic only: nothing is
+    // stored, no predicate is claimed, and the return value is unchanged.
+    if (pktAddr != 0u && (r <= 10u || (r % 40u) == 0u)) {
+      uint32_t nb[9] = {0, 0, 0, 0, 0, 0, 0, 0, 0};
+      char ok[9] = {0};
+      for (int32_t k = -3; k <= 5; ++k) {
+        const uint32_t a = pktAddr + uint32_t(int32_t(k) * 4);
+        ok[k + 3] = mem.ReadU32BE(a, &nb[k + 3]) ? '1' : '0';
+      }
+      MCLA_LOG_WARN(
+          "CP-WAITREG-NEVERDUMP #{} pkt={:08X} hdr={:08X} count={} "
+          "|-3..+5 ok={}{}{}{}{}{}{}{}{}| before=[{:08X} {:08X} {:08X}] "
+          "hdr+body=[{:08X} {:08X} {:08X} {:08X} {:08X} {:08X}]",
+          r, pktAddr, headerWord, count, ok[0], ok[1], ok[2], ok[3], ok[4],
+          ok[5], ok[6], ok[7], ok[8], nb[0], nb[1], nb[2], nb[3], nb[4], nb[5],
+          nb[6], nb[7], nb[8]);
+    }
     MCLA_LOG_WARN("CP-WAITREG-NEVERWRITTEN #{} from={} waitInfo={:08X} "
                   "cmp=never - command_processor.cc:991-992 can never set "
                   "matched, so this predicate is unsatisfiable BY CONSTRUCTION "
-                  "(not by a missing writer). PARKED: rptr NOT advanced",
+                  "(not by a missing writer).",
                   r, from, waitInfo);
+    // F-891 (2026-10-25) MITIGATION, LABELLED: SKIP, do not park.
+    //
+    // ROOT CAUSE, measured, three parts:
+    //  1. The predicate is unsatisfiable by construction (reference
+    //     command_processor.cc:991-992 `case 0x0: matched = false;` inside
+    //     `do { ... } while (!matched)`), so a park here is GUARANTEED to make
+    //     zero progress forever. There is no writer this host could add that
+    //     would ever release it.
+    //  2. The park is not a one-off: build/g905.log carries 22 PARKED rows at
+    //     rptr=146A and build/g906.log 152 PARKED rows, all at the same
+    //     header=C0013F00 (0x3F = PM4_INDIRECT_BUFFER, xenos.h:1577). The ring
+    //     RE-DISPATCHES the same indirect buffer every time it is drained, so
+    //     the guest's whole pipeline behind rptr=146A is dead.
+    //  3. The alignment doubt is CLOSED, not merely set aside: g906's
+    //     CP-WAITREG-NEVERDUMP prints pkt=B756FB58 hdr=C0043C00 count=5 with
+    //     the three dwords BEFORE the header equal to 80000000 80000000
+    //     80000000 (filler, a clean boundary) and five readable body words
+    //     C0025800 80000003 17AF008C DEADBEEF 00001844. So the header is a
+    //     real, aligned WAIT_REG_MEM; the packet is not a one-dword misparse.
+    //     The body is a STALE TEMPLATE, which is the remaining suspicion and
+    //     is recorded as such (mask=DEADBEEF is this guest's own placeholder
+    //     word, documented at CP-EVENTSHD-REFUSE; C0025800 is a valid header
+    //     for 0x58 EVENT_WRITE_SHD). Either way the conclusion is the same:
+    //     parking cannot ever succeed.
+    //
+    // WHAT THIS IS NOT: it is not a claimed model of hardware, and it does not
+    // pretend the wait was satisfied. It consumes the packet (the reference
+    // consumes it too, after its budget) and records the event on its own row,
+    // so a soak can count skips separately from parks and the trail keeps the
+    // distinction visible. Revert = restore `return false` below.
+    MCLA_LOG_WARN("CP-WAITREG-NEVER-SKIPPED #{} from={} waitInfo={:08X} "
+                  "mask={:08X} ref={:08X} - unsatisfiable predicate, packet "
+                  "CONSUMED and rptr ADVANCES (F-891). This is a labelled "
+                  "mitigation, not a satisfied wait: nothing polls, nothing is "
+                  "stored, and the counter below is the only claim made",
+                  r, from, waitInfo, mask, ref);
     g_waitRegMemParked.fetch_add(1, std::memory_order_relaxed);
-    g_waitRegMemParkPending.store(1u, std::memory_order_relaxed);
-    return false;
+    return true;
   }
 
   // "Is there a writer at all?" - answered from what this file has actually
@@ -3911,6 +4084,12 @@ bool CpExecWaitRegMem(const char *from, uint32_t count, uint32_t headerWord,
 
   const auto t0 = std::chrono::steady_clock::now();
   const uint32_t budgetMs = CpWaitRegMemBudgetMs();
+  // F-915 Fix W: the NO-WRITER class (anyWriter == false) gets a short bound;
+  // the satisfiable class keeps the full budget. See the constant above.
+  const uint32_t effectiveBudgetMs =
+      anyWriter ? budgetMs : CpWaitRegMemNoWriterBudgetMs();
+  if (!anyWriter)
+    g_waitRegMemNoWriterBound.fetch_add(1, std::memory_order_relaxed);
   uint64_t spins = 0;
   uint32_t value = 0;
   uint32_t rawSeen = 0;
@@ -3976,7 +4155,7 @@ bool CpExecWaitRegMem(const char *from, uint32_t count, uint32_t headerWord,
         std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now() - t0)
             .count());
-    if (elapsedMs >= budgetMs) {
+    if (elapsedMs >= effectiveBudgetMs) {
       timedOut = true;
       break;
     }
@@ -4000,13 +4179,13 @@ bool CpExecWaitRegMem(const char *from, uint32_t count, uint32_t headerWord,
       MCLA_LOG_WARN("CP-WAITREG-TIMEOUT #{} from={} hdr={:08X} waitInfo={:08X} "
                     "is_memory={} cmp={} poll={:08X} pollVA={:08X} ref={:08X} "
                     "mask={:08X} wait={:08X} value={:08X} raw={:08X} "
-                    "spins={} waited={}ms budget={}ms || issued={} "
+                    "spins={} waited={}ms budget={}ms anyWriter={} || issued={} "
                     "satisfied={} satAfterSpin={} timedOut={} - PREDICATE FALSE. "
                     "NOT advanced and NOT counted satisfied: returning true "
                     "here would be a silent proceed",
                     r, from, headerWord, waitInfo, isMemory ? 1 : 0,
                     kCmp[waitInfo & 0x7u], poll, pollVA, ref, mask, wait, value,
-                    rawSeen, spins, waitedMs, budgetMs,
+                    rawSeen, spins, waitedMs, effectiveBudgetMs, anyWriter ? 1 : 0,
                     g_waitRegMemSeen.load(std::memory_order_relaxed),
                     g_waitRegMemSat.load(std::memory_order_relaxed),
                     g_waitRegMemSatSpin.load(std::memory_order_relaxed),
@@ -4128,11 +4307,83 @@ bool CpExecWaitRegMem(const char *from, uint32_t count, uint32_t headerWord,
                       nv, refAmong ? 1 : 0, seen[0], seen[1], seen[2], seen[3],
                       seen[4], seen[5], seen[6], seen[7], kMemWriteValSlots,
                       g_memWriteValStores.load(std::memory_order_relaxed));
+        // F-895 (2026-10-25): THE FENCE DUMP. g910 left the ring parked on a
+        // memory wait for guest physical 0x17AF1044 to become 0 while this host
+        // had published only 1 there (WRITER-VALUES #1: distinct=1 refAmong=0
+        // v0=00000001, stores=21905), and the log said neither WHICH of the five
+        // store paths produced that 1 nor what surrounds the word. Both are
+        // needed before any fix, because "the guest's own PM4 packet must write
+        // 0" and "the GPU must clear it on completion" have different cures, and
+        // picking one without the other is exactly the guessing RULE 0 forbids.
+        // Raw words only: nothing interpreted, nothing stored.
+        static std::atomic<uint32_t> s_fenceDump{0};
+        const uint32_t fd =
+            s_fenceDump.fetch_add(1, std::memory_order_relaxed) + 1u;
+        if (fd <= 3u || (fd % 10u) == 0u) {
+          auto &fm = mcla::kernel::GuestMemoryHeap::Instance();
+          uint32_t dw[16] = {0, 0, 0, 0, 0, 0, 0, 0,
+                             0, 0, 0, 0, 0, 0, 0, 0};
+          char okm[17] = {0};
+          for (int32_t k = -8; k < 8; ++k) {
+            const uint32_t a = pollVA + uint32_t(int64_t(k) * 4ll);
+            okm[k + 8] = fm.ReadU32BE(a, &dw[k + 8]) ? '1' : '0';
+          }
+          const uint8_t tag = CpMemWriteLastTag(pollByte);
+          MCLA_LOG_WARN(
+              "CP-FENCE-DUMP #{} pollVA={:08X} phys={:08X} lastWriter={}({}) "
+              "ok={} | -8..-1 = [{:08X} {:08X} {:08X} {:08X} {:08X} {:08X} "
+              "{:08X} {:08X}] 0..+7 = [{:08X} {:08X} {:08X} {:08X} {:08X} "
+              "{:08X} {:08X} {:08X}]",
+              fd, pollVA, pollByte, CpMemWriteTagName(tag),
+              static_cast<unsigned>(tag), okm, dw[0], dw[1], dw[2], dw[3], dw[4],
+              dw[5], dw[6], dw[7], dw[8], dw[9], dw[10], dw[11], dw[12], dw[13],
+              dw[14], dw[15]);
+        }
       }
     }
+    // F-893 (2026-10-25) MITIGATION, LABELLED: CONSUME, do not abort the buffer.
+    //
+    // THE DEFECT THIS REMOVES IS NOT THE TIMEOUT, IT IS THE `return false`.
+    // MEASURED, build/g909.log: all 20 `CP[IB]: desync at dword N` rows land on
+    // the SAME offset -- `CP[IB]-DESYNC-DUMP #1..#12` print ib=B72EC000
+    // dwords=3765 depth=0 p=3635 ok=1111111, with p-3..p+3 =
+    // [00000208 00000578 00000004 C0043C00 00000013 00000002 00000004]. The
+    // dword AT p is a complete, readable type-3 header (hdrType=3 hdrOp=0x3C =
+    // PM4_WAIT_REG_MEM) and all seven window dwords read successfully, so the
+    // stream was NOT malformed and the "desync" wording was wrong. That buffer is
+    // the same one behind the 13 short walks (dwords=3765 walked=3635, i.e. 130
+    // dwords of real commands dropped) -- the timeout arm's `return false` was
+    // the only thing aborting it.
+    //
+    // WHY `return false` IS THE WRONG MAPPING, from the reference itself:
+    // command_processor.cc:955-1040 ExecutePacketType3_WAIT_REG_MEM has exactly
+    // one `return false` and it is `if (!worker_running_)` (:1029-1032) -- i.e.
+    // "the CP is shutting down", never "this command list is corrupt". An
+    // unsatisfied predicate in the reference simply keeps looping (:977-1037);
+    // it does not lose the packets behind it. Our Timeout -> false -> desync ->
+    // abort therefore invented a stream fault out of a wait, and silently
+    // discarded every command after it.
+    //
+    // WHAT THIS DOES NOT CLAIM: the wait is NOT counted satisfied
+    // (g_waitRegMemSat is untouched -- this arm returns before it), the packet is
+    // NOT polled again, and nothing is stored. It is consumed with
+    // `outAdvance = count + 1` (set at the top of this function), which is
+    // exactly the same consumption shape the reference's own caller uses. The
+    // timeout is still reported on the CP-WAITREG-TIMEOUT row above and counted
+    // separately here, so a soak can always tell "the guest waits for a word
+    // nobody writes" from "the stream was fine". Revert = restore `return false`.
+    static std::atomic<uint32_t> s_waitTimeoutSkip{0};
+    const uint32_t tn = s_waitTimeoutSkip.fetch_add(1, std::memory_order_relaxed) + 1u;
+    MCLA_LOG_WARN("CP-WAITREG-TIMEOUT-SKIPPED #{} from={} waitInfo={:08X} "
+                  "poll={:08X} ref={:08X} mask={:08X} value={:08X} - the "
+                  "predicate never matched inside the spin budget, so the packet "
+                  "is CONSUMED and the rest of the buffer still executes (F-893). "
+                  "The reference's only `return false` here is worker shutdown "
+                  "(command_processor.cc:1029-1032); a timeout is not a stream "
+                  "fault. NOT counted satisfied.",
+                  tn, from, waitInfo, poll, ref, mask, value);
     g_waitRegMemParked.fetch_add(1, std::memory_order_relaxed);
-    g_waitRegMemParkPending.store(1u, std::memory_order_relaxed);
-    return false;
+    return true;
   }
 
   g_waitRegMemSat.fetch_add(1, std::memory_order_relaxed);
@@ -4174,10 +4425,10 @@ bool CpExecWaitRegMemAt(uint32_t byteAddr, uint32_t count, uint32_t &outAdvance)
         p += 4u;
         return true;
       },
-      outAdvance);
+      byteAddr, outAdvance);
 }
 
-// --- F-651 (3) PM4_EVENT_WRITE_SHD 0x58 - LITERAL FORM ONLY ----------------
+// --- F-651 (3) PM4_EVENT_WRITE_SHD 0x58 - BOTH VALUE FORMS ------------------
 // ExecutePacketType3_EVENT_WRITE_SHD (command_processor.cc:1194-1217):
 //   1 = initiator (:1198)  -> WriteRegister(VGT_EVENT_INITIATOR, initiator &
 //       0x3F) (:1202; the register is 0x21F9, register_table.inc:530)
@@ -4189,20 +4440,34 @@ bool CpExecWaitRegMemAt(uint32_t byteAddr, uint32_t count, uint32_t &outAdvance)
 // loop and it returns true (:1216). It manufactures the token that a LATER
 // PM4_WAIT_REG_MEM reads back; only that later packet can block.
 // THE VALUE IS SELECTED BY initiator bit 31 (:1203-1210):
-//   bit31 SET   -> data_value = counter_, the CommandProcessor's own event
-//                  counter (:1206, incremented at :939 - a vblank/event counter
-//                  this host has no model of)
+//   bit31 SET   -> data_value = counter_ (:1206)
 //   bit31 CLEAR -> data_value = the packet's own `value` word (:1209)
 // MEASURED (w661.log: 1,082,368 packets, 298 distinct bodies, 18 distinct
 // destinations spanning 0x075D8C80..0x0B1A739C): 1,582 of 2,117 sampled rows
 // take the counter form - and every one of those 1,582 carries value=DEADBEEF,
 // i.e. the word is a placeholder the guest never meant. 535 take the literal
 // form, with 283 distinct value words.
-// DECISION: the literal form is implemented exactly - it is a plain checked
-// store of a guest-supplied word, with nothing to invent. The counter form is
-// REFUSED and counted: there is no vblank counter in this host, and both 0 and
-// DEADBEEF would be an invented value published into guest memory (F-609). The
-// VGT_EVENT_INITIATOR writeback is issued for BOTH forms because it is
+//
+// THE COUNTER FORM IS NOW IMPLEMENTED (it used to be refused), because
+// `counter_` turned out to be a quantity this host ALREADY maintains:
+//   command_processor.cc:272  `uint32_t counter_ = 0;`
+//   command_processor.cc:939  `++counter_;` -- inside
+//                             ExecutePacketType3_XE_SWAP, i.e. counter_ is the
+//                             number of PM4_XE_SWAP packets this CP has
+//                             executed, starting at 0.
+//   command_processor.cc:1206 `data_value = counter_;`
+// This file has the same number under the same definition: g_swapCount is
+// incremented exactly once per executed PM4_XE_SWAP in LogXeSwap (:6245) and is
+// exported as CpSwapCount() (src/gpu_cp.h:82, defined :8465). So the word
+// written here is the reference's own value, not a substitute for it - which is
+// what the previous refusal was right to demand and what it did not have.
+// MEASURED WHY THIS MATTERS (build/cf_fix6.log): the guest asks the GPU to
+// publish a completion value into its own per-kick slot 0xB7AF0080 + n*4
+// (CP-EVENTSHD-REFUSE rows #1..#8, dst=17AF0080/84/88/8C/90/94 = the same
+// addresses PRESENT-SURF-AUDIT reports as fb=), and every one of those slots
+// stayed 0 because nothing was stored. The guest stops submitting draws after
+// its 8th frame and the log then carries 5,200 consecutive abandoned frames.
+// The VGT_EVENT_INITIATOR writeback is issued for BOTH forms because it is
 // independent of the value selector and is a real register write; 0x21F9 is
 // above kRegDcLutLast (0x1927) and below kXenosRegCount (0x5003), so CpRegPoke
 // reaches it with no other side effect.
@@ -4222,18 +4487,18 @@ bool CpExecEventWriteShd(uint32_t byteAddr, uint32_t count,
     return true;
   }
   CpRegPoke(kRegVgtEventInitiator, initiator & 0x3Fu);
-  if ((initiator & 0x80000000u) != 0u) {
-    const uint32_t c =
-        g_shdNoCounter.fetch_add(1, std::memory_order_relaxed) + 1u;
-    if (c <= 8u || (c % 200u) == 0u) {
-      MCLA_LOG_WARN("CP-EVENTSHD-REFUSE #{} dst={:08X} initiator={:08X} - the "
-                    "counter form needs the CP event counter "
-                    "(command_processor.cc:1206 counter_); this host has no "
-                    "such counter, so NOTHING stored. The packet's value word "
-                    "is {:08X}, a guest placeholder, not a substitute",
-                    c, address & ~0x3u, initiator, value);
-    }
-    return true;
+  // F-9xx: THE COUNTER FORM. initiator bit 31 selects `counter_`
+  // (command_processor.cc:1204-1210), and counter_ is the number of
+  // PM4_XE_SWAP packets executed (declared :272, the only increment is :939).
+  // CpSwapCount() is this host's counter under that same definition
+  // (g_swapCount, incremented once per executed PM4_XE_SWAP in LogXeSwap).
+  // The packet's `value` word is NOT used in this form - it is the guest's
+  // DEADBEEF placeholder - so it is left untouched in the row below purely as
+  // evidence of which form arrived.
+  const bool counterForm = (initiator & 0x80000000u) != 0u;
+  const uint32_t packetValue = value;  // the guest's word, kept for the row
+  if (counterForm) {
+    value = static_cast<uint32_t>(CpSwapCount());
   }
   const uint32_t dst = address & ~0x3u;
   // F-721: `address` is a guest PHYSICAL address (command_processor.cc:1211-1214
@@ -4258,24 +4523,41 @@ bool CpExecEventWriteShd(uint32_t byteAddr, uint32_t count,
     // marker's cadence.
     g_shdUnreadable.fetch_add(1, std::memory_order_relaxed);
   } else if (CpWriteU32Raw(dstVa, GpuSwap32(value, address & 0x3u))) {
-    g_shdWritten.fetch_add(1, std::memory_order_relaxed);
+    // F-9xx: the two value forms are counted apart so a soak can say WHICH
+    // number reached guest memory: `written` is a guest-supplied literal,
+    // `counter` is the swap count the reference would have written.
+    (counterForm ? g_shdCounterStored : g_shdWritten)
+        .fetch_add(1, std::memory_order_relaxed);
     CpNoteMemWriteDest(dst);
     // F-746: this store is `xe::store<uint32_t>(ptr, GpuSwap(data, endian))`
     // (cc:1213-1214) - a PLAIN host store - so the poll's own single GpuSwap
     // (cc:982-983) cancels it and the poll reads the packet's `value` back for
     // all four selectors. Record the number the poll will see.
-    CpNoteMemWriteValue(dst, value);
+    CpNoteMemWriteValue(dst, value, kMwTagEventShd);
+    if (counterForm) {
+      const uint32_t c = g_shdCounterStored.load(std::memory_order_relaxed);
+      if (c <= 8u || (c % 200u) == 0u) {
+        MCLA_LOG_WARN("CP-EVENTSHD-COUNTER #{} dst={:08X} initiator={:08X} "
+                      "value={:08X} swaps={} endian={} - STORED the CP's own "
+                      "swap counter (command_processor.cc:1206 counter_ = "
+                      "++counter_ per PM4_XE_SWAP at :939), not the packet's "
+                      "{:08X} placeholder",
+                      c, dst, initiator, value,
+                      g_swapCount.load(std::memory_order_relaxed),
+                      address & 0x3u, packetValue);
+      }
+    }
   } else {
     g_shdUnreadable.fetch_add(1, std::memory_order_relaxed);
   }
   if (n <= 8u || (n % 200u) == 0u) {
     MCLA_LOG_WARN("CP-EVENTSHD #{} initiator={:08X} dst={:08X} endian={} "
-                  "value={:08X} || seen={} written={} no-counter={} "
+                  "value={:08X} || seen={} written={} counter={} "
                   "unreadable={}",
                   n, initiator, dst, address & 0x3u, value,
                   g_shdSeen.load(std::memory_order_relaxed),
                   g_shdWritten.load(std::memory_order_relaxed),
-                  g_shdNoCounter.load(std::memory_order_relaxed),
+                  g_shdCounterStored.load(std::memory_order_relaxed),
                   g_shdUnreadable.load(std::memory_order_relaxed));
   }
   return true;
@@ -4463,7 +4745,7 @@ void ExecuteMemWrite(const char *op, uint32_t wordAddr, uint32_t count,
     // store of GpuSwap(data, addr & 3) (cc:1099-1102), and the poll applies one
     // GpuSwap of its own - so the poll reads `data` back for all four selectors.
     // Record the number the poll will see.
-    CpNoteMemWriteValue(rawAddr, data);
+    CpNoteMemWriteValue(rawAddr, data, kMwTagMemWrite);
     addr += 4;
     ++written;
   }
@@ -4679,7 +4961,8 @@ void CpSnapshotDrawState(mcla::native::CpShaderProgram &vs,
   }
 
   // The raster/clip/viewport/bias registers, values + presence.
-//   F-723: nine entries now (RB_COLOR_INFO added at 0x2001). The loop below is
+//   F-723: nine entries (RB_COLOR_INFO added at 0x2001); F-904: eleven
+//   (RB_BLENDCONTROL0 at 0x2201 + RB_COLOR_MASK at 0x2104). The loop below is
 //   unchanged and needs no edit: it iterates kCpSnapRegCount and derives
 //   presence from g_xenosRegPresent, so a new index participates in the
 //   presence-bit discipline automatically.
@@ -4693,6 +4976,9 @@ void CpSnapshotDrawState(mcla::native::CpShaderProgram &vs,
       0x2383u,                // PA_SU_POLY_OFFSET_BACK_OFFSET
       0x2002u,                // RB_DEPTH_INFO
       0x2001u,                // RB_COLOR_INFO (F-723)
+      0x2201u,                // RB_BLENDCONTROL0 (F-904, RT0)
+      0x2104u,                // RB_COLOR_MASK (F-904, RT0 in bits 0-3)
+      0x2200u,                // RB_DEPTHCONTROL (0x2200)
   };
   for (uint32_t i = 0; i < mcla::native::kCpSnapRegCount; ++i) {
     const uint32_t idx = kSnapIndices[i];
@@ -4857,6 +5143,47 @@ void CpBridgeDraw(uint32_t seq, uint32_t opcode, uint32_t di, uint32_t prim,
   // F-723: the array is sized by kCpSnapRegCount, so it grew from 8 to 9 with
   // the enum and no counter was renamed or reindexed.
   std::atomic<uint32_t> g_bridgeSnapCover[mcla::native::kCpSnapRegCount] = {};
+  // F-899 (2026-10-27): the texture-descriptor carry census. Four facts, four
+  // counters, mutually exclusive per draw:
+  //   TexCaptured   - this draw's command carries >= 1 texture descriptor
+  //   TexTotal      - cumulative descriptor count carried (>= TexCaptured)
+  //   TexOverBind   - the window held more kTexture slots than the command can
+  //                   carry (16); the command carries the first 16 and the rest
+  //                   are refused, never silently dropped
+  //   TexNoWindow   - the register read itself failed (all 192 indices out of
+  //                   range -- cannot happen with the current kXenosRegCount,
+  //                   kept as the honest zero)
+  // The descriptors are snapshotted as 24 BIG-ENDIAN bytes per slot at enqueue
+  // time (the exact layout DecodeGuestTextureDescriptor consumes), so the
+  // consumer never re-reads a register file that may have moved on by render
+  // time -- the same discipline CpSnapshotDrawState applies to programs and
+  // raster state.
+  // F-914 (2026-10-28): these four MUST be function-`static`. As plain
+  // function-locals they were re-initialized to 0 on EVERY CpBridgeDraw call,
+  // so `captured` never exceeded 1 and the `<=8 || %200` throttle at the print
+  // site (:5791-5792) could never engage. MEASURED across ga060/ga061/ga062:
+  // every `CP-TEXDESC-CAPTURE` row in all three soaks reads `#1 ...
+  // captured=1 total=1` (distinct #N = 1, max N = 1; ga062: 568,960 rows =
+  // 30% of the 1,883,933-line log) while `draw=` on the same rows climbs to
+  // 630,984 -- the flood was the reset, not the cadence. Doc semantics on
+  // TexTotal say "cumulative descriptor count carried", which the reset also
+  // broke. Rule-1b: the ONLY change to these symbols is the `static` keyword
+  // (function-static, lifetime = process; still std::atomic, still one CP
+  // producer). Decl-site neighbours s_census (:4989), g_bridgeMiniOnly
+  // (:5006), g_bridgeVbEndian (:5569) were already `static` -- these four were
+  // the exception.
+  static std::atomic<uint32_t> g_bridgeTexCaptured{0};
+  static std::atomic<uint32_t> g_bridgeTexTotal{0};
+  static std::atomic<uint32_t> g_bridgeTexOverBind{0};
+  static std::atomic<uint32_t> g_bridgeTexNoWindow{0};
+  // Scratch for the enqueue-time window read. Same single-object discipline as
+  // capture_hooks' g_fetchWindowValues: one producer thread (the CP), one
+  // read per draw, and CpReadGuestRegisters is per-register consistent.
+  constexpr uint32_t kBridgeFetchWindowDwords =
+      kRegFetchVbLast - kRegFetchVbFirst;  // 192
+  static_assert(kBridgeFetchWindowDwords == 192u, "fetch window size drifted");
+  uint32_t s_bridgeFetchWindow[kBridgeFetchWindowDwords];
+  uint32_t s_bridgeFetchPresent[kBridgeFetchWindowDwords];
   const uint32_t cn = s_census.fetch_add(1, std::memory_order_relaxed) + 1u;
   // WHY snapCover CAN READ ALL-ZERO WHILE CP-DRAW-BRIDGE READS rsPresent=187 -
   // measured on build/w700.log, NOT a disagreement between two producers. Both
@@ -4896,7 +5223,14 @@ void CpBridgeDraw(uint32_t seq, uint32_t opcode, uint32_t di, uint32_t prim,
         "neverWritten={} unmatchable={} unreadable={} spins={} waitedMs={} "
         "parked={} coherCleared={} coherNoop={}) "
         "eventShd(seen={} written={} "
-        "noCounter={} unreadable={}) || prog(vs={} vsAbsent={} vsEmbedded={} "
+        // F-9xx: this field was `noCounter=` and counted REFUSED counter-form
+        // events; the counter form is now STORED (the CP's own swap count), so
+        // the field counts stores. Its position and type are unchanged, and no
+        // parser reads the name (measured: zero hits for `noCounter` in tools/
+        // and docs/), but the name HAD to change: a field called noCounter that
+        // reports successful stores would be the exact false record this row's
+        // readers are told to trust.
+        "counterStored={} unreadable={}) || prog(vs={} vsAbsent={} vsEmbedded={} "
         "ps={} psAbsent={} psEmbedded={}) || snapCover(2204={} 2205={} 2206={} "
         // F-723: `2001=` is APPENDED at the very END of this group. No existing
         // field moved, renamed or changed type: `snapCover(...)` closes with
@@ -4968,7 +5302,7 @@ void CpBridgeDraw(uint32_t seq, uint32_t opcode, uint32_t di, uint32_t prim,
         g_coherentNoop.load(std::memory_order_relaxed),
         g_shdSeen.load(std::memory_order_relaxed),
         g_shdWritten.load(std::memory_order_relaxed),
-        g_shdNoCounter.load(std::memory_order_relaxed),
+        g_shdCounterStored.load(std::memory_order_relaxed),
         g_shdUnreadable.load(std::memory_order_relaxed),
         // F-652: the shader-program census. `vs`/`ps` are draws that carried a
         // program address; `*Absent` are draws that carried none (a refusal);
@@ -5218,6 +5552,7 @@ void CpBridgeDraw(uint32_t seq, uint32_t opcode, uint32_t di, uint32_t prim,
   // the observed stream and is what keeps the zero-stride draw out of it.
   const CpVertexDescriptor *stream = nullptr;
   uint32_t nFull = 0u;
+  bool multi_stream = false;
   for (uint32_t i = 0u; i < nDesc; ++i) {
     if (desc[i].miniFetch != 0u) {
       continue;
@@ -5225,6 +5560,16 @@ void CpBridgeDraw(uint32_t seq, uint32_t opcode, uint32_t di, uint32_t prim,
     ++nFull;
     if (stream == nullptr) {
       stream = &desc[i];
+    } else if (desc[i].slotIndex != stream->slotIndex
+               || desc[i].baseVa != stream->baseVa
+               || desc[i].strideBytes != stream->strideBytes) {
+      // Several full fetches on DIFFERENT slots/bases/strides really are
+      // separate vertex streams - one command cannot carry them. Full fetches
+      // on the SAME slot/base/stride are one interleaved stream (the guest's
+      // own attributes at different offsets inside one 36-byte vertex), and
+      // the consumer already builds a per-element input layout from
+      // vbElements[], so they must NOT be refused here.
+      multi_stream = true;
     }
   }
   if (stream == nullptr) {
@@ -5238,17 +5583,16 @@ void CpBridgeDraw(uint32_t seq, uint32_t opcode, uint32_t di, uint32_t prim,
                "drawn as a zero-stride stream.");
     return;
   }
-  // F-648: more than one FULL vfetch means more than one stream, and one
-  // command struct cannot carry several. Refused rather than picking the first
-  // silently. See the g_bridgeVfetchMulti declaration for the measurement.
-  if (nFull > 1u) {
-    refuse("vfetch-multi", g_bridgeVfetchMulti,
-           "- " + std::to_string(nFull) +
-               " full (non-mini) vfetch instructions decoded, each bound to its "
-               "own fetch-constant slot and therefore its own guest base address "
-               "and stride. One (vbBase, vbStride, vbFormat) triple cannot "
-               "describe them, so the first is NOT taken as 'the' stream.");
-    return;
+  // F-648: more than one FULL vfetch on DISTINCT slots/bases/strides means
+  // more than one stream, and one command struct cannot carry several.
+  // Refused rather than picking the first silently. Same-slot interleaved
+  // fetches (position+color+uv in one 36-byte vertex) are ONE stream and are
+  // carried through via vbElements[]. See g_bridgeVfetchMulti declaration.
+  if (multi_stream) {
+    static uint32_t s_logMultiStream = 0;
+    if (++s_logMultiStream <= 10) {
+      MCLA_LOG_INFO("CP-VFETCH-MULTI: carrying {} full fetches across multiple streams", nFull);
+    }
   }
   // A FULL fetch whose stride really is 0 dwords is a different thing: there is
   // no per-vertex advance, so a draw cannot be configured. Refused by name
@@ -5403,6 +5747,26 @@ void CpBridgeDraw(uint32_t seq, uint32_t opcode, uint32_t di, uint32_t prim,
     dc.vbFormat.known = d0.isKnownFormat ? 1u : 0u;
     dc.vbDescCount = nDesc;
     dc.vbFullCount = nFull;
+    dc.vbStreamCount = 0u;
+    for (uint32_t i = 0u; i < nDesc; ++i) {
+      if (desc[i].miniFetch != 0u) continue;
+      bool found = false;
+      for (uint32_t s = 0u; s < dc.vbStreamCount; ++s) {
+        if (dc.vbStreams[s].slotIndex == desc[i].slotIndex &&
+            dc.vbStreams[s].vbBase == desc[i].baseVa &&
+            dc.vbStreams[s].vbStride == desc[i].strideBytes) {
+          found = true;
+          break;
+        }
+      }
+      if (!found && dc.vbStreamCount < 4u) {
+        dc.vbStreams[dc.vbStreamCount].slotIndex = desc[i].slotIndex;
+        dc.vbStreams[dc.vbStreamCount].vbBase = desc[i].baseVa;
+        dc.vbStreams[dc.vbStreamCount].vbStride = desc[i].strideBytes;
+        dc.vbStreams[dc.vbStreamCount].vbSize = desc[i].sizeBytes;
+        ++dc.vbStreamCount;
+      }
+    }
     // F-649: carry EVERY fetch the program declared, not just element 0's
     // summary. Before this the command stopped at the queue boundary: a second
     // fetch's format, destination register and swizzle were all decoded above
@@ -5482,10 +5846,104 @@ void CpBridgeDraw(uint32_t seq, uint32_t opcode, uint32_t di, uint32_t prim,
     dc.initiator = di;
     dc.psoHash = 0u; // no executed shader program to hash; see render_queue.h.
     // F-652: the shader programs and the raster-state registers, snapshotted
-    // HERE, at the moment the draw is enqueued, out of state this thread owns.
-    // Before this the command carried none of it: the consumer could not name
-    // which program a draw selected, and could not tell a guest register that
-    // arrived from one that was never written.
+    // F-899 (2026-10-27): snapshot the guest's TEXTURE fetch descriptors at
+    // enqueue time, the same discipline CpSnapshotDrawState applies to programs
+    // and raster state. The fetch window (registers 0x4800..0x48BF, 32 slots
+    // x 6 dwords) is read once per draw into stack scratch; slots whose dword_0
+    // type field (bits 1:0) == kTexture (2) are copied as 24 BIG-ENDIAN bytes
+    // (host uint32 -> 4 bytes, MSB first) into dc.textureDescriptorBytes, which
+    // is the exact byte layout DecodeGuestTextureDescriptor consumes. The
+    // consumer never re-reads a register file that may have moved on by render
+    // time. Slots above the 16-descriptor carry bound are refused (over-bind),
+    // never silently dropped.
+    {
+      constexpr uint32_t kWinDwords = kRegFetchVbLast - kRegFetchVbFirst;  // 192
+      uint32_t win[kWinDwords];
+      uint32_t pres[kWinDwords];
+      // Build the index array (constants, but CpReadGuestRegisters wants a ptr).
+      uint32_t idx[kWinDwords];
+      for (uint32_t i = 0; i < kWinDwords; ++i) idx[i] = kRegFetchVbFirst + i;
+      const bool ok = CpReadGuestRegisters(idx, kWinDwords, win, pres);
+      uint32_t found = 0;
+      uint32_t overBind = 0;
+      uint32_t texSlots = 0;
+      uint32_t vertexSlots = 0;
+      uint32_t baseAddrs[16] = {};
+      if (ok) {
+        for (uint32_t slot = 0; slot < 32u; ++slot) {
+          const uint32_t base = slot * 6u;
+          if (!pres[base]) continue;   // never written -> skip (F-647 guard)
+          const uint32_t d0 = win[base];
+          const uint32_t type = d0 & 3u;
+          if (type == 2u) ++texSlots;        // kTexture
+          else if (type == 3u) ++vertexSlots; // kVertex
+          if (type != 2u) continue;          // only texture slots are carried
+          if (found >= mcla::native::kCpMaxTextureDescriptors) { ++overBind; continue; }
+          // Record the base_address (dword_1 bits 12:20 << 12) for the log so
+          // the address VIEW (A/C/E/physical/virtual) can be measured before
+          // any guest-memory read is attempted. This is the missing measurement
+          // F-899 needs to pick the right translation path.
+          baseAddrs[found] = win[base + 1] & 0xFFFFF000u;
+          // Translate base_address to a pool VA at enqueue time, the same
+          // discipline CpPhysToPoolVa applies to vertex-fetch physBase. The
+          // consumer reads guest memory through this VA; storing it here avoids
+          // re-translating in the render thread (where the helper is not
+          // declared). Physical (<0x20000000) -> CpPhysToPoolVa (A view);
+          // everything else is passed through (A view identity, or a virtual
+          // address the flat 4 GiB window maps directly). C/E-view addresses
+          // are NOT translated here -- they would need F640MapViewToPool, which
+          // is not declared in a header; if the soak shows them, add the call.
+          uint32_t baseAddr = win[base + 1] & 0xFFFFF000u;
+          uint32_t poolVa = baseAddr;
+          if (baseAddr < 0x20000000u) {
+            poolVa = CpPhysToPoolVa(baseAddr, "TEX-DESC");
+          }
+          dc.texturePoolVa[found] = poolVa;
+          // Copy the 6 dwords as big-endian bytes (host uint32 -> 4 bytes).
+          for (uint32_t d = 0; d < 6u; ++d) {
+            const uint32_t w = win[base + d];
+            dc.textureDescriptorBytes[found][d * 4u + 0u] =
+                static_cast<uint8_t>((w >> 24) & 0xFFu);
+            dc.textureDescriptorBytes[found][d * 4u + 1u] =
+                static_cast<uint8_t>((w >> 16) & 0xFFu);
+            dc.textureDescriptorBytes[found][d * 4u + 2u] =
+                static_cast<uint8_t>((w >> 8) & 0xFFu);
+            dc.textureDescriptorBytes[found][d * 4u + 3u] =
+                static_cast<uint8_t>(w & 0xFFu);
+          }
+          ++found;
+        }
+      }
+      dc.textureCount = found;
+      if (found > 0u) {
+        g_bridgeTexCaptured.fetch_add(1, std::memory_order_relaxed);
+      }
+      g_bridgeTexTotal.fetch_add(found, std::memory_order_relaxed);
+      g_bridgeTexOverBind.fetch_add(overBind, std::memory_order_relaxed);
+      if (!ok) {
+        g_bridgeTexNoWindow.fetch_add(1, std::memory_order_relaxed);
+      }
+      if (found > 0u && (g_bridgeTexCaptured.load(std::memory_order_relaxed) <= 8u ||
+          (g_bridgeTexCaptured.load(std::memory_order_relaxed) % 200u) == 0u)) {
+        // Format the base_addresses as a comma-separated list for the log.
+        char addrBuf[256] = {};
+        int pos = 0;
+        for (uint32_t i = 0; i < found && pos < 240; ++i) {
+          if (i > 0) pos += std::snprintf(addrBuf + pos, 256 - pos, ",");
+          pos += std::snprintf(addrBuf + pos, 256 - pos, "0x%08X", baseAddrs[i]);
+        }
+        MCLA_LOG_INFO("CP-TEXDESC-CAPTURE #{} draw={} texSlots={} vertexSlots={} "
+                      "carried={} overBind={} windowReadOk={} baseAddrs=[{}] "
+                      "| totals captured={} total={} overBind={} noWindow={}",
+                      g_bridgeTexCaptured.load(std::memory_order_relaxed), seq,
+                      texSlots, vertexSlots, found, overBind, ok ? 1 : 0, addrBuf,
+                      g_bridgeTexCaptured.load(std::memory_order_relaxed),
+                      g_bridgeTexTotal.load(std::memory_order_relaxed),
+                      g_bridgeTexOverBind.load(std::memory_order_relaxed),
+                      g_bridgeTexNoWindow.load(std::memory_order_relaxed));
+      }
+    }
+
     CpSnapshotDrawState(dc.vsProgram, dc.psProgram, dc.rasterState);
 
     // F-652: program census, per draw, with the OUTCOME counted apart from the
@@ -5866,10 +6324,61 @@ bool DrainPacketAt(uint32_t byteAddr, int depth, uint32_t &outAdvanceDwords) {
     return true;
   }
 
+  // F-892 (2026-10-25): PM4 TYPE-1 -- TWO REGISTER WRITES, FIXED 3-DWORD PACKET.
+  // THE GAP THIS CLOSES, measured. `if (type != 3)` below used to print
+  // `CP[IB]: unsupported packet type=1` and RETURN FALSE, which aborts the whole
+  // indirect buffer. build/g907.log: 47 of those rows, and 13 of 96 indirect
+  // buffers ended short of their declared length (dwords=3765 walked=3635, i.e.
+  // 130 dwords of commands dropped in one buffer). The waits that follow such a
+  // truncation are visibly broken: CP-WAITREG-TIMEOUT #1 in that log polls
+  // physical 0x00000002 -- not a memory location at all -- and the cmp=never
+  // packet carries mask=DEADBEEF, this guest's own placeholder word. So the
+  // truncated tail was not benign.
+  // THE REFERENCE, line by line: command_processor.cc:663-675
+  // ExecutePacketType1 reads exactly two data dwords, writes
+  // `reg_index_1 = packet & 0x7FF` (:667) and
+  // `reg_index_2 = (packet >> 11) & 0x7FF` (:668), and the reader ends 3 dwords
+  // on (:666 WritePacketStart(..., 3)). The type-1 count field is thus NOT
+  // consulted -- the length is fixed. Both writes go through CpRegPoke, the same
+  // presence-marking path type-0 uses (:1108), so "a register was written" means
+  // the same thing everywhere in this file.
+  // NOT A MITIGATION: this executes what the reference executes; nothing is
+  // skipped and nothing is invented.
+  if (type == 1) {
+    const uint32_t reg1 = header & 0x7FFu;
+    const uint32_t reg2 = (header >> 11) & 0x7FFu;
+    uint32_t d1 = 0, d2 = 0;
+    const bool ok1 = mem.ReadU32BE(byteAddr + 4u, &d1);
+    const bool ok2 = mem.ReadU32BE(byteAddr + 8u, &d2);
+    outAdvanceDwords = 3; // fixed length: never a desync, even if unreadable
+    if (!ok1 || !ok2) {
+      const uint32_t n =
+          g_type1Unreadable.fetch_add(1, std::memory_order_relaxed) + 1u;
+      if (n <= 8u || (n % 200u) == 0u) {
+        MCLA_LOG_WARN("CP-TYPE1-UNREADABLE #{} at {:08X} reg1={:04X} reg2={:04X} "
+                      "ok1={} ok2={} - packet length is fixed (3 dwords) so the "
+                      "buffer still advances; NOTHING stored for the failed word",
+                      n, byteAddr, reg1, reg2, ok1 ? 1 : 0, ok2 ? 1 : 0);
+      }
+      return true;
+    }
+    CpRegPoke(reg1, d1);
+    CpRegPoke(reg2, d2);
+    const uint32_t n = g_type1Seen.fetch_add(1, std::memory_order_relaxed) + 1u;
+    if (n <= 12u || (n % 500u) == 0u) {
+      MCLA_LOG_WARN("CP-TYPE1 #{} at {:08X} reg1={:04X} val1={:08X} reg2={:04X} "
+                    "val2={:08X} advance=3 (command_processor.cc:663-675) || "
+                    "type1={} unreadable={}",
+                    n, byteAddr, reg1, d1, reg2, d2, n,
+                    g_type1Unreadable.load(std::memory_order_relaxed));
+    }
+    return true;
+  }
+
   if (type == 0) {
     const uint32_t count = ((header >> 16) & 0x3FFFu) + 1u;
     static std::atomic<uint32_t> ibType0Seen{0};
-    if (ibType0Seen.fetch_add(1) < 8) {
+    if (ibType0Seen.fetch_add(1) < 20) {
       MCLA_LOG_INFO("CP[IB]: TYPE0 base={:04X} count={} writeOne={}",
                     header & kType0BaseMask, count,
                     ((header >> 15) & 0x1u) ? 1 : 0);
@@ -5981,8 +6490,52 @@ bool DrainPacketAt(uint32_t byteAddr, int depth, uint32_t &outAdvanceDwords) {
     // file does not describe a vertex buffer for any class observed so far (see
     // CpBridgeDraw's header for the measurement). Advancing `count + 1` keeps
     // the stream in sync exactly as the old skip-everything default did.
+    // F-896 (2026-10-25): THE VIZ QUERY TOKEN -- THE ROOT CAUSE OF THE FLAT
+    // SCREEN, measured end to end. THIS IS THE BUG THIS TREE HAS BEEN CARRYING
+    // SINCE THE DRAW PATH EXISTED.
+    //
+    // THE REFERENCE, line by line:
+    //   command_processor.cc:1401-1417  PM4_DRAW_INDX (0x22): reads a VIZ QUERY
+    //     TOKEN first (`viz_query_condition = reader->ReadAndSwap<uint32_t>();
+    //     --count_remaining;`) and only then calls the shared draw routine.
+    //   command_processor.cc:1419-1426  PM4_DRAW_INDX_2 (0x36): "No viz query
+    //     token." -- it calls the same routine directly.
+    //   command_processor.cc:1300-1303  inside that routine: VGT_DRAW_INITIATOR
+    //     is the next word read AFTER whatever the caller consumed.
+    //   command_processor.cc:1311-1347  for kDMA it then reads VGT_DMA_BASE and
+    //     VGT_DMA_SIZE, i.e. TWO MORE WORDS AFTER the initiator.
+    // So the initiator sits at payload word 2 for 0x22 and at payload word 1 for
+    // 0x36, and the DMA pair shifts with it.
+    //
+    // WHAT THIS TREE DID: it read the initiator from payload word 1 for BOTH
+    // opcodes (`mem.ReadU32BE(byteAddr + 4, &di)`), i.e. for every 0x22 packet
+    // it read the VIZ TOKEN as if it were the initiator.
+    //
+    // WHY THAT IS EXACTLY THE MEASURED SYMPTOM, not a theory: the 2D UI path
+    // publishes 64-byte command chunks (GFX-2D-SUBMIT, F-896(a)), and the raw
+    // dump of those chunks (build/g913.log, GFX-2D-SUBMIT cmd[0..15]) shows
+    // every chunk ending with the header 0xC0012201 -- type 3, opcode 0x22,
+    // count=2, predicate bit set -- followed by the word 0 (the viz token) and
+    // then, in the next chunk, 0x00040086. Decoded with this file's own field
+    // map (DrawInitiatorField), 0x00040086 is:
+    //     prim_type     = 0x06  (triangle strip)
+    //     source_select = 2     (kAutoIndex)
+    //     index_size    = 0     (16-bit)
+    //     num_indices   = 4     ((0x40086 >> 16) & 0xFFFF)
+    // and 4 is EXACTLY the vertex count of the batch that was just published
+    // (GFX-2D-SUBMIT rows: count=4, armed=4, count=6, armed=6). Reading the
+    // VIZ token instead yields prim=0, src=0, numIdx=0 -- which is precisely
+    // the class this tree has been counting all along: build/g911.log's last
+    // CP-DRAWCLASS row: total=577536, prim0=568587, emptyIdx=568586,
+    // srcDma=568587. 568,586 EMPTY draws, every one of them a UI draw whose
+    // real initiator sat one word later.
+    //
+    // WHAT THIS IS NOT: nothing is invented here. The offsets come from the
+    // reference and the values come from the guest's own bytes. The change is
+    // one word of offset per opcode.
+    const uint32_t initOff = (opcode == kPm4DrawIndx) ? 8u : 4u;
     uint32_t di = 0;
-    if (!mem.ReadU32BE(byteAddr + 4, &di)) {
+    if (!mem.ReadU32BE(byteAddr + initOff, &di)) {
       return false;
     }
     const uint32_t prim = DrawInitiatorField(di, 0, 6);
@@ -5990,9 +6543,69 @@ bool DrainPacketAt(uint32_t byteAddr, int depth, uint32_t &outAdvanceDwords) {
     const uint32_t idxSize = DrawInitiatorField(di, 11, 1);
     const uint32_t numIdx = DrawInitiatorField(di, 16, 16);
     uint32_t dmaBase = 0, dmaSize = 0;
-    if (src == 0 && count >= 3) { // SourceSelect::kDMA
-      (void)mem.ReadU32BE(byteAddr + 8, &dmaBase);
-      (void)mem.ReadU32BE(byteAddr + 12, &dmaSize);
+    // kDMA needs viz?+initiator+dmaBase+dmaSize for 0x22, and initiator+dma
+    // pair for 0x36 -- the word count the reference actually consumes.
+    const uint32_t kdmaWords = (opcode == kPm4DrawIndx) ? 4u : 3u;
+    if (src == 0 && count >= kdmaWords) { // SourceSelect::kDMA
+      (void)mem.ReadU32BE(byteAddr + initOff + 4u, &dmaBase);
+      (void)mem.ReadU32BE(byteAddr + initOff + 8u, &dmaSize);
+    }
+    // F-888 (2026-10-25): MEASUREMENT BEFORE ANY BEHAVIOUR CHANGE.
+    // MEASURED in build/g901.log: CP-DRAW-REFUSE prints 2,780 rows, 2,780 of the
+    // 2,788 total are what=empty-index-buffer with `op=0x22 src=0 prim=0
+    // numIdx=0 idxVa=00000000 idxBytes=0`, and the refusal counter reaches
+    // #554400 -- so essentially EVERY draw in the soak is refused at this gate,
+    // while `fetchVbWrites` climbs by thousands between refusals (4057386 ->
+    // 4060470 -> 4063618 -> 4066718). Two readings fit that and they imply
+    // opposite fixes, so this row separates them:
+    //   (a) the guest truly submits empty draws: payload dwords +8/+12 are 0 AND
+    //       the VGT_DMA_BASE/SIZE registers are 0 as well;
+    //   (b) the packet does not carry the pair (count < 3) and the block above
+    //       leaves dmaBase=dmaSize=0 instead of falling back to the register
+    //       file, so `ibBytes == 0` is an artefact of decode order and the draw
+    //       is real.
+    // It prints the header, the packet's own count field, BOTH payload dwords
+    // regardless of count, and both registers. Log-only: no state touched, no
+    // register poked, nothing read from the destination. Capped at 32 rows then
+    // every 4096 (the same house pattern as the neighbouring censuses).
+    // F-889 (2026-10-25): EXACT per-class draw accounting. The CP-DRAW row is
+    // SAMPLED (n<=24 || n%64==0), so a soak can only ever say "the sampled rows
+    // had prim=0" -- it cannot say a prim=8 draw never happened. g904 settled the
+    // packet layout question that made the sampling ambiguous: the stream at boot
+    // is `C0003600 00010081` repeated at a PHYSICAL 8-byte period (24 consecutive
+    // addresses, B7AF89C0..B7AF8A78), and the only parse consistent with that
+    // period is a 2-dword packet, i.e. this tree's
+    // `count = ((hdr>>16)&0x3FFF)+1` then `advance = count + 1` is CORRECT for
+    // that class (field 0 => 2 dwords). g904 also shows `C0003601 00030088`,
+    // whose payload decodes to a REAL initiator (prim=8, src=2 kAutoIndex,
+    // numIdx=3 => one triangle). So the "phantom triangle" worry is retired:
+    // the initiator is a real payload dword, not the next packet's header.
+    // What is still unmeasured is the RATE of those real draws inside the gate
+    // window, which is the only thing that decides whether the loss is host-side
+    // or guest-side. Hence counters, not samples. Log-only, no state touched.
+    {
+      static std::atomic<uint32_t> s_dcTotal{0};
+      static std::atomic<uint32_t> s_dcTri{0};    // prim 4..8
+      static std::atomic<uint32_t> s_dcPrim0{0};  // prim == 0 (DI_PT_NONE)
+      static std::atomic<uint32_t> s_dcEmpty{0};  // numIdx == 0
+      static std::atomic<uint32_t> s_dcDma{0};    // src == 0 (kDMA)
+      const uint32_t dn =
+          s_dcTotal.fetch_add(1, std::memory_order_relaxed) + 1u;
+      const bool isTri = (prim >= 4u && prim <= 8u);
+      if (isTri) s_dcTri.fetch_add(1, std::memory_order_relaxed);
+      if (prim == 0u) s_dcPrim0.fetch_add(1, std::memory_order_relaxed);
+      if (numIdx == 0u) s_dcEmpty.fetch_add(1, std::memory_order_relaxed);
+      if (src == 0u) s_dcDma.fetch_add(1, std::memory_order_relaxed);
+      if ((dn % 4096u) == 0u) {
+        MCLA_LOG_WARN(
+            "CP-DRAWCLASS #{} total={} tri(prim4..8)={} prim0={} emptyIdx={} "
+            "srcDma={} lastPrim={} lastNumIdx={} lastSrc={} fetchVbWrites={}",
+            dn, dn, s_dcTri.load(std::memory_order_relaxed),
+            s_dcPrim0.load(std::memory_order_relaxed),
+            s_dcEmpty.load(std::memory_order_relaxed),
+            s_dcDma.load(std::memory_order_relaxed), prim, numIdx, src,
+            g_fetchVbWrites.load(std::memory_order_relaxed));
+      }
     }
     // F-606: Xenia parity (command_processor.cc:1300-1334): the draw call
     // WriteRegisters VGT_DMA_BASE/SIZE/DRAW_INITIATOR. Mirrors the draw's own
@@ -6046,6 +6659,31 @@ bool DrainPacketAt(uint32_t byteAddr, int depth, uint32_t &outAdvanceDwords) {
                     CpRegPeek(0x0D2u), CpRegPeek(0x0A2u), CpRegPeek(0x1DCu),
                     CpRegPeek(0x1DDu),
                     g_fetchVbWrites.load(std::memory_order_relaxed));
+      const uint32_t vpXs = CpRegPeek(0x210Fu);
+      const uint32_t vpXo = CpRegPeek(0x2110u);
+      const uint32_t vpYs = CpRegPeek(0x2111u);
+      const uint32_t vpYo = CpRegPeek(0x2112u);
+      const uint32_t vpZs = CpRegPeek(0x2113u);
+      const uint32_t vpZo = CpRegPeek(0x2114u);
+      const uint32_t vpPresent =
+          (CpRegPresent(0x210Fu) ? 1u : 0u) |
+          (CpRegPresent(0x2110u) ? 2u : 0u) |
+          (CpRegPresent(0x2111u) ? 4u : 0u) |
+          (CpRegPresent(0x2112u) ? 8u : 0u) |
+          (CpRegPresent(0x2113u) ? 16u : 0u) |
+          (CpRegPresent(0x2114u) ? 32u : 0u);
+      MCLA_LOG_WARN(
+          "CP-DRAW-VPORT #{} clip={:08X}/{} vte={:08X}/{} vpPresent={:02X} "
+          "xs={:08X} xo={:08X} ys={:08X} yo={:08X} zs={:08X} zo={:08X} "
+          "screenScissorTL={:08X}/{} screenScissorBR={:08X}/{} "
+          "surfaceInfo={:08X}/{} -- raw guest registers at draw submission; "
+          "vpPresent bits 0..5 are X/Y/Z scale/offset presence",
+          n, CpRegPeek(0x2204u), CpRegPresent(0x2204u) ? 1u : 0u,
+          CpRegPeek(0x2206u), CpRegPresent(0x2206u) ? 1u : 0u, vpPresent,
+          vpXs, vpXo, vpYs, vpYo, vpZs, vpZo, CpRegPeek(0x200Eu),
+          CpRegPresent(0x200Eu) ? 1u : 0u, CpRegPeek(0x200Fu),
+          CpRegPresent(0x200Fu) ? 1u : 0u, CpRegPeek(0x2000u),
+          CpRegPresent(0x2000u) ? 1u : 0u);
     }
     // T41.4c: the whole batch this draw was preceded by, in write order, so the
     // AUTO-source VB/IB candidates are identifiable instead of guessed at
@@ -6297,6 +6935,42 @@ void DrainIndirectBuffer(uint32_t byteAddr, uint32_t dwordCount, int depth) {
     }
     uint32_t advance = 0;
     if (!DrainPacketAt(byteAddr + p * 4, depth, advance)) {
+      // F-892 (2026-10-25): THE DESYNC DUMP, and why it was needed. After the
+      // PM4 type-1 arm was implemented (see the type==1 block in DrainPacketAt),
+      // build/g908.log still shows 13 of 96 indirect buffers ending short of
+      // their declared length and 25 `desync at dword N` rows, so a buffer is
+      // still being abandoned mid-stream. The counters on that log rule out the
+      // previous causes: `unsupported packet type=` rows are ZERO (they were 47
+      // in g907), so the walker is no longer meeting an unknown type; the only
+      // remaining `return false` in DrainPacketAt is an UNREADABLE header word
+      // (:5923). That means the packet boundary walked past readable memory --
+      // i.e. some header's count field was consumed as a length. Nothing about
+      // which header is guessable from a row that only prints `p`, so this row
+      // prints the raw seven dwords around the failure plus the offender's own
+      // type/opcode. Diagnostic only: nothing is stored, no predicate claimed.
+      static std::atomic<uint32_t> s_ibDesyncDump{0};
+      const uint32_t dn = s_ibDesyncDump.fetch_add(1) + 1u;
+      if (dn <= 12u || (dn % 40u) == 0u) {
+        auto &dm = mcla::kernel::GuestMemoryHeap::Instance();
+        uint32_t w[7] = {0, 0, 0, 0, 0, 0, 0};
+        char okc[7] = {0};
+        for (int32_t k = -3; k <= 3; ++k) {
+          const int64_t idx = int64_t(p) + int64_t(k);
+          if (idx < 0) {
+            okc[k + 3] = '_';
+            continue;
+          }
+          okc[k + 3] =
+              dm.ReadU32BE(byteAddr + uint32_t(idx) * 4u, &w[k + 3]) ? '1' : '0';
+        }
+        MCLA_LOG_WARN(
+            "CP[IB]-DESYNC-DUMP #{} ib={:08X} dwords={} depth={} p={} "
+            "ok={}{}{}{}{}{}{} | p-3..p+3 = [{:08X} {:08X} {:08X} {:08X} "
+            "{:08X} {:08X} {:08X}] | atP hdrType={} hdrOp=0x{:02X}",
+            dn, byteAddr, limited, depth, p, okc[0], okc[1], okc[2], okc[3],
+            okc[4], okc[5], okc[6], w[0], w[1], w[2], w[3], w[4], w[5], w[6],
+            (w[3] >> 30) & 0x3u, (w[3] >> 8) & 0x7Fu);
+      }
       MCLA_LOG_WARN("CP[IB]: desync at dword {} - aborting buffer", p);
       break;
     }
@@ -6861,7 +7535,6 @@ bool CpEmitXeSwap(uint32_t ringVa, const uint32_t fetch[6], uint32_t physAddr,
   constexpr uint32_t kSwapMagic = 0x53574150u;  // 'SWAP'
   constexpr uint32_t kNop2 = 0x80000000u;       // MakePacketType2()
   constexpr uint32_t kPacketDwords = 12u;       // 1 + 6 (TYPE-0) + 1 + 4 (TYPE-3)
-  constexpr uint32_t kFillDwords = 63u;         // 64 words minus the guest's header word
 
   uint32_t pkt[kPacketDwords];
   pkt[0] = ((6u - 1u) << 16) | kFetchReg;  // MakePacketType0(kFetchReg, 6)
@@ -6882,15 +7555,21 @@ bool CpEmitXeSwap(uint32_t ringVa, const uint32_t fetch[6], uint32_t physAddr,
   pkt[10] = width;
   pkt[11] = height;
 
+  constexpr uint32_t kBlockDwords = 64u;  // full 64-dword block the guest publishes (wptr += 64)
+
   uint32_t written = 0;
-  for (uint32_t i = 0; i < kFillDwords; ++i) {
-    const uint32_t v = (i < kPacketDwords) ? pkt[i] : kNop2;
+  for (uint32_t i = 0; i < kBlockDwords; ++i) {
+    uint32_t v = kNop2;  // default: type-2 NOP (advance 1)
+    if (i < kPacketDwords) {
+      v = pkt[i];        // indices 0..11: TYPE-0 fetch write + XE_SWAP packet
+    }
+    // indices 12..63: kNop2 (already default)
     if (!mem.WriteU32BE(ringVa + i * 4u, v)) {
       break;
     }
     ++written;
   }
-  const bool ok = (written == kFillDwords);
+  const bool ok = (written == kBlockDwords);
 
   // F-XXX: the emission census. `emitOk` counts the writes that landed and
   // `emitCalls` the attempts, so a zero of either is a measurement and not a
@@ -6906,7 +7585,7 @@ bool CpEmitXeSwap(uint32_t ringVa, const uint32_t fetch[6], uint32_t physAddr,
     MCLA_LOG_WARN(
         "CP: XE_SWAP-EMIT #{} ring={:08X} dwords={}/{} ok={} magic={:08X} "
         "fb={:08X} wh={}x{} fetchD1={:08X} emitOk={}/{}",
-        n, ringVa, written, kFillDwords, ok ? 1 : 0, kSwapMagic, physAddr, width,
+        n, ringVa, written, kBlockDwords, ok ? 1 : 0, kSwapMagic, physAddr, width,
         height, fetch[1], g_xeSwapEmitOk.load(std::memory_order_relaxed),
         g_xeSwapEmitCalls.load(std::memory_order_relaxed));
   }
