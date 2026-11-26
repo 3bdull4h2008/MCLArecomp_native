@@ -27,6 +27,7 @@
 #include <vector>
 
 #include "render_queue.h"
+#include "d3d12_p0_audit.h"
 #include "renderer/resource_cache.h"
 #include "renderer/pipeline_cache.h"
 #include "renderer/texture_decode.h"
@@ -108,7 +109,12 @@ public:
     // draws with the input layout the PSO declares. `cachedIndexGpu` is set by
     // the caller to reuse a previously cached static index buffer (0 = none).
     struct DynamicMeshDesc {
-        uint32_t psoRtvFormat = 0;  // RTVFormats[0] the caller built the PSO with (0 = unknown); TEMP-PSO-RTV check
+        uint32_t psoRtvFormat = 0;  // legacy RTVFormats[0] metadata (0 = unknown)
+        uint64_t commandOrder = 0;  // monotonic RenderCommandQueue admission order
+        bool psoRtvKnown = false;
+        uint8_t psoRtvCount = 0;
+        uint8_t psoRtvMask = 0;
+        std::array<uint32_t, 8> psoRtvFormats{};
         // Guest viewport in target pixels (PA_CL_VPORT_*, when PA_CL_VTE_CNTL enables scale+offset).
         bool guestVpValid = false;
         bool rawVb = false;        // RAWVB: VS prepends XE_RAWVB; the uploaded VB is also bound as root SRV 4 (ByteAddressBuffer t0,space1)
@@ -920,6 +926,7 @@ public:
     // disjoint DrawRecorder command lists in Stage 3.
     struct PreparedDraw {
         uint64_t drawSeq = 0;
+        uint64_t commandOrder = 0;
 
         // Stage 1: owned buffers & pipeline state (zero D3D12Backend::m_mutex locks)
         std::vector<uint8_t> vb;
@@ -998,6 +1005,8 @@ public:
         uint64_t rtvBindKey = 0;
         uint64_t dsvBindKey = 0;
         DXGI_FORMAT boundRtvFormat = DXGI_FORMAT_UNKNOWN;
+        uint8_t boundRtvMask = 0;
+        std::array<uint32_t, 8> boundRtvFormats{};
         D3D12_CPU_DESCRIPTOR_HANDLE rtvHandle = {};
         uint32_t rtvCount = 1;
         D3D12_CPU_DESCRIPTOR_HANDLE rtvHandles[4] = {};
@@ -1006,7 +1015,7 @@ public:
         uint64_t srvTableHash = 0;
         uint32_t boundTexCount = 0;
         D3D12_GPU_DESCRIPTOR_HANDLE resolvedSamplerGpu = {};
-        ID3D12DescriptorHeap* resolvedSamplerHeap = nullptr;  // Stage 2 owner identity; log-only Stage 3 check
+        p0_audit::P0SamplerOwner samplerOwner{};
 
         void FinalizeDescPointers() {
             desc.vertexBytes = vb.empty() ? nullptr : vb.data();
@@ -1032,6 +1041,7 @@ public:
 
         void ResetForReuse() {
             drawSeq = 0;
+            commandOrder = 0;
             vb.clear();
             for (auto& s : vbStreamsExtra) s.clear();
             streamStrides.fill(0);
@@ -1099,6 +1109,8 @@ public:
             rtvBindKey = 0;
             dsvBindKey = 0;
             boundRtvFormat = DXGI_FORMAT_UNKNOWN;
+            boundRtvMask = 0;
+            boundRtvFormats.fill(0);
             rtvHandle = {};
             rtvCount = 1;
             for (uint32_t i = 0; i < 4u; ++i) rtvHandles[i] = {};
@@ -1107,7 +1119,7 @@ public:
             srvTableHash = 0;
             boundTexCount = 0;
             resolvedSamplerGpu = {};
-            resolvedSamplerHeap = nullptr;
+            samplerOwner = {};
         }
     };
 
@@ -1256,6 +1268,8 @@ public:
         D3D12_GPU_DESCRIPTOR_HANDLE samplerTableGpu = {};
         // Draw-state caches (formerly file-scope statics)
         bool heapsBound = false;
+        bool descriptorHeapsSet = false;
+        ID3D12DescriptorHeap* boundSamplerHeap = nullptr;
         ID3D12RootSignature* boundRootSig = nullptr;
         ID3D12PipelineState* boundPso = nullptr;
         int32_t boundStencilRef = -1;
@@ -1295,6 +1309,8 @@ public:
         uint32_t srvRingClampedCount = 0;
         void ResetListBindState() {
             heapsBound = false;
+            descriptorHeapsSet = false;
+            boundSamplerHeap = nullptr;
             boundRootSig = nullptr;
             boundPso = nullptr;
             boundStencilRef = -1;
@@ -2372,27 +2388,38 @@ private:
     }
     void FoldMtRecorderStats();
     bool WaitForCurrentFrameGpuUnlocked();
-    uint32_t BindGuestTexturesUnlocked(const GuestTextureEntry* entries, uint32_t count, DrawRecorder* rec);
+    void SetDescriptorHeapsObserved(ID3D12GraphicsCommandList* cl, UINT count,
+                                    ID3D12DescriptorHeap* const* heaps);
+    void AuditSampler(const p0_audit::P0SamplerOwner& owner, ID3D12GraphicsCommandList* cl,
+                      uint32_t recorder, uint64_t commandOrder);
+    void AuditPsoRtv(const p0_audit::P0PsoRtvSnapshot& snapshot, uint32_t recorder);
+    uint32_t BindGuestTexturesUnlocked(const GuestTextureEntry* entries, uint32_t count, DrawRecorder* rec,
+                                       uint64_t commandOrder = 0);
     bool InternGuestSampler(const native::HostSamplerDesc& hostSampler,
-                            D3D12_GPU_DESCRIPTOR_HANDLE& samplerTableGpuOut);
+                            D3D12_GPU_DESCRIPTOR_HANDLE& samplerTableGpuOut,
+                            p0_audit::P0SamplerOwner& ownerOut);
     bool InternGuestSamplerTable(const native::HostSamplerDesc* table, uint32_t mask,
                                  D3D12_GPU_DESCRIPTOR_HANDLE& samplerTableGpuOut,
+                                 p0_audit::P0SamplerOwner& ownerOut,
                                  uint32_t activeMask = 0);
     bool BindGuestSamplerInternal(const native::HostSamplerDesc& hostSampler, ID3D12GraphicsCommandList* cl,
                                   bool& heapsBound, D3D12_GPU_DESCRIPTOR_HANDLE& samplerTableGpuOut,
                                   D3D12_GPU_DESCRIPTOR_HANDLE& boundSamplerTableGpu,
-                                  ID3D12RootSignature* boundRootSig);
+                                  ID3D12RootSignature* boundRootSig,
+                                  uint64_t commandOrder = 0);
     bool BindGuestSamplerTableInternal(const native::HostSamplerDesc* table, uint32_t mask, ID3D12GraphicsCommandList* cl,
                                        bool& heapsBound, D3D12_GPU_DESCRIPTOR_HANDLE& samplerTableGpuOut,
                                        D3D12_GPU_DESCRIPTOR_HANDLE& boundSamplerTableGpu,
                                        ID3D12RootSignature* boundRootSig,
                                        uint32_t activeMask = 0,
-                                       D3D12_GPU_DESCRIPTOR_HANDLE* boundSrvTableGpu = nullptr);
+                                       D3D12_GPU_DESCRIPTOR_HANDLE* boundSrvTableGpu = nullptr,
+                                       uint64_t commandOrder = 0);
     uint32_t ResolveGuestTexturesToStaging(const GuestTextureEntry* entries, uint32_t count,
                                            ID3D12GraphicsCommandList* uploadCl, bool allowMipgen,
                                            uint32_t (&outStagedSlots)[kShaderTextureSlotCount],
                                            uint64_t& outTableHash,
-                                           std::vector<FallbackSrv>* outFallbackSrvs);
+                                           std::vector<FallbackSrv>* outFallbackSrvs,
+                                           uint64_t commandOrder = 0);
     D3D12_GPU_DESCRIPTOR_HANDLE CommitSrvTableFromStaging(const uint32_t (&stagedSlots)[kShaderTextureSlotCount],
                                                           uint64_t tableHash, DrawRecorder* rec,
                                                           const std::vector<FallbackSrv>* fallbackSrvs,
@@ -2542,6 +2569,8 @@ private:
     // across a new list would leave that list with no render target bound,
     // which is a silent black frame, not an optimisation.
     bool m_boundTargetsValid = false;
+    bool m_mainDescriptorHeapsSet = false;
+    ID3D12DescriptorHeap* m_mainBoundSamplerHeap = nullptr;
     uint64_t m_boundRtvKey = 0;
     uint64_t m_boundDsvKey = 0;
     // F-XXX: OMSET forensics counters (w13 follow-up). The fault row used to

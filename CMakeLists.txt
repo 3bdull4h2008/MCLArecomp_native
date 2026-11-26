@@ -921,6 +921,14 @@ add_executable(texture_decode_test
 target_include_directories(texture_decode_test PRIVATE ${VALIDATOR_INCLUDE_DIRS})
 target_compile_definitions(texture_decode_test PRIVATE ${VALIDATOR_COMPILE_DEFS})
 
+add_executable(p0_audit_test tools/validators/p0_audit_test.cpp)
+target_include_directories(p0_audit_test PRIVATE ${VALIDATOR_INCLUDE_DIRS})
+target_compile_definitions(p0_audit_test PRIVATE ${VALIDATOR_COMPILE_DEFS})
+add_custom_target(check_p0_audit DEPENDS p0_audit_test
+    COMMAND $<TARGET_FILE:p0_audit_test>
+    WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}
+    COMMENT "P0-02 observation-only audit classifiers and fixtures")
+
 add_executable(capture_dump_validator
     tools/validators/capture_dump_validator.cpp src/frame_trace.cpp src/frame_trace.h
     src/renderer/vertex_decode.cpp)

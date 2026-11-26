@@ -952,6 +952,10 @@ bool D3D12Backend::Initialize(HWND hwnd, uint32_t width, uint32_t height) {
     std::unique_lock<std::recursive_mutex> lock(m_mutex);
 
     if (m_initialized) return true;
+    auto p0Sink = [](const std::string& row) { MCLA_LOG_INFO("{}", row); };
+    p0_audit::Global().Initialize(p0Sink);
+    if (p0_audit::Global().Enabled(p0_audit::kMaskFixture))
+        p0_audit::RunBuiltInFixtures(p0Sink);
     mcla::diag::RegisterGrowth("d3d12-backend", [this] {  // TEMP-GROWTH, racy reads, diag only
         return fmt::format("texCache n={} MB={} resCache n={} pso n={} texPoolSlots={} poolFree={} srvStagingNext={} srvFree={} frameUploadRes={} rtCache={} dsCache={} resolved={} resolvedAlt={} resolvedLastColour={} retiredTargets={} resourceStates={} texProbes={} samplerCache={} blend={} ds={} rast={} fbHost={}MB stencilDraws={} stencilRefSets={}",
             m_textureCache.Size(), m_textureCache.ResidentBytes() >> 20, m_resourceCache.Size(), m_pipelineCache.Size(),
@@ -2436,10 +2440,10 @@ bool D3D12Backend::BlitGuestRenderTargetToScanout() {
     // Keep primary heaps bound
     if (m_srvHeap && m_samplerHeap) {
         ID3D12DescriptorHeap* heaps[] = { m_srvHeap.Get(), m_samplerHeap.Get() };
-        m_commandList->SetDescriptorHeaps(2, heaps);
+        SetDescriptorHeapsObserved(m_commandList.Get(), 2, heaps);
     } else if (m_srvHeap) {
         ID3D12DescriptorHeap* heaps[] = { m_srvHeap.Get() };
-        m_commandList->SetDescriptorHeaps(1, heaps);
+        SetDescriptorHeapsObserved(m_commandList.Get(), 1, heaps);
     }
 
     if (GammaLutActive() && EnsureGammaLutPipeline() && m_frameIndex < kBufferCount) {
@@ -2479,10 +2483,10 @@ bool D3D12Backend::BlitGuestRenderTargetToScanout() {
     }
     if (m_srvHeap && m_samplerHeap) {
         ID3D12DescriptorHeap* heaps[] = { m_srvHeap.Get(), m_samplerHeap.Get() };
-        m_commandList->SetDescriptorHeaps(2, heaps);
+        SetDescriptorHeapsObserved(m_commandList.Get(), 2, heaps);
     } else if (m_srvHeap) {
         ID3D12DescriptorHeap* heaps[] = { m_srvHeap.Get() };
-        m_commandList->SetDescriptorHeaps(1, heaps);
+        SetDescriptorHeapsObserved(m_commandList.Get(), 1, heaps);
     }
 
     static uint32_t s_blitCount = 0;
@@ -2674,7 +2678,7 @@ bool D3D12Backend::MirrorDepthResolvePass(ID3D12Resource* src, ID3D12Resource* d
     const D3D12_CPU_DESCRIPTOR_HANDLE rtv = rh->GetCPUDescriptorHandleForHeapStart();
     m_device->CreateRenderTargetView(dst, nullptr, rtv);
     ID3D12DescriptorHeap* heaps[] = { sh.Get() };
-    m_commandList->SetDescriptorHeaps(1, heaps);
+    SetDescriptorHeapsObserved(m_commandList.Get(), 1, heaps);
     m_commandList->SetGraphicsRootSignature(s_rs.Get());
     m_commandList->SetPipelineState(s_pso.Get());
     m_commandList->SetGraphicsRootDescriptorTable(0, sh->GetGPUDescriptorHandleForHeapStart());
@@ -2693,10 +2697,10 @@ bool D3D12Backend::MirrorDepthResolvePass(ID3D12Resource* src, ID3D12Resource* d
     m_commandList->DrawInstanced(3, 1, 0, 0);
     if (m_srvHeap && m_samplerHeap) {
         ID3D12DescriptorHeap* hs[] = { m_srvHeap.Get(), m_samplerHeap.Get() };
-        m_commandList->SetDescriptorHeaps(2, hs);
+        SetDescriptorHeapsObserved(m_commandList.Get(), 2, hs);
     } else if (m_srvHeap) {
         ID3D12DescriptorHeap* hs[] = { m_srvHeap.Get() };
-        m_commandList->SetDescriptorHeaps(1, hs);
+        SetDescriptorHeapsObserved(m_commandList.Get(), 1, hs);
     }
     RetireTarget(std::move(sh));
     RetireTarget(std::move(rh));
@@ -3373,10 +3377,94 @@ void D3D12Backend::BindSamplerHeap() {
     if (!m_samplerHeap) return;
     if (m_srvHeap) {
         ID3D12DescriptorHeap* heaps[] = { m_srvHeap.Get(), m_samplerHeap.Get() };
-        m_commandList->SetDescriptorHeaps(2, heaps);
+        SetDescriptorHeapsObserved(m_commandList.Get(), 2, heaps);
     } else {
         ID3D12DescriptorHeap* heaps[] = { m_samplerHeap.Get() };
-        m_commandList->SetDescriptorHeaps(1, heaps);
+        SetDescriptorHeapsObserved(m_commandList.Get(), 1, heaps);
+    }
+}
+
+void D3D12Backend::SetDescriptorHeapsObserved(ID3D12GraphicsCommandList* cl, UINT count,
+                                              ID3D12DescriptorHeap* const* heaps) {
+    cl->SetDescriptorHeaps(count, heaps);
+    DrawRecorder* recorder = nullptr;
+    bool mainList = false;
+    if (cl == m_commandList.Get()) {
+        mainList = true;
+    } else {
+        for (uint32_t r = 0; r < m_mtRecorderCount; ++r) {
+            if (m_mtRecorderState[r].list == cl) { recorder = &m_mtRecorderState[r]; break; }
+        }
+    }
+    if (!mainList && !recorder) return;
+    ID3D12DescriptorHeap* sampler = nullptr;
+    for (UINT i = 0; i < count; ++i) {
+        ID3D12DescriptorHeap* heap = heaps[i];
+        if (heap == m_precompiledSamplerHeap.Get()) { sampler = heap; break; }
+        for (uint32_t h = 0; h < kSamplerHeapCount; ++h) {
+            if (heap == m_samplerHeaps[h].heap.Get()) { sampler = heap; break; }
+        }
+        if (sampler) break;
+    }
+    if (mainList) {
+        m_mainDescriptorHeapsSet = true;
+        m_mainBoundSamplerHeap = sampler;
+    } else {
+        recorder->descriptorHeapsSet = true;
+        recorder->boundSamplerHeap = sampler;
+    }
+}
+
+void D3D12Backend::AuditSampler(const p0_audit::P0SamplerOwner& owner, ID3D12GraphicsCommandList* cl,
+                               uint32_t recorderIndex, uint64_t commandOrder) {
+    if (!p0_audit::Global().Enabled(p0_audit::kMaskSampler)) return;
+    p0_audit::P0SamplerSnapshot snapshot;
+    snapshot.owner = owner;
+    snapshot.commandOrder = commandOrder;
+    snapshot.recorder = recorderIndex;
+    if (cl == m_commandList.Get()) {
+        snapshot.descriptorHeapsSet = m_mainDescriptorHeapsSet;
+        snapshot.boundHeap = m_mainBoundSamplerHeap;
+    } else {
+        for (uint32_t r = 0; r < m_mtRecorderCount; ++r) {
+            if (m_mtRecorderState[r].list == cl) {
+                snapshot.descriptorHeapsSet = m_mtRecorderState[r].descriptorHeapsSet;
+                snapshot.boundHeap = m_mtRecorderState[r].boundSamplerHeap;
+                snapshot.recorder = r;
+                break;
+            }
+        }
+    }
+    p0_audit::Global().Emit(p0_audit::kMaskSampler, "SAMPLER", p0_audit::ClassifySampler(snapshot), {
+        {"commandOrder", std::to_string(commandOrder)}, {"recorder", std::to_string(snapshot.recorder)},
+        {"ownerHeap", p0_audit::Hex(reinterpret_cast<uintptr_t>(owner.heap), 16)},
+        {"boundHeap", p0_audit::Hex(reinterpret_cast<uintptr_t>(snapshot.boundHeap), 16)},
+        {"heapIndex", std::to_string(owner.heapIndex)}, {"base", std::to_string(owner.base)},
+        {"handle", p0_audit::Hex(owner.handle, 16)}, {"descriptorSize", std::to_string(owner.descriptorSize)},
+        {"descriptorCount", std::to_string(owner.descriptorCount)}, {"internOk", std::to_string(owner.internOk ? 1 : 0)},
+        {"neutralFallback", std::to_string(owner.neutralFallback ? 1 : 0)},
+    });
+}
+
+void D3D12Backend::AuditPsoRtv(const p0_audit::P0PsoRtvSnapshot& snapshot, uint32_t recorder) {
+    if (!p0_audit::Global().Enabled(p0_audit::kMaskPsoRtv)) return;
+    const uint32_t slots = std::max<uint32_t>({1u, snapshot.psoCount, snapshot.rtvCount});
+    for (uint32_t slot = 0; slot < slots; ++slot) {
+        uint8_t rtvKnownMask = 0;
+        for (uint32_t i = 0; i < snapshot.rtvCount && i < snapshot.rtvSlotKnown.size(); ++i)
+            if (snapshot.rtvSlotKnown[i]) rtvKnownMask |= static_cast<uint8_t>(1u << i);
+        std::vector<p0_audit::Detail> details = {
+            {"commandOrder", std::to_string(snapshot.commandOrder)}, {"recorder", std::to_string(recorder)},
+            {"slot", std::to_string(slot)}, {"psoKnown", std::to_string(snapshot.psoKnown ? 1 : 0)},
+            {"psoCount", std::to_string(snapshot.psoCount)}, {"psoMask", p0_audit::Hex(snapshot.psoMask, 2)},
+            {"rtvCount", std::to_string(snapshot.rtvCount)}, {"rtvMask", p0_audit::Hex(snapshot.rtvMask, 2)},
+            {"rtvFormatsKnown", std::to_string(snapshot.rtvFormatsKnown ? 1 : 0)},
+            {"rtvKnownMask", p0_audit::Hex(rtvKnownMask, 2)},
+            {"depthOnly", std::to_string(snapshot.depthOnly ? 1 : 0)},
+            {"psoFmt", std::to_string(snapshot.psoFormats[slot])},
+            {"rtvFmt", std::to_string(snapshot.rtvFormats[slot])},
+        };
+        p0_audit::Global().Emit(p0_audit::kMaskPsoRtv, "PSO-RTV", p0_audit::ClassifyPsoRtv(snapshot), details);
     }
 }
 
@@ -4661,7 +4749,8 @@ uint32_t D3D12Backend::ResolveGuestTexturesToStaging(
     const GuestTextureEntry* entries, uint32_t count,
     ID3D12GraphicsCommandList* uploadCl, bool allowMipgen,
     uint32_t (&outStagedSlots)[kShaderTextureSlotCount],
-    uint64_t& outTableHash, std::vector<FallbackSrv>* outFallbackSrvs) {
+    uint64_t& outTableHash, std::vector<FallbackSrv>* outFallbackSrvs,
+    uint64_t commandOrder) {
     for (uint32_t s = 0; s < kShaderTextureSlotCount; ++s) outStagedSlots[s] = 0;
     outTableHash = 0;
     if (outFallbackSrvs) outFallbackSrvs->clear();
@@ -4832,6 +4921,10 @@ uint32_t D3D12Backend::ResolveGuestTexturesToStaging(
             const uint32_t fetchFmt = entry.descriptorBytes[7] & 0x3Fu;
             const bool wantsDepth = fetchFmt == 22u || fetchFmt == 23u;  // k_24_8 / k_24_8_FLOAT
             uint32_t colourKey = gb;
+            const char* selectionPriority = "none";
+            const char* selectionSource = "none";
+            const uint64_t resolveMaxAge = MaxResolveAgeFrames();
+            const bool resolveAgePolicyEnabled = resolveMaxAge != ~uint64_t(0);
             // ExecuteGuestResolve keys colour resolves by the source EDRAM RT DXGI format
             // (never R8_UNORM=61); k_8 (fetchFmt=2) resolves originate from k_8_8_8_8
             // EDRAM (dxgi=28) with RB_COPY_DEST_INFO.copy_dest_format=2, so pref=28u lets
@@ -4842,19 +4935,20 @@ uint32_t D3D12Backend::ResolveGuestTexturesToStaging(
                 return f == 10u || f == 28u || f == 24u || f == 11u;
             };
             // A1: swap any parked multi-size variant matching the requested fetch dims into the primary slot.
-            const auto preferSize = [&](uint32_t key, bool wantDepth) {
+            const auto preferSize = [&](uint32_t key, bool wantDepth) -> bool {
                 auto pi = m_resolved.find(key);
                 if (pi == m_resolved.end() || pi->second.isDepth != wantDepth ||
-                    (pi->second.w == gtd.width && pi->second.h == gtd.height)) return;
+                    (pi->second.w == gtd.width && pi->second.h == gtd.height)) return false;
                 auto ai = m_resolvedAlt.find(key);
-                if (ai == m_resolvedAlt.end()) return;
+                if (ai == m_resolvedAlt.end()) return false;
                 for (ResolvedTex& alt : ai->second) {
                     if (alt.valid && alt.res && alt.isDepth == wantDepth &&
                         alt.w == gtd.width && alt.h == gtd.height) {
                         std::swap(pi->second, alt);
-                        return;
+                        return true;
                     }
                 }
+                return false;
             };
             bool colourMatched = false;
             const auto isFreshColour = [&](auto it) {
@@ -4865,20 +4959,22 @@ uint32_t D3D12Backend::ResolveGuestTexturesToStaging(
                 // Priority 1: exact preferred format key gb | (pref << 2).
                 if (pref != 0u) {
                     const uint32_t pk = gb | (pref << 2);
-                    preferSize(pk, false);
+                    const bool primaryAlt = preferSize(pk, false);
                     auto pm = m_resolved.find(pk);
                     const bool dimAgree = pm != m_resolved.end() &&
                         pm->second.w == gtd.width && pm->second.h == gtd.height;
                     if (isFreshColour(pm) && dimAgree) {
                         colourKey = pk;
                         colourMatched = true;
+                        selectionPriority = "1";
+                        selectionSource = primaryAlt ? "alt" : "primary";
                     }
                 }
                 // Priority 2: m_resolvedLastColour[gb] (allows compatible colour DXGI format).
                 if (!colourMatched && !NoLastColour()) {
                     auto lc = m_resolvedLastColour.find(gb);
                     if (lc != m_resolvedLastColour.end()) {
-                        preferSize(lc->second, false);
+                        const bool lastColourAlt = preferSize(lc->second, false);
                         auto it = m_resolved.find(lc->second);
                         const bool fmtAgree = (pref == 0u || (it != m_resolved.end() && static_cast<uint32_t>(it->second.fmt) == pref));
                         const bool dimAgree = it != m_resolved.end() &&
@@ -4887,6 +4983,8 @@ uint32_t D3D12Backend::ResolveGuestTexturesToStaging(
                             (fmtAgree || isColorDxgi(pref))) {
                             colourKey = lc->second;
                             colourMatched = true;
+                            selectionPriority = "2";
+                            selectionSource = lastColourAlt ? "alt" : "last-colour";
                         }
                     }
                 }
@@ -4894,11 +4992,13 @@ uint32_t D3D12Backend::ResolveGuestTexturesToStaging(
                 if (!colourMatched && isColorDxgi(pref)) {
                     for (uint32_t cf : { 10u, 28u, 24u, 11u }) {
                         const uint32_t ck = gb | (cf << 2);
-                        preferSize(ck, false);
+                        const bool fallbackAlt = preferSize(ck, false);
                         auto cit = m_resolved.find(ck);
                         if (isFreshColour(cit) && cit->second.w == gtd.width && cit->second.h == gtd.height) {
                             colourKey = ck;
                             colourMatched = true;
+                            selectionPriority = "3";
+                            selectionSource = fallbackAlt ? "alt" : "primary";
                             break;
                         }
                     }
@@ -4910,21 +5010,25 @@ uint32_t D3D12Backend::ResolveGuestTexturesToStaging(
                 if (!colourMatched && !NoLastColour() && !s_noP4) {
                     auto lc = m_resolvedLastColour.find(gb);
                     if (lc != m_resolvedLastColour.end()) {
-                        preferSize(lc->second, false);
+                        const bool p4LastAlt = preferSize(lc->second, false);
                         auto it = m_resolved.find(lc->second);
                         if (isFreshColour(it)) {
                             colourKey = lc->second;
                             colourMatched = true;
+                            selectionPriority = "4";
+                            selectionSource = p4LastAlt ? "alt" : "last-colour";
                         }
                     }
                     if (!colourMatched) {
                         for (uint32_t cf : { 10u, 28u, 24u, 11u }) {
                             const uint32_t ck = gb | (cf << 2);
-                            preferSize(ck, false);
+                            const bool p4Alt = preferSize(ck, false);
                             auto cit = m_resolved.find(ck);
                             if (isFreshColour(cit)) {
                                 colourKey = ck;
                                 colourMatched = true;
+                                selectionPriority = "4";
+                                selectionSource = p4Alt ? "alt" : "primary";
                                 break;
                             }
                         }
@@ -4942,10 +5046,17 @@ uint32_t D3D12Backend::ResolveGuestTexturesToStaging(
                     }
                 }
             }
-            preferSize(wantsDepth ? (gb | 1u) : colourKey, wantsDepth);
+            if (wantsDepth) {
+                selectionPriority = "depth";
+                if (std::strcmp(selectionSource, "none") == 0) selectionSource = "primary";
+            }
+            const bool finalAlt = preferSize(wantsDepth ? (gb | 1u) : colourKey, wantsDepth);
+            if (finalAlt) selectionSource = "alt";
             auto rit = m_resolved.find(wantsDepth ? (gb | 1u) : colourKey);
             if (!wantsDepth && !colourMatched)
                 rit = m_resolved.end();
+            ResolvedTex* observedResolved = rit != m_resolved.end() ? &rit->second : nullptr;
+            uint32_t observedResolveKey = rit != m_resolved.end() ? rit->first : (wantsDepth ? (gb | 1u) : colourKey);
             if (rit != m_resolved.end() && !wantsDepth && m_presentedFrames - rit->second.lastPresent > MaxResolveAgeFrames())
                 rit = m_resolved.end();  // stale resolve target: the guest has since put a CPU texture at this base (TEXRACE: 128x128 at age 43)
             {   // TEMP-RBIND2: unique (base, fetchFmt, hit) for fetches of a resolve destination; m_mutex is held.
@@ -4969,7 +5080,59 @@ uint32_t D3D12Backend::ResolveGuestTexturesToStaging(
                  rit->second.w == gtd.width && rit->second.h == gtd.height);
             const bool dimOk = wantsDepth || colourMatched || rit == m_resolved.end() ||
                 (rit->second.w == gtd.width && rit->second.h == gtd.height);
-            if (rit != m_resolved.end() && rit->second.valid && rit->second.res && fmtOk && dimOk) {
+            const bool resolvedSelected = rit != m_resolved.end() && rit->second.valid && rit->second.res && fmtOk && dimOk;
+            const uint32_t requestedResolveKey = wantsDepth ? (gb | 1u) : colourKey;
+            const bool resolveCandidateKnown = observedResolved != nullptr || m_resolvedLastColour.count(gb) || m_resolved.count(gb);
+            const auto emitResolvedAudit = [&](bool selected, const char* stagedResult) {
+                if (!p0_audit::Global().Enabled(p0_audit::kMaskResolved) || !resolveCandidateKnown) return;
+                const auto lastColour = m_resolvedLastColour.find(gb);
+                p0_audit::P0ResolvedSnapshot snapshot;
+                snapshot.commandOrder = commandOrder;
+                snapshot.slot = idx;
+                snapshot.candidateKey = requestedResolveKey;
+                snapshot.winnerKey = observedResolveKey;
+                snapshot.priority = selectionPriority;
+                snapshot.source = selectionSource;
+                snapshot.selected = selected;
+                snapshot.candidateKnown = true;
+                snapshot.metadataKnown = observedResolved != nullptr;
+                snapshot.agePolicyEnabled = resolveAgePolicyEnabled;
+                snapshot.ageLimitFrames = resolveMaxAge;
+                snapshot.frameUnderflow = observedResolved != nullptr && m_presentedFrames < observedResolved->lastPresent;
+                snapshot.ageFrames = observedResolved != nullptr && !snapshot.frameUnderflow
+                    ? m_presentedFrames - observedResolved->lastPresent : 0;
+                snapshot.formatCompatible = observedResolved != nullptr &&
+                    (wantsDepth ? observedResolved->isDepth : fmtOk);
+                snapshot.formatExact = observedResolved != nullptr &&
+                    (wantsDepth ? observedResolved->isDepth
+                                : (pref == 0u || observedResolved->fmt == static_cast<DXGI_FORMAT>(pref)));
+                snapshot.winnerIsLastColour = wantsDepth ||
+                    (lastColour != m_resolvedLastColour.end() && lastColour->second == observedResolveKey);
+                snapshot.depthFetch = wantsDepth;
+                snapshot.fetchWidth = gtd.width;
+                snapshot.fetchHeight = gtd.height;
+                snapshot.resolvedWidth = observedResolved != nullptr ? observedResolved->w : 0;
+                snapshot.resolvedHeight = observedResolved != nullptr ? observedResolved->h : 0;
+                snapshot.fetchFormat = fetchFmt;
+                snapshot.resolvedFormat = observedResolved != nullptr ? static_cast<uint32_t>(observedResolved->fmt) : 0;
+                snapshot.stagedResult = stagedResult;
+                p0_audit::Global().Emit(p0_audit::kMaskResolved, "RESOLVED", p0_audit::ClassifyResolved(snapshot), {
+                    {"commandOrder", std::to_string(commandOrder)}, {"slot", std::to_string(idx)},
+                    {"candidateKey", p0_audit::Hex(requestedResolveKey, 8)},
+                    {"winnerKey", p0_audit::Hex(snapshot.winnerKey, 8)},
+                    {"priority", selectionPriority}, {"source", selectionSource},
+                    {"selected", std::to_string(selected ? 1 : 0)}, {"metadataKnown", std::to_string(snapshot.metadataKnown ? 1 : 0)},
+                    {"agePolicy", std::to_string(resolveAgePolicyEnabled ? 1 : 0)}, {"ageLimit", std::to_string(snapshot.ageLimitFrames)},
+                    {"ageFrames", std::to_string(snapshot.ageFrames)}, {"frameUnderflow", std::to_string(snapshot.frameUnderflow ? 1 : 0)},
+                    {"formatExact", std::to_string(snapshot.formatExact ? 1 : 0)}, {"formatCompatible", std::to_string(snapshot.formatCompatible ? 1 : 0)},
+                    {"winnerIsLastColour", std::to_string(snapshot.winnerIsLastColour ? 1 : 0)}, {"depthFetch", std::to_string(snapshot.depthFetch ? 1 : 0)},
+                    {"fetch", std::to_string(gtd.width) + "x" + std::to_string(gtd.height)},
+                    {"resolved", std::to_string(snapshot.resolvedWidth) + "x" + std::to_string(snapshot.resolvedHeight)},
+                    {"fetchFmt", std::to_string(fetchFmt)},
+                    {"resolvedFmt", std::to_string(snapshot.resolvedFormat)}, {"staged", stagedResult},
+                });
+            };
+            if (resolvedSelected) {
                 D3D12_SHADER_RESOURCE_VIEW_DESC rsd = {};
                 rsd.Format = rit->second.srvFmt != DXGI_FORMAT_UNKNOWN ? rit->second.srvFmt : rit->second.fmt;
                 rsd.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
@@ -5013,25 +5176,14 @@ uint32_t D3D12Backend::ResolveGuestTexturesToStaging(
                     mipChain = ResolvedMipsFind(gb, rit->second, (md5 >> 12) << 12, gtd.mipMaxLevel, allowMipgen ? uploadCl : nullptr);
                     if (mipChain) { srvTex = &mipChain->tex; rsd.Texture2D.MipLevels = mipChain->levels; }
                 }
-                if (srvTex->w != gtd.width || srvTex->h != gtd.height) {  // Phase 0 diagnostic; rebind policy unchanged
-                    static std::atomic<uint64_t> s_dimMismatch{0};
-                    static std::mutex s_dimMismatchMu;
-                    static std::set<std::array<uint32_t, 5>> s_dimMismatchSeen;
-                    const uint64_t n = s_dimMismatch.fetch_add(1, std::memory_order_relaxed) + 1;
-                    const std::array<uint32_t, 5> mismatchKey = {
-                        rit->first, gtd.width, gtd.height, srvTex->w, srvTex->h
-                    };
-                    std::lock_guard<std::mutex> mismatchLock(s_dimMismatchMu);
-                    if (s_dimMismatchSeen.size() < 64 && s_dimMismatchSeen.insert(mismatchKey).second)
-                        MCLA_LOG_WARN("RESOLVED-BIND-DIM-MISMATCH #{} key={:08X} slot={} fetch={}x{} resolved={}x{} (diagnostic; rebind unchanged)",
-                                      n, rit->first, idx, gtd.width, gtd.height, srvTex->w, srvTex->h);
-                }
                 const uint32_t stagingSlot = GetOrCreateResolvedStagingSrv(*srvTex, rsd);
                 if (stagingSlot != UINT32_MAX) {
                     stagedSlots[idx] = stagingSlot;
                 } else {
                     fallbackSrvs.push_back({ idx, srvTex->res.Get(), rsd });
                 }
+                if (mipChain) selectionSource = "mip";
+                emitResolvedAudit(true, stagingSlot != UINT32_MAX ? "staged" : "fallback-srv");
                 ++bound;
                 if (capturePixProbe && !wantsDepth && rit->second.w >= 640u && rit->second.h >= 360u) {
                     s_pixprobeCurSamplesSceneColor = true;
@@ -5061,6 +5213,7 @@ uint32_t D3D12Backend::ResolveGuestTexturesToStaging(
                 }
                 continue;
             }
+            emitResolvedAudit(false, "rejected");
         }
         const bool is3D = gtd.dimension == native::GuestTextureDimension::ThreeD;
         if (gtd.expAdjust != 0) {   // EXPADJ-CPU census: a non-resolved texture whose fetch asks for x 2^exp_adjust, which no host path applies
@@ -5708,7 +5861,8 @@ uint32_t D3D12Backend::BindGuestTextures(const GuestTextureEntry* entries, uint3
     return BindGuestTexturesUnlocked(entries, count, rec);
 }
 
-uint32_t D3D12Backend::BindGuestTexturesUnlocked(const GuestTextureEntry* entries, uint32_t count, DrawRecorder* rec) {
+uint32_t D3D12Backend::BindGuestTexturesUnlocked(const GuestTextureEntry* entries, uint32_t count, DrawRecorder* rec,
+                                                  uint64_t commandOrder) {
     if (!m_srvHeap || !m_device) return 0;
     if (count > kMaxGuestTextureDescriptors) count = kMaxGuestTextureDescriptors;
     if (count == 0 || entries == nullptr) return 0;
@@ -5821,7 +5975,7 @@ uint32_t D3D12Backend::BindGuestTexturesUnlocked(const GuestTextureEntry* entrie
     fallbackSrvs.clear();
     ID3D12GraphicsCommandList* uploadCl = rec ? rec->list : m_commandList.Get();
     const uint32_t bound = ResolveGuestTexturesToStaging(
-        entries, count, uploadCl, !mtRec, stagedSlots, tableHash, &fallbackSrvs);
+        entries, count, uploadCl, !mtRec, stagedSlots, tableHash, &fallbackSrvs, commandOrder);
     // PIXPROBE: capture the staged SRV index and decoded descriptors on the real
     // bind path (and snapshot into s_pixprobeMemo* so subsequent memo hits stay accurate).
     if (PixProbeEnabled() && !mtRec) {
@@ -5916,13 +6070,13 @@ void D3D12Backend::BindDecodedTextureInternal(ID3D12GraphicsCommandList* cl,
     if (m_srvHeap && activeSmp) {
         if (!heapsBound) {
             ID3D12DescriptorHeap* heaps[] = { m_srvHeap.Get(), activeSmp };
-            cl->SetDescriptorHeaps(2, heaps);
+            SetDescriptorHeapsObserved(cl, 2, heaps);
             heapsBound = true;
             boundSrvTableGpu = {};
             boundSamplerTableGpu = {};
         }
     } else if (m_srvHeap) {
-        cl->SetDescriptorHeaps(1, m_srvHeap.GetAddressOf());
+        SetDescriptorHeapsObserved(cl, 1, m_srvHeap.GetAddressOf());
         heapsBound = false;
     }
     const D3D12_GPU_DESCRIPTOR_HANDLE srvTableGpu =
@@ -5981,7 +6135,9 @@ bool D3D12Backend::BindGuestSamplerTable(const native::HostSamplerDesc* table, u
 
 bool D3D12Backend::InternGuestSamplerTable(const native::HostSamplerDesc* table, uint32_t mask,
                                            D3D12_GPU_DESCRIPTOR_HANDLE& samplerTableGpuOut,
+                                           p0_audit::P0SamplerOwner& ownerOut,
                                            uint32_t activeMask) {
+    ownerOut = {};
     if (!m_samplerHeap || !m_device) return false;
     if (SamplerHeapFixEnabled() && activeMask != 0) {
         mask &= activeMask;
@@ -6007,6 +6163,16 @@ bool D3D12Backend::InternGuestSamplerTable(const native::HostSamplerDesc* table,
 
     if (legal == 0) {
         samplerTableGpuOut = activeHeap->GetGPUDescriptorHandleForHeapStart();
+        ownerOut.heap = activeHeap;
+        ownerOut.heapIndex = m_activeSamplerHeapIdx;
+        ownerOut.base = 0;
+        ownerOut.handle = samplerTableGpuOut.ptr;
+        ownerOut.heapBaseGpu = samplerTableGpuOut.ptr;
+        ownerOut.descriptorSize = m_samplerDescriptorSize;
+        ownerOut.descriptorCount = kSamplerBlockSize;
+        ownerOut.heapDescriptorCount = activeHeap->GetDesc().NumDescriptors;
+        ownerOut.internOk = true;
+        ownerOut.neutralFallback = true;
         return true;
     }
 
@@ -6149,6 +6315,16 @@ bool D3D12Backend::InternGuestSamplerTable(const native::HostSamplerDesc* table,
 
     samplerTableGpuOut = curHeap->heap->GetGPUDescriptorHandleForHeapStart();
     samplerTableGpuOut.ptr += static_cast<SIZE_T>(base) * m_samplerDescriptorSize;
+    ownerOut.heap = curHeap->heap.Get();
+    ownerOut.heapIndex = m_activeSamplerHeapIdx;
+    ownerOut.base = base;
+    ownerOut.handle = samplerTableGpuOut.ptr;
+    ownerOut.heapBaseGpu = curHeap->heap->GetGPUDescriptorHandleForHeapStart().ptr;
+    ownerOut.descriptorSize = m_samplerDescriptorSize;
+    ownerOut.descriptorCount = kSamplerBlockSize;
+    ownerOut.heapDescriptorCount = curHeap->heap->GetDesc().NumDescriptors;
+    ownerOut.internOk = ok;
+    ownerOut.neutralFallback = false;
     return ok;
 }
 
@@ -6168,9 +6344,11 @@ bool D3D12Backend::BindGuestSamplerTableInternal(const native::HostSamplerDesc* 
                                                  D3D12_GPU_DESCRIPTOR_HANDLE& boundSamplerTableGpu,
                                                  ID3D12RootSignature* boundRootSig,
                                                  uint32_t activeMask,
-                                                 D3D12_GPU_DESCRIPTOR_HANDLE* boundSrvTableGpu) {
+                                                 D3D12_GPU_DESCRIPTOR_HANDLE* boundSrvTableGpu,
+                                                 uint64_t commandOrder) {
     if (!m_samplerHeap || !cl) return false;
-    const bool ok = InternGuestSamplerTable(table, mask, samplerTableGpuOut, activeMask);
+    p0_audit::P0SamplerOwner owner;
+    const bool ok = InternGuestSamplerTable(table, mask, samplerTableGpuOut, owner, activeMask);
     static const bool s_noTexBindSkip = [] {
         const char* e = std::getenv("MCLA_NO_TEXBIND_SKIP");
         return e && e[0] == '1';
@@ -6183,7 +6361,7 @@ bool D3D12Backend::BindGuestSamplerTableInternal(const native::HostSamplerDesc* 
     if (m_srvHeap) {
         if (needHeapRebind) {
             ID3D12DescriptorHeap* heaps[] = { m_srvHeap.Get(), activeSamplerHeap };
-            cl->SetDescriptorHeaps(2, heaps);
+            SetDescriptorHeapsObserved(cl, 2, heaps);
             heapsBound = true;
             boundSamplerTableGpu = {};
             if (boundSrvTableGpu) {
@@ -6200,7 +6378,7 @@ bool D3D12Backend::BindGuestSamplerTableInternal(const native::HostSamplerDesc* 
         }
     } else {
         if (needHeapRebind) {
-            cl->SetDescriptorHeaps(1, &activeSamplerHeap);
+            SetDescriptorHeapsObserved(cl, 1, &activeSamplerHeap);
             heapsBound = false;
             boundSamplerTableGpu = {};
             if (boundSrvTableGpu) {
@@ -6219,6 +6397,7 @@ bool D3D12Backend::BindGuestSamplerTableInternal(const native::HostSamplerDesc* 
     } else {
         boundSamplerTableGpu = {};
     }
+    if (ok) AuditSampler(owner, cl, 0, commandOrder);
     return ok;
 }
 
@@ -6229,11 +6408,13 @@ bool D3D12Backend::BindGuestSampler(const native::HostSamplerDesc& hostSampler) 
 }
 
 bool D3D12Backend::InternGuestSampler(const native::HostSamplerDesc& hostSampler,
-                                      D3D12_GPU_DESCRIPTOR_HANDLE& samplerTableGpuOut) {
+                                      D3D12_GPU_DESCRIPTOR_HANDLE& samplerTableGpuOut,
+                                      p0_audit::P0SamplerOwner& ownerOut) {
+    ownerOut = {};
     if (GuestSamplerTableEnabled()) {
         native::HostSamplerDesc singleTab[renderer::kShaderSamplerCount] = {};
         singleTab[0] = hostSampler;
-        return InternGuestSamplerTable(singleTab, 1u, samplerTableGpuOut);
+        return InternGuestSamplerTable(singleTab, 1u, samplerTableGpuOut, ownerOut);
     }
     if (!m_samplerHeap || !m_device) return false;
 
@@ -6324,6 +6505,19 @@ bool D3D12Backend::InternGuestSampler(const native::HostSamplerDesc& hostSampler
         samplerTableGpuOut = m_samplerHeap->GetGPUDescriptorHandleForHeapStart();
         samplerTableGpuOut.ptr += static_cast<SIZE_T>(index) * m_samplerDescriptorSize;
     }
+    ownerOut.heap = m_samplerHeap.Get();
+    ownerOut.heapIndex = m_activeSamplerHeapIdx;
+    for (uint32_t h = 0; h < kSamplerHeapCount; ++h) {
+        if (m_samplerHeaps[h].heap.Get() == m_samplerHeap.Get()) { ownerOut.heapIndex = h; break; }
+    }
+    ownerOut.base = index;
+    ownerOut.handle = samplerTableGpuOut.ptr;
+    ownerOut.heapBaseGpu = m_samplerHeap->GetGPUDescriptorHandleForHeapStart().ptr;
+    ownerOut.descriptorSize = m_samplerDescriptorSize;
+    ownerOut.descriptorCount = 1;
+    ownerOut.heapDescriptorCount = m_samplerHeap->GetDesc().NumDescriptors;
+    ownerOut.internOk = true;
+    ownerOut.neutralFallback = false;
     return true;
 }
 
@@ -6341,9 +6535,11 @@ bool D3D12Backend::BindGuestSamplerInternal(const native::HostSamplerDesc& hostS
                                             ID3D12GraphicsCommandList* cl, bool& heapsBound,
                                             D3D12_GPU_DESCRIPTOR_HANDLE& samplerTableGpuOut,
                                             D3D12_GPU_DESCRIPTOR_HANDLE& boundSamplerTableGpu,
-                                            ID3D12RootSignature* boundRootSig) {
+                                            ID3D12RootSignature* boundRootSig,
+                                            uint64_t commandOrder) {
     if (!m_samplerHeap || !cl) return false;
-    if (!InternGuestSampler(hostSampler, samplerTableGpuOut)) return false;
+    p0_audit::P0SamplerOwner owner;
+    if (!InternGuestSampler(hostSampler, samplerTableGpuOut, owner)) return false;
 
     static const bool s_noTexBindSkip = [] {
         const char* e = std::getenv("MCLA_NO_TEXBIND_SKIP");
@@ -6356,11 +6552,11 @@ bool D3D12Backend::BindGuestSamplerInternal(const native::HostSamplerDesc& hostS
     if (m_srvHeap) {
         if (!heapsBound) {
             ID3D12DescriptorHeap* heaps[] = { m_srvHeap.Get(), m_samplerHeap.Get() };
-            cl->SetDescriptorHeaps(2, heaps);
+            SetDescriptorHeapsObserved(cl, 2, heaps);
             heapsBound = true;
         }
     } else {
-        cl->SetDescriptorHeaps(1, m_samplerHeap.GetAddressOf());
+        SetDescriptorHeapsObserved(cl, 1, m_samplerHeap.GetAddressOf());
         heapsBound = false;
     }
     if (heapsBound && boundRootSig == m_rootSignature.Get()) {
@@ -6372,6 +6568,7 @@ bool D3D12Backend::BindGuestSamplerInternal(const native::HostSamplerDesc& hostS
     } else {
         boundSamplerTableGpu = {};
     }
+    AuditSampler(owner, cl, 0, commandOrder);
     return true;
 }
 
@@ -6865,7 +7062,7 @@ bool D3D12Backend::BindPrecompiledDrawResources(ID3D12GraphicsCommandList* cmdLi
         m_precompiledSrvHeap.Get(),
         m_precompiledSamplerHeap.Get()
     };
-    cmdList->SetDescriptorHeaps(_countof(heaps), heaps);
+    SetDescriptorHeapsObserved(cmdList, _countof(heaps), heaps);
 
     // Set precompiled root signature
     cmdList->SetGraphicsRootSignature(m_precompiledRootSignature.Get());
@@ -7178,7 +7375,7 @@ bool D3D12Backend::GenerateMipmaps(ID3D12Resource* texture, uint32_t mipLevels) 
         // time). Without this bind the tables reference an unbound heap -- a
         // D3D12 validation error and an undefined read.
         ID3D12DescriptorHeap* mipGenHeaps[] = { srvUavHeap.Get() };
-        m_commandList->SetDescriptorHeaps(1, mipGenHeaps);
+        SetDescriptorHeapsObserved(m_commandList.Get(), 1, mipGenHeaps);
         InvalidateBoundState();
 
         // Bind SRV table (src mip)
@@ -7235,10 +7432,10 @@ bool D3D12Backend::GenerateMipmaps(ID3D12Resource* texture, uint32_t mipLevels) 
 
     if (m_srvHeap && m_samplerHeap) {
         ID3D12DescriptorHeap* heaps[] = { m_srvHeap.Get(), m_samplerHeap.Get() };
-        m_commandList->SetDescriptorHeaps(2, heaps);
+        SetDescriptorHeapsObserved(m_commandList.Get(), 2, heaps);
     } else if (m_srvHeap) {
         ID3D12DescriptorHeap* heaps[] = { m_srvHeap.Get() };
-        m_commandList->SetDescriptorHeaps(1, heaps);
+        SetDescriptorHeapsObserved(m_commandList.Get(), 1, heaps);
     }
 
     InvalidateBoundState();
@@ -8107,14 +8304,6 @@ void D3D12Backend::ResolveGuestPassTargets(const DynamicMeshDesc& desc, ID3D12Gr
             out = m_passMemo.targets;
             m_drawsIntoGuestRt = true;
             m_guestRtDrawn = true;
-            if (effectiveRtCount > 0 && (effectiveMask & 1u) &&
-                static_cast<uint32_t>(m_guestRtFormat) != desc.psoRtvFormat) {
-                static std::atomic<uint32_t> s_m{0};
-                const uint32_t q = s_m.fetch_add(1) + 1;
-                if (q <= 20 || (q % 5000) == 0)
-                    MCLA_LOG_WARN("TEMP-PSO-RTV #{} path={} pso={} rt={} intoGuestRt=1 hasRt=1 rtColorInfo={:08X}",
-                                  q, desc.psoPath, desc.psoRtvFormat, static_cast<uint32_t>(m_guestRtFormat), desc.rtColorInfo);
-            }
             MayWriteBackBuffer(FrameOwner::Draw);
             for (uint32_t i = 0; i < effectiveRtCount; ++i) {
                 if ((effectiveMask & (1u << i)) && out.rtEntries[i]) {
@@ -8271,18 +8460,6 @@ void D3D12Backend::ResolveGuestPassTargets(const DynamicMeshDesc& desc, ID3D12Gr
             out.rtvCount = resolvedRtvCount;
             out.rtActiveMask = effectiveMask;
             m_drawsIntoGuestRt = true;
-        }
-    }
-
-    if (!depthOnlyGuestPass && drawTarget && m_drawsIntoGuestRt) {
-        const uint32_t rtFmt = static_cast<uint32_t>(m_guestRtFormat);
-        if ((effectiveMask & 1u) && rtFmt != desc.psoRtvFormat) {
-            static std::atomic<uint32_t> s_m{0};
-            const uint32_t q = s_m.fetch_add(1) + 1;
-            if (q <= 20 || (q % 5000) == 0)
-                MCLA_LOG_WARN("TEMP-PSO-RTV #{} path={} pso={} rt={} intoGuestRt={} hasRt={} rtColorInfo={:08X}", q,
-                              desc.psoPath, desc.psoRtvFormat, rtFmt, m_drawsIntoGuestRt ? 1 : 0, desc.hasRt ? 1 : 0,
-                              desc.rtColorInfo);
         }
     }
 
@@ -8537,22 +8714,13 @@ bool D3D12Backend::PrepareDrawStage2(PreparedDraw& prep) {
     }
     prep.dsvBindKey = prep.hasDsv ? static_cast<uint64_t>(prep.dsvHandle.ptr) : 0ull;
     prep.boundRtvFormat = m_activePassTargets.boundRtvFormat;
-
-    if (prep.rtvCount > 0 && (m_activePassTargets.rtActiveMask & 1u)) {
-        const uint32_t rtFmt = static_cast<uint32_t>(prep.boundRtvFormat);
-        if (rtFmt != prep.desc.psoRtvFormat) {
-            static std::atomic<uint32_t> s_m{0};
-            const uint32_t q = s_m.fetch_add(1) + 1;
-            if (q <= 20 || (q % 5000) == 0)
-                MCLA_LOG_WARN("TEMP-PSO-RTV #{} path={} pso={} rt={} intoGuestRt=1 hasRt={} rtColorInfo={:08X}",
-                              q, prep.desc.psoPath, prep.desc.psoRtvFormat, rtFmt,
-                              prep.desc.hasRt ? 1 : 0, prep.desc.rtColorInfo);
-        }
-    }
+    prep.boundRtvMask = m_activePassTargets.rtActiveMask;
+    for (uint32_t i = 0; i < 4u && i < prep.boundRtvFormats.size(); ++i)
+        prep.boundRtvFormats[i] = static_cast<uint32_t>(m_activePassTargets.rtvFormats[i]);
 
     prep.hasSampler = false;
     prep.resolvedSamplerGpu = {};
-    prep.resolvedSamplerHeap = nullptr;
+    prep.samplerOwner = {};
     if (GuestSamplerTableEnabled() && prep.desc.hasGuestSamplerTable) {
         uint32_t activeMask = prep.desc.activeSamplerMask;
         if (activeMask == 0 && prep.desc.guestTextures && prep.desc.guestTextureCount > 0) {
@@ -8562,15 +8730,11 @@ bool D3D12Backend::PrepareDrawStage2(PreparedDraw& prep) {
                 }
             }
         }
-        (void)InternGuestSamplerTable(prep.desc.guestSamplerTable, prep.desc.guestSamplerMask, prep.resolvedSamplerGpu, activeMask);
+        (void)InternGuestSamplerTable(prep.desc.guestSamplerTable, prep.desc.guestSamplerMask,
+                                      prep.resolvedSamplerGpu, prep.samplerOwner, activeMask);
         prep.hasSampler = (prep.resolvedSamplerGpu.ptr != 0);
     } else if (prep.desc.hasGuestSampler) {
-        prep.hasSampler = InternGuestSampler(prep.desc.guestSampler, prep.resolvedSamplerGpu);
-    }
-    if (prep.hasSampler) {  // Phase 0 diagnostic: retain the heap that owns this draw's handle
-        prep.resolvedSamplerHeap = m_samplerHeaps[m_activeSamplerHeapIdx].heap
-            ? m_samplerHeaps[m_activeSamplerHeapIdx].heap.Get()
-            : m_samplerHeap.Get();
+        prep.hasSampler = InternGuestSampler(prep.desc.guestSampler, prep.resolvedSamplerGpu, prep.samplerOwner);
     }
 
     prep.stagedSlots.fill(0);
@@ -8584,7 +8748,7 @@ bool D3D12Backend::PrepareDrawStage2(PreparedDraw& prep) {
         uint32_t rawSlots[kShaderTextureSlotCount] = {};
         prep.boundTexCount = ResolveGuestTexturesToStaging(
             prep.desc.guestTextures, prep.desc.guestTextureCount, m_commandList.Get(), true,
-            rawSlots, prep.srvTableHash, &m_stage2FallbackSrvs);
+            rawSlots, prep.srvTableHash, &m_stage2FallbackSrvs, prep.commandOrder);
         for (uint32_t s = 0; s < kShaderTextureSlotCount; ++s) {
             prep.stagedSlots[s] = rawSlots[s];
         }
@@ -8647,7 +8811,6 @@ bool D3D12Backend::FlushActiveCommandLists() {
     }
     std::vector<ID3D12CommandList*> execLists;
     execLists.reserve(1 + kMaxMtRecorders);
-    uint64_t submittedFenceValue = 0;  // successful Signal for this submission; 0 = no new signal
 
     if (m_mainListOpen) {
         CloseActiveOcclusionQueriesBeforeClose();
@@ -8701,7 +8864,6 @@ bool D3D12Backend::FlushActiveCommandLists() {
         if ((hasUnfencedOcc || hasUnfencedSampler) && m_fence) {
             ++m_currentFenceValue;
             if (SUCCEEDED(m_commandQueue->Signal(m_fence.Get(), m_currentFenceValue))) {
-                submittedFenceValue = m_currentFenceValue;
                 for (auto& q : m_pendingOccQueries) {
                     if (q.fenceValue == UINT64_MAX) q.fenceValue = m_currentFenceValue;
                 }
@@ -8728,15 +8890,9 @@ bool D3D12Backend::FlushActiveCommandLists() {
         }
     }
 
-    static std::atomic<uint64_t> s_allocResetFenceLog{0};
-    const uint64_t allocResetN = s_allocResetFenceLog.fetch_add(1, std::memory_order_relaxed) + 1;
-    const uint64_t completedFenceValue = m_fence ? m_fence->GetCompletedValue() : 0;
-    if (allocResetN <= 8 || (allocResetN % 500) == 0)
-        MCLA_LOG_WARN("ALLOC-LIFETIME-FENCE #{} phase=main lists={} submittedFence={} completedFence={} currentFence={} frameSlot={} (diagnostic; no wait)",
-                      allocResetN, execLists.size(), submittedFenceValue, completedFenceValue,
-                      m_currentFenceValue, (m_frameIndex < kBufferCount) ? m_frameIndex : 0u);
-
     const uint32_t frameSlot = (m_frameIndex < kBufferCount) ? m_frameIndex : 0u;
+    m_mainDescriptorHeapsSet = false;
+    m_mainBoundSamplerHeap = nullptr;
     const HRESULT rhr = m_commandList->Reset(m_commandAllocators[frameSlot].Get(), nullptr);
     if (FAILED(rhr)) {
         m_mainListOpen = false;
@@ -8751,11 +8907,6 @@ bool D3D12Backend::FlushActiveCommandLists() {
     BumpRtPassEpoch();
 
     if (m_mtRecorderCount > 1) {
-        const uint64_t mtCompletedFenceValue = m_fence ? m_fence->GetCompletedValue() : 0;
-        if (allocResetN <= 8 || (allocResetN % 500) == 0)
-            MCLA_LOG_WARN("ALLOC-LIFETIME-FENCE #{} phase=mt lists={} submittedFence={} completedFence={} currentFence={} recorders={} (diagnostic; no wait)",
-                          allocResetN, execLists.size(), submittedFenceValue, mtCompletedFenceValue,
-                          m_currentFenceValue, m_mtRecorderCount);
         for (uint32_t r = 0; r < m_mtRecorderCount; ++r) {
             DrawRecorder& st = m_mtRecorderState[r];
             if (m_mtCommandLists[r] && m_mtAllocators[frameSlot][r]) {
@@ -8782,6 +8933,10 @@ bool D3D12Backend::DrawPreparedStage3(const PreparedDraw& prep, DrawRecorder& re
     }
 
     const DynamicMeshDesc& desc = prep.desc;
+    bool p0OmSetOk = false;
+    bool p0PsoSetOk = false;
+    std::array<uint32_t, 8> p0EffectiveRtvFormats{};
+    std::array<bool, 8> p0EffectiveRtvKnown{};
     const uint32_t streamCount = (desc.streamCount > 0 && desc.streamCount <= 4u) ? desc.streamCount : 1u;
     D3D12_VERTEX_BUFFER_VIEW vbViews[4] = {};
     for (uint32_t s = 0; s < streamCount; ++s) {
@@ -8835,6 +8990,16 @@ bool D3D12Backend::DrawPreparedStage3(const PreparedDraw& prep, DrawRecorder& re
         ibBytesSize = desc.indexBytesSize;
     }
 
+    p0EffectiveRtvFormats = prep.boundRtvFormats;
+    p0EffectiveRtvKnown.fill(false);
+    for (uint32_t i = 0; i < prep.rtvCount && i < 4u; ++i) {
+        if (!prep.rtvHandles[i].ptr) {
+            p0EffectiveRtvFormats[i] = DXGI_FORMAT_R8G8B8A8_UNORM;
+            p0EffectiveRtvKnown[i] = true;
+        } else {
+            p0EffectiveRtvKnown[i] = p0EffectiveRtvFormats[i] != DXGI_FORMAT_UNKNOWN;
+        }
+    }
     if (!rec.boundTargetsValid || rec.boundRtvKey != prep.rtvBindKey ||
         rec.boundDsvKey != prep.dsvBindKey) {
         const D3D12_CPU_DESCRIPTOR_HANDLE* pDsv = prep.hasDsv ? &prep.dsvHandle : nullptr;
@@ -8855,8 +9020,10 @@ bool D3D12Backend::DrawPreparedStage3(const PreparedDraw& prep, DrawRecorder& re
         rec.boundTargetsValid = true;
         rec.boundRtvKey = prep.rtvBindKey;
         rec.boundDsvKey = prep.dsvBindKey;
+        p0OmSetOk = true;
     } else {
         ++rec.omSetSkips;
+        p0OmSetOk = true;
     }
 
     D3D12_VIEWPORT viewport{};
@@ -8910,6 +9077,23 @@ bool D3D12Backend::DrawPreparedStage3(const PreparedDraw& prep, DrawRecorder& re
         cl->SetPipelineState(prep.pso);
         rec.boundPso = prep.pso;
     }
+    p0PsoSetOk = true;
+    if (p0OmSetOk && p0PsoSetOk && p0_audit::Global().Enabled(p0_audit::kMaskPsoRtv)) {
+        p0_audit::P0PsoRtvSnapshot snapshot;
+        snapshot.commandOrder = prep.commandOrder;
+        snapshot.psoKnown = desc.psoRtvKnown;
+        snapshot.omSetRenderTargetsOk = p0OmSetOk;
+        snapshot.setPipelineStateOk = p0PsoSetOk;
+        snapshot.depthOnly = prep.rtvCount == 0 && prep.hasDsv;
+        snapshot.psoCount = desc.psoRtvCount;
+        snapshot.psoMask = desc.psoRtvMask;
+        snapshot.psoFormats = desc.psoRtvFormats;
+        snapshot.rtvCount = static_cast<uint8_t>(prep.rtvCount);
+        snapshot.rtvMask = prep.boundRtvMask;
+        snapshot.rtvFormats = p0EffectiveRtvFormats;
+        snapshot.rtvSlotKnown = p0EffectiveRtvKnown;
+        AuditPsoRtv(snapshot, rec.index);
+    }
     if (desc.stencilOn) {
         g_stencilDraws.fetch_add(1, std::memory_order_relaxed);
         if (rec.boundStencilRef != int32_t(desc.stencilRef)) {
@@ -8933,24 +9117,9 @@ bool D3D12Backend::DrawPreparedStage3(const PreparedDraw& prep, DrawRecorder& re
     }
     const D3D12_GPU_DESCRIPTOR_HANDLE smpGpu = prep.hasSampler ? prep.resolvedSamplerGpu
                                                                : D3D12_GPU_DESCRIPTOR_HANDLE{};
-    if (prep.hasSampler) {  // Phase 0 diagnostic: Stage 2's owner versus Stage 3's active heap
-        ID3D12DescriptorHeap* activeSamplerHeap =
-            (SamplerHeapFixEnabled() && m_samplerHeaps[m_activeSamplerHeapIdx].heap)
-                ? m_samplerHeaps[m_activeSamplerHeapIdx].heap.Get()
-                : m_samplerHeap.Get();
-        if (activeSamplerHeap != prep.resolvedSamplerHeap) {
-            static std::atomic<uint64_t> s_samplerOwnerMismatch{0};
-            const uint64_t n = s_samplerOwnerMismatch.fetch_add(1, std::memory_order_relaxed) + 1;
-            if (n <= 8 || (n % 1000) == 0)
-                MCLA_LOG_WARN("SAMPLER-HEAP-OWNER-MISMATCH #{} drawSeq={} rec={} owner={:016X} active={:016X} activeHeapIdx={} smp={:016X} (diagnostic)",
-                              n, prep.drawSeq, rec.index,
-                              static_cast<uint64_t>(reinterpret_cast<uintptr_t>(prep.resolvedSamplerHeap)),
-                              static_cast<uint64_t>(reinterpret_cast<uintptr_t>(activeSamplerHeap)),
-                              m_activeSamplerHeapIdx, smpGpu.ptr);
-        }
-    }
     BindDecodedTextureInternal(cl, srvTableGpu, rec.heapsBound, smpGpu,
                                rec.boundSrvTableGpu, rec.boundSamplerTableGpu, rec.boundRootSig);
+    if (prep.hasSampler) AuditSampler(prep.samplerOwner, cl, rec.index, prep.commandOrder);
 
     if (desc.indexed) {
         cl->DrawIndexedInstanced(desc.indexCount, 1, desc.startIndexLocation,
@@ -9041,6 +9210,10 @@ bool D3D12Backend::DrawDynamicMeshWithPipeline(const DynamicMeshDesc& desc,
     DcMark(0);
     m_drawRefuseLine = 0;
     ID3D12GraphicsCommandList* cl = rec ? rec->list : m_commandList.Get();
+    bool p0OmSetOk = false;
+    bool p0PsoSetOk = false;
+    std::array<uint32_t, 8> p0EffectiveRtvFormats{};
+    std::array<bool, 8> p0EffectiveRtvKnown{};
     // Per-recorder draw-state cache refs (file-scope globals for legacy path)
     ID3D12RootSignature*& boundRootSigRef = rec ? rec->boundRootSig : s_boundRootSig;
     ID3D12PipelineState*& boundPsoRef = rec ? rec->boundPso : s_boundPso;
@@ -9533,6 +9706,7 @@ bool D3D12Backend::DrawDynamicMeshWithPipeline(const DynamicMeshDesc& desc,
     if (boundTargetsValidRef && boundRtvKeyRef == rtvKey &&
         boundDsvKeyRef == dsvKey) {
         ++m_omSetSkips;
+        p0OmSetOk = true;
     } else {
     if (s_omsetFaults.load(std::memory_order_relaxed) >= 32u) {
         if (!s_omsetLatchLogged.exchange(true, std::memory_order_relaxed)) {
@@ -9546,11 +9720,18 @@ bool D3D12Backend::DrawDynamicMeshWithPipeline(const DynamicMeshDesc& desc,
     unsigned long omsetCode = 0;
     D3D12_CPU_DESCRIPTOR_HANDLE safeRtvs[4] = {};
     const D3D12_CPU_DESCRIPTOR_HANDLE* rtvArray = nullptr;
+    for (uint32_t i = 0; i < p0EffectiveRtvFormats.size(); ++i)
+        p0EffectiveRtvFormats[i] = i < 4u ? static_cast<uint32_t>(passTargets.rtvFormats[i]) : 0u;
+    p0EffectiveRtvKnown.fill(false);
     if (passTargets.rtvCount > 0) {
         for (uint32_t i = 0; i < passTargets.rtvCount && i < 4u; ++i) {
             D3D12_CPU_DESCRIPTOR_HANDLE h = passTargets.rtvHandles[i];
             if (h.ptr == 0 && i == 0 && passTargets.rtvCount == 1u) h = rtvHandle;
-            if (h.ptr == 0) h = EnsureGuestNullRtv(passTargets.rtvFormats[i]);
+            if (h.ptr == 0) {
+                p0EffectiveRtvFormats[i] = static_cast<uint32_t>(passTargets.rtvFormats[i]);
+                h = EnsureGuestNullRtv(passTargets.rtvFormats[i]);
+            }
+            p0EffectiveRtvKnown[i] = p0EffectiveRtvFormats[i] != DXGI_FORMAT_UNKNOWN;
             safeRtvs[i] = h;
         }
         rtvArray = safeRtvs;
@@ -9623,6 +9804,7 @@ bool D3D12Backend::DrawDynamicMeshWithPipeline(const DynamicMeshDesc& desc,
         boundTargetsValidRef = true;
         boundRtvKeyRef = rtvKey;
         boundDsvKeyRef = dsvKey;
+        p0OmSetOk = true;
     }  // bind was needed
     {
         static std::atomic<uint32_t> s_targetLogCount{0};
@@ -9778,6 +9960,23 @@ bool D3D12Backend::DrawDynamicMeshWithPipeline(const DynamicMeshDesc& desc,
     DcMark(6);
     ID3D12PipelineState* pso = pipeline;
     if (boundPsoRef != pso) { cl->SetPipelineState(pso); boundPsoRef = pso; }
+    p0PsoSetOk = true;
+    if (p0OmSetOk && p0PsoSetOk && p0_audit::Global().Enabled(p0_audit::kMaskPsoRtv)) {
+        p0_audit::P0PsoRtvSnapshot snapshot;
+        snapshot.commandOrder = desc.commandOrder;
+        snapshot.psoKnown = desc.psoRtvKnown;
+        snapshot.omSetRenderTargetsOk = p0OmSetOk;
+        snapshot.setPipelineStateOk = p0PsoSetOk;
+        snapshot.depthOnly = passTargets.rtvCount == 0 && passTargets.hasDsv;
+        snapshot.psoCount = desc.psoRtvCount;
+        snapshot.psoMask = desc.psoRtvMask;
+        snapshot.psoFormats = desc.psoRtvFormats;
+        snapshot.rtvCount = static_cast<uint8_t>(passTargets.rtvCount);
+        snapshot.rtvMask = passTargets.rtActiveMask;
+        snapshot.rtvFormats = p0EffectiveRtvFormats;
+        snapshot.rtvSlotKnown = p0EffectiveRtvKnown;
+        AuditPsoRtv(snapshot, rec ? rec->index : 0u);
+    }
     if (desc.stencilOn) {  // Xenia d3d12_command_processor.cc:2963-2969: ref is dynamic state, set only on change
         int32_t& sr = rec ? rec->boundStencilRef : s_boundStencilRef;
         const uint32_t sn = g_stencilDraws.fetch_add(1, std::memory_order_relaxed) + 1;
@@ -9879,7 +10078,8 @@ bool D3D12Backend::DrawDynamicMeshWithPipeline(const DynamicMeshDesc& desc,
                 }
             }
             const int64_t tbB0 = DcNowNs();
-            const uint32_t tmpBound = BindGuestTexturesUnlocked(desc.guestTextures, desc.guestTextureCount, rec);
+            const uint32_t tmpBound = BindGuestTexturesUnlocked(desc.guestTextures, desc.guestTextureCount, rec,
+                                                                 desc.commandOrder);
             g_tbAcc[0] += DcNowNs() - tbB0;
             if (wantWbLog) {
                 const uint64_t tmpRef1 = [] { uint64_t t = 0; for (uint32_t i = 0; i < 32; ++i) t += g_textureImportRefusals[i]; return t + g_textureBindRefusals; }();
@@ -9911,18 +10111,18 @@ bool D3D12Backend::DrawDynamicMeshWithPipeline(const DynamicMeshDesc& desc,
                 if (!BindGuestSamplerTableInternal(desc.guestSamplerTable, desc.guestSamplerMask, cl,
                                                    heapsBoundRef, samplerTableGpuRef,
                                                    boundSamplerTableGpuRef, boundRootSigRef, activeMask,
-                                                   &boundSrvTableGpuRef)) {
+                                                   &boundSrvTableGpuRef, desc.commandOrder)) {
                     boundSamplerTableGpuRef = {};
                 }
             } else if (desc.hasGuestSampler) {
                 if (!BindGuestSamplerInternal(desc.guestSampler, cl, heapsBoundRef, samplerTableGpuRef,
-                                              boundSamplerTableGpuRef, boundRootSigRef)) {
+                                              boundSamplerTableGpuRef, boundRootSigRef, desc.commandOrder)) {
                     boundSamplerTableGpuRef = {};
                 }
             }
         } else if (desc.hasGuestSampler) {
             if (!BindGuestSamplerInternal(desc.guestSampler, cl, heapsBoundRef, samplerTableGpuRef,
-                                          boundSamplerTableGpuRef, boundRootSigRef)) {
+                                          boundSamplerTableGpuRef, boundRootSigRef, desc.commandOrder)) {
                 boundSamplerTableGpuRef = {};
             }
         }
@@ -9934,7 +10134,7 @@ bool D3D12Backend::DrawDynamicMeshWithPipeline(const DynamicMeshDesc& desc,
         // Precompiled pipeline: import textures into the SRV heap (slots 1..)
         // and point the SharedConstants indices at those slots.
         if (desc.guestTextures && desc.guestTextureCount) {
-            BindGuestTexturesUnlocked(desc.guestTextures, desc.guestTextureCount, rec);
+            BindGuestTexturesUnlocked(desc.guestTextures, desc.guestTextureCount, rec, desc.commandOrder);
         }
         uint32_t indices[16] = {};
         for (uint32_t t = 0; t < desc.guestTextureCount && t < 16; ++t) {
@@ -11541,7 +11741,7 @@ bool D3D12Backend::ExecuteGuestResolve(const native::ResolveCommand& rc) {
                         (++g_dcBarriers, m_commandList)->ResourceBarrier(1, &convBar);
 
                         ID3D12DescriptorHeap* heaps1[] = { m_resolve1xSrvHeap.Get() };
-                        m_commandList->SetDescriptorHeaps(1, heaps1);
+                        SetDescriptorHeapsObserved(m_commandList.Get(), 1, heaps1);
                         m_commandList->SetGraphicsRootSignature(m_blitRootSignature.Get());
                         m_commandList->SetPipelineState(
                             (rule.dxgiFmt == DXGI_FORMAT_R32G32_FLOAT) ? m_resolveConvPsoRg32f.Get() : m_resolveConvPsoRgba8.Get());
@@ -13833,20 +14033,48 @@ bool D3D12Backend::BeginFrame() {
         return false;
     }
 
-    HRESULT hr = m_commandAllocators[m_frameIndex]->Reset();
+    const uint64_t allocatorTargetFence = m_fenceValues[m_frameIndex];
+    const uint64_t allocatorCompletedBefore = m_fence ? m_fence->GetCompletedValue() : 0;
+    const bool allocatorFenceKnown = m_fence != nullptr;
+    const HRESULT allocatorFirstHr = m_commandAllocators[m_frameIndex]->Reset();
+    HRESULT hr = allocatorFirstHr;
+    bool allocatorRetried = false;
     if (FAILED(hr)) {
         if (m_commandList && m_mainListOpen) {
             (void)m_commandList->Close();
             m_mainListOpen = false;
             hr = m_commandAllocators[m_frameIndex]->Reset();
-        }
-        if (FAILED(hr)) {
-            RecordBeginFrameRefusal(BeginFrameGate::kAllocatorReset, m_frameIndex,
-                                    static_cast<uint32_t>(hr));
-            return false;
+            allocatorRetried = true;
         }
     }
+    if (p0_audit::Global().Enabled(p0_audit::kMaskAllocator)) {
+        p0_audit::P0AllocatorSnapshot snapshot;
+        snapshot.kind = "main";
+        snapshot.firstHresult = static_cast<int32_t>(allocatorFirstHr);
+        snapshot.finalHresult = static_cast<int32_t>(hr);
+        snapshot.retried = allocatorRetried;
+        snapshot.fenceKnown = allocatorFenceKnown;
+        snapshot.targetFence = allocatorTargetFence;
+        snapshot.completedBefore = allocatorCompletedBefore;
+        snapshot.recordingAtFinal = m_commandList && m_mainListOpen;
+        snapshot.frameIndex = m_frameIndex;
+        p0_audit::Global().Emit(p0_audit::kMaskAllocator, "ALLOCATOR", p0_audit::ClassifyAllocator(snapshot), {
+            {"kind", "main"}, {"frameIndex", std::to_string(m_frameIndex)},
+            {"firstHresult", p0_audit::Hex(static_cast<uint32_t>(allocatorFirstHr), 8)},
+            {"finalHresult", p0_audit::Hex(static_cast<uint32_t>(hr), 8)},
+            {"retried", std::to_string(allocatorRetried ? 1 : 0)}, {"targetFence", std::to_string(allocatorTargetFence)},
+            {"completedBefore", std::to_string(allocatorCompletedBefore)},
+            {"recordingAtFinal", std::to_string(snapshot.recordingAtFinal ? 1 : 0)},
+        });
+    }
+    if (FAILED(hr)) {
+        RecordBeginFrameRefusal(BeginFrameGate::kAllocatorReset, m_frameIndex,
+                                static_cast<uint32_t>(hr));
+        return false;
+    }
 
+    m_mainDescriptorHeapsSet = false;
+    m_mainBoundSamplerHeap = nullptr;
     hr = m_commandList->Reset(m_commandAllocators[m_frameIndex].Get(), nullptr);
     if (FAILED(hr)) {
         static const bool s_noCmdlistRecover = [] {
@@ -13901,7 +14129,28 @@ bool D3D12Backend::BeginFrame() {
                 m_mtRecorderState[r].listOpen = false;
             }
             if (m_mtAllocators[frameSlot][r]) {
-                (void)m_mtAllocators[frameSlot][r]->Reset();
+                const uint64_t targetFence = m_fenceValues[frameSlot];
+                const uint64_t completedBefore = m_fence ? m_fence->GetCompletedValue() : 0;
+                const HRESULT allocatorHr = m_mtAllocators[frameSlot][r]->Reset();
+                if (p0_audit::Global().Enabled(p0_audit::kMaskAllocator)) {
+                    p0_audit::P0AllocatorSnapshot snapshot;
+                    snapshot.kind = "mt";
+                    snapshot.recorder = r;
+                    snapshot.firstHresult = snapshot.finalHresult = static_cast<int32_t>(allocatorHr);
+                    snapshot.fenceKnown = m_fence != nullptr;
+                    snapshot.targetFence = targetFence;
+                    snapshot.completedBefore = completedBefore;
+                    snapshot.recordingAtFinal = m_mtCommandLists[r] && m_mtRecorderState[r].listOpen;
+                    snapshot.frameIndex = frameSlot;
+                    p0_audit::Global().Emit(p0_audit::kMaskAllocator, "ALLOCATOR", p0_audit::ClassifyAllocator(snapshot), {
+                        {"kind", "mt"}, {"recorder", std::to_string(r)}, {"frameIndex", std::to_string(frameSlot)},
+                        {"firstHresult", p0_audit::Hex(static_cast<uint32_t>(allocatorHr), 8)},
+                        {"finalHresult", p0_audit::Hex(static_cast<uint32_t>(allocatorHr), 8)},
+                        {"retried", std::to_string(0)}, {"targetFence", std::to_string(targetFence)},
+                        {"completedBefore", std::to_string(completedBefore)},
+                        {"recordingAtFinal", std::to_string(snapshot.recordingAtFinal ? 1 : 0)},
+                    });
+                }
             }
             bool listOpened = false;
             if (m_mtCommandLists[r] && m_mtAllocators[frameSlot][r]) {
@@ -13946,6 +14195,7 @@ bool D3D12Backend::BeginFrame() {
     }
     if (g_f9State.load(std::memory_order_relaxed) == 1) F9ArmFrame();
     m_inFrame = true;
+    p0_audit::Global().NoteFrameBegun(m_beginFrameBegins);
     m_batchDrawFrameHasDraw = false;
     m_uploadOffset = 0; ++m_uploadEpoch;
     s_frameSrvRingCursor.store(0, std::memory_order_relaxed);
@@ -15053,6 +15303,7 @@ void D3D12Backend::Shutdown() {
     std::unique_lock<std::recursive_mutex> lock(m_mutex);
     if (!m_initialized) return;
 
+    p0_audit::Global().Shutdown();
     WaitForGpu();
 
     // Stop pipeline cache worker thread

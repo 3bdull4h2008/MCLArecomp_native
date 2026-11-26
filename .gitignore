@@ -147,3 +147,7 @@ tools/translator_probe/obj/
 
 # Generated validator output: local only
 /tools/validators/texture_quad_shaders_gen.h
+
+# P0 audit test fixtures are source data, not runtime logs
+!tools/fixtures/p0_audit_positive.log
+!tools/fixtures/p0_audit_negative.log

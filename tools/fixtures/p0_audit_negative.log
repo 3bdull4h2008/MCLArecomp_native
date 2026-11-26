@@ -1,0 +1,19 @@
+[00:00:00.000] [info] P0-AUDIT-CONFIG status=armed mask=0xF source=explicit
+[00:00:00.001] [info] P0-AUDIT-SAMPLER v=1 seq=1 events=1 attention=1 unknown=0 notApplicable=0 recovered=0 fixture=1 category=attention verdict=neutral-fallback reason="neutral-fallback" case=neutral-fallback
+[00:00:00.002] [info] P0-AUDIT-SAMPLER v=1 seq=2 events=2 attention=2 unknown=0 notApplicable=0 recovered=0 fixture=1 category=attention verdict=owner-mismatch reason="owner-bound-heap-mismatch" case=two-recorder-owner-A-bound-B
+[00:00:00.003] [info] P0-AUDIT-SAMPLER v=1 seq=3 events=3 attention=3 unknown=0 notApplicable=0 recovered=0 fixture=1 category=attention verdict=out-of-range reason="handle-out-of-range" case=out-of-range
+[00:00:00.004] [info] P0-AUDIT-SAMPLER v=1 seq=4 events=4 attention=4 unknown=0 notApplicable=0 recovered=0 fixture=1 category=attention verdict=unbound reason="descriptor-heaps-unbound" case=unbound
+[00:00:00.005] [info] P0-AUDIT-SAMPLER v=1 seq=5 events=5 attention=4 unknown=1 notApplicable=0 recovered=0 fixture=1 category=unknown verdict=intern-failed reason="intern-not-ok" case=unknown
+[00:00:00.006] [info] P0-AUDIT-ALLOCATOR v=1 seq=6 events=6 attention=5 unknown=1 notApplicable=0 recovered=0 fixture=1 category=attention verdict=unsafe reason="allocator-reset-before-fence" case=unsafe
+[00:00:00.007] [info] P0-AUDIT-RESOLVED v=1 seq=7 events=7 attention=6 unknown=1 notApplicable=0 recovered=0 fixture=1 category=attention verdict=fallback-dim reason="fallback-dim" case=fallback-dim
+[00:00:00.008] [info] P0-AUDIT-PSO-RTV v=1 seq=8 events=8 attention=6 unknown=1 notApplicable=1 recovered=0 fixture=1 category=not-applicable verdict=depth-only reason="depth-only-zero-rtv" case=depth-only
+[00:00:00.009] [info] P0-AUDIT-SELFTEST-DONE pass=8 total=8 fixture=1
+[00:00:01.000] [info] prose collision: P0-AUDIT-RESOLVED verdict=attention must not count
+[00:00:01.100] [info] P0-AUDIT-SAMPLER v=1 seq=9 domainSeq=1 events=1 attention=0 unknown=0 notApplicable=0 recovered=0 fixture=0 category=ok verdict=bound-ok reason="owner-bound-aligned-in-range" commandOrder=42 recorder=1
+[00:00:01.200] [info] P0-AUDIT-ALLOCATOR v=1 seq=10 domainSeq=1 events=1 attention=0 unknown=0 notApplicable=0 recovered=0 fixture=0 category=ok verdict=safe reason="allocator-reset-after-fence" kind=main
+[00:00:01.300] [info] P0-AUDIT-RESOLVED v=1 seq=11 domainSeq=1 events=1 attention=0 unknown=0 notApplicable=0 recovered=0 fixture=0 category=ok verdict=exact reason="selected-exact-staged" commandOrder=42
+[00:00:01.400] [info] P0-AUDIT-PSO-RTV v=1 seq=12 domainSeq=1 events=1 attention=0 unknown=0 notApplicable=1 recovered=0 fixture=0 category=not-applicable verdict=depth-only reason="depth-only-zero-rtv" commandOrder=42
+[00:00:02.000] [info] P0-AUDIT-SUMMARY v=1 seq=13 domain=SAMPLER domainSeq=1 events=1 attention=0 unknown=0 notApplicable=0 recovered=0 fixture=0 category=summary verdict=summary reason="frame-begun" frame=2
+[00:00:02.001] [info] P0-AUDIT-SUMMARY v=1 seq=14 domain=ALLOCATOR domainSeq=1 events=1 attention=0 unknown=0 notApplicable=0 recovered=0 fixture=0 category=summary verdict=summary reason="frame-begun" frame=2
+[00:00:02.002] [info] P0-AUDIT-SUMMARY v=1 seq=15 domain=RESOLVED domainSeq=1 events=1 attention=0 unknown=0 notApplicable=0 recovered=0 fixture=0 category=summary verdict=summary reason="frame-begun" frame=2
+[00:00:02.003] [info] P0-AUDIT-SUMMARY v=1 seq=16 domain=PSO-RTV domainSeq=1 events=1 attention=0 unknown=0 notApplicable=1 recovered=0 fixture=0 category=summary verdict=summary reason="frame-begun" frame=2

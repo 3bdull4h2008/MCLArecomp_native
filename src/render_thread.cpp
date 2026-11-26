@@ -3398,6 +3398,8 @@ void RenderThread::PrepareDrawStage1(const RenderCommand& cmd,
     const uint64_t preSeq = prep.drawSeq;
     prep.ResetForReuse();
     if (preSeq != 0u) prep.drawSeq = preSeq;
+    prep.commandOrder = cmd.commandOrder;
+    prep.desc.commandOrder = cmd.commandOrder;
     meta.Reset();
     struct Stage1TimerGuard {
         ~Stage1TimerGuard() {
@@ -8824,6 +8826,18 @@ void RenderThread::PrepareDrawStage1(const RenderCommand& cmd,
                                 }
                             }
                         }
+                        auto capturePsoRtvMetadata = [&](const mcla::renderer::PipelineState& state) {
+                            desc.psoRtvKnown = true;
+                            desc.psoRtvCount = 0;
+                            desc.psoRtvMask = 0;
+                            for (uint32_t i = 0; i < desc.psoRtvFormats.size(); ++i) {
+                                desc.psoRtvFormats[i] = state.targetFormats[i];
+                                if (state.targetFormats[i] != DXGI_FORMAT_UNKNOWN) {
+                                    ++desc.psoRtvCount;
+                                    desc.psoRtvMask |= static_cast<uint8_t>(1u << i);
+                                }
+                            }
+                        };
                         if (!desc.usePrecompiledPipeline) {
                             if (memoHit) {
                                 if (psoSlot.negative) {
@@ -8832,6 +8846,7 @@ void RenderThread::PrepareDrawStage1(const RenderCommand& cmd,
                                 } else {
                                     pipePso = psoSlot.pso;
                                     pipeHasGeomStage = psoSlot.carries;
+                                    capturePsoRtvMetadata(derived);
                                     if (psoSlot.smpMask != 0) desc.activeSamplerMask = psoSlot.smpMask;
                                     pc.NoteMemoHit();
                                 }
@@ -8844,6 +8859,7 @@ void RenderThread::PrepareDrawStage1(const RenderCommand& cmd,
                                 pipePso = pc.GetOrCompile(
                                     key, *pipeVsHlsl, *pipePsHlsl, inputLayout,
                                     "render_thread.cpp:F-716", &pipeHasGeomStage, true, &mapHit, &negHit);
+                                if (mapHit && pipePso) capturePsoRtvMetadata(key.state);
                                 if (memoOk && mapHit && pipePso) {
                                     psoSlot.valid = true;
                                     psoSlot.negative = false;

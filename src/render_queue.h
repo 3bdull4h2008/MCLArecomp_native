@@ -809,6 +809,7 @@ struct RenderCommand {
         ClearCommand,
         QueryOpCommand
     > data;
+    uint64_t commandOrder = 0;  // assigned once under CommandQueue::mutex_ at admission
 };
 
 // F-610: the heartbeat PRESENT is exactly {frameNumber=0, obj=0, swapInfo=0}
@@ -931,7 +932,10 @@ public:
                     std::chrono::steady_clock::now().time_since_epoch()).count();
             }
         }
-        pushImpl(sheddable, [&] { queue_.push(std::move(cmd), maxCapacity_ + kRingSlack); });
+        pushImpl(sheddable, [&] {
+            cmd.commandOrder = nextCommandOrder_++;
+            queue_.push(std::move(cmd), maxCapacity_ + kRingSlack);
+        });
     }
     // DRAW_CAPTURED written straight into its ring slot with CopyDrawPrefix: no RenderCommand temporary and
     // no copy of the unused body tails. Same admission/eviction as push().
@@ -945,6 +949,7 @@ public:
         }
         pushImpl(false, [&] {
             RenderCommand& slot = queue_.push_slot(maxCapacity_ + kRingSlack);
+            slot.commandOrder = nextCommandOrder_++;
             slot.type = RenderCommand::DRAW_CAPTURED;
             CopyDrawPrefix(slot.data.emplace<DrawCapturedCommand>(DrawCapturedCommand::NoInit{}), dc);
         });
@@ -1190,6 +1195,7 @@ private:
     };
     static constexpr size_t kRingSlack = 256;
     CmdRing queue_;
+    uint64_t nextCommandOrder_ = 1;  // guarded by mutex_
     size_t maxCapacity_;
     std::atomic<bool> shutdown_;
     // F-610: atomics, not mutex-protected fields, so the render thread can
