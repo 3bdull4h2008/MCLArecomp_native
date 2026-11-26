@@ -1090,9 +1090,10 @@ private:
     void WorkerLoop(Microsoft::WRL::ComPtr<ID3D12Device> device,
                     Microsoft::WRL::ComPtr<ID3D12RootSignature> rootSignature);
 
-    // Versioned PSO-description persistence. Prewarming runs synchronously from
+    // Versioned PSO-description persistence. Prewarming merges the best-effort
+    // user cache with a strict read-only packaged seed synchronously from
     // StartWorker before the worker thread can receive guest work. Appending is
-    // worker-only; MCLA_NO_PSO_PREWARM and MCLA_NO_PSO_PERSIST gate the two sides.
+    // worker-only; MCLA_NO_PSO_PREWARM/PERSIST/SEED gate the three sides.
     void PrewarmPsoCache(Microsoft::WRL::ComPtr<ID3D12Device> device,
                          Microsoft::WRL::ComPtr<ID3D12RootSignature> rootSignature);
     bool AppendPsoDescription(
@@ -1160,6 +1161,8 @@ mutable std::mutex queueMutex_;
     // PSO-description cache state. StartWorker initialises the path/hash before
     // spawning the worker; only that worker appends records afterwards.
     std::string psoCachePath_;
+    std::string psoSeedPath_;
+    bool psoSeedOnly_ = false;  // normalized user/seed paths alias: user persistence is disabled
     uint64_t psoCacheValidBytes_ = 0;
     uint64_t rootSignatureHash_ = 0;
     bool rootSignatureHashValid_ = false;
@@ -1214,9 +1217,14 @@ mutable std::mutex queueMutex_;
     // Key -> reflected sampler bitmask (s0..s31). Guarded by mapMutex_.
     std::unordered_map<PipelineKey, uint32_t, PipelineKeyHash> samplerMasks_;
 
-    // Keys reconstructed from pso_cache.bin, so a fast-path hit can be counted
-    // apart from an ordinary worker-created hit. Guarded by mapMutex_.
-    std::unordered_set<PipelineKey, PipelineKeyHash> prewarmedKeys_;
+    // Keys reconstructed from the user cache or packaged seed, so a fast-path
+    // hit can be counted apart from an ordinary worker-created hit and report
+    // its provenance. Guarded by mapMutex_.
+    enum class PrewarmSource : uint8_t { kUser, kSeed };
+    std::unordered_map<PipelineKey, PrewarmSource, PipelineKeyHash> prewarmSources_;
+    // Accepted seed keys are never appended to the user cache, even if a later
+    // worker compile has to recreate one after eviction/prewarm failure.
+    std::unordered_set<PipelineKey, PipelineKeyHash> seedKeys_;
 
     // Refusal log throttle + counters. refusedKeys_ is bounded by
     // kMaxInflight*2 so a key-churning soak cannot grow it without limit.

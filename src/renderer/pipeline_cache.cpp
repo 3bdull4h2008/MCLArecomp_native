@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cctype>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -1843,17 +1844,52 @@ bool ShouldLogPsoCensus(uint64_t n) {
     return n <= 4 || (n % 200) == 0;
 }
 
-std::string ResolvePsoCachePath() {
-    if (const char* env = std::getenv("MCLA_PSO_CACHE"); env && *env)
-        return env;
+static std::filesystem::path PsoExecutableDirectory() {
     std::vector<char> exe(32768, '\0');
     const DWORD n = GetModuleFileNameA(nullptr, exe.data(), static_cast<DWORD>(exe.size()));
     if (n > 0 && n < exe.size()) {
         const std::filesystem::path dir =
             std::filesystem::path(std::string(exe.data(), n)).parent_path();
-        if (!dir.empty()) return (dir / "pso_cache.bin").string();
+        if (!dir.empty()) return dir;
     }
+    return {};
+}
+
+std::string ResolvePsoCachePath() {
+    if (const char* env = std::getenv("MCLA_PSO_CACHE"); env && *env)
+        return env;
+    const std::filesystem::path dir = PsoExecutableDirectory();
+    if (!dir.empty()) return (dir / "pso_cache.bin").string();
     return "pso_cache.bin";
+}
+
+std::string ResolvePsoSeedPath() {
+    if (const char* env = std::getenv("MCLA_PSO_SEED"); env && *env)
+        return env;
+    const std::filesystem::path dir = PsoExecutableDirectory();
+    if (!dir.empty()) return (dir / "pso_title_seed.bin").string();
+    return "pso_title_seed.bin";
+}
+
+static std::filesystem::path NormalizePsoCachePath(const std::string& path) {
+    std::error_code ec;
+    std::filesystem::path absolute = std::filesystem::absolute(std::filesystem::path(path), ec);
+    if (ec) absolute = std::filesystem::path(path);
+    const std::filesystem::path canonical = std::filesystem::weakly_canonical(absolute, ec);
+    if (!ec) absolute = canonical;
+    return absolute.lexically_normal();
+}
+
+static bool SamePsoCachePath(const std::string& lhs, const std::string& rhs) {
+    std::error_code ec;
+    if (std::filesystem::equivalent(std::filesystem::path(lhs), std::filesystem::path(rhs), ec) && !ec)
+        return true;
+    auto fold = [](std::filesystem::path path) {
+        std::string value = NormalizePsoCachePath(path.string()).string();
+        for (char& c : value) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        return value;
+    };
+    return fold(lhs) == fold(rhs);
 }
 
 // ID3D12RootSignature does not expose its serialized blob. The cache therefore
@@ -2413,25 +2449,33 @@ bool ValidatePsoDescription(const PsoDescription& record, std::string& error) {
 
 struct PsoCacheScan {
     std::vector<PsoDescription> records;
+    std::vector<std::vector<uint8_t>> recordPayloads;  // exact validated payloads for duplicate/conflict identity
     uint64_t validBytes = 0;
     uint64_t corrupt = 0;
     uint64_t stale = 0;
     uint64_t examined = 0;
+    uint64_t duplicates = 0;
+    uint64_t conflicts = 0;
+    bool rejected = false;  // strict seed: one bad/stale/conflicting record rejects the whole file
 };
 
 PsoCacheScan ScanPsoCache(const std::string& path, uint64_t rootSignatureHash,
-                          bool keepRecords) {
+                          bool keepRecords, bool strictSeed = false) {
     PsoCacheScan result;
+    keepRecords = keepRecords || strictSeed;
+    auto rejectSeed = [&] { if (strictSeed) result.rejected = true; };
     std::error_code ec;
     const bool exists = std::filesystem::exists(path, ec);
     if (ec) {
         result.corrupt = 1;
+        rejectSeed();
         return result;
     }
     if (!exists) return result;
     const uint64_t fileSize = std::filesystem::file_size(path, ec);
     if (ec || fileSize > kPsoCacheMaxFileBytes) {
         result.corrupt = 1;
+        rejectSeed();
         return result;
     }
     std::ifstream input(path, std::ios::binary);
@@ -2443,6 +2487,7 @@ PsoCacheScan ScanPsoCache(const std::string& path, uint64_t rootSignatureHash,
     if (!input || std::memcmp(magic, "MPSC", 4) != 0 ||
         version != kPsoCacheFileVersion || headerBytes != kPsoCacheHeaderBytes) {
         result.corrupt = 1;
+        rejectSeed();
         return result;
     }
     uint64_t offset = kPsoCacheHeaderBytes;
@@ -2450,6 +2495,7 @@ PsoCacheScan ScanPsoCache(const std::string& path, uint64_t rootSignatureHash,
     while (offset < fileSize) {
         if (fileSize - offset < kPsoRecordHeaderBytes || result.examined >= kPsoCacheMaxRecords) {
             ++result.corrupt;
+            rejectSeed();
             break;
         }
         char recordMagic[4] = {};
@@ -2461,6 +2507,7 @@ PsoCacheScan ScanPsoCache(const std::string& path, uint64_t rootSignatureHash,
         if (!input || std::memcmp(recordMagic, "PSOR", 4) != 0 ||
             payloadSize > kPsoCacheMaxRecordBytes || payloadSize > fileSize - offset - kPsoRecordHeaderBytes) {
             ++result.corrupt;
+            rejectSeed();
             break;
         }
         std::vector<uint8_t> payload(payloadSize);
@@ -2470,6 +2517,7 @@ PsoCacheScan ScanPsoCache(const std::string& path, uint64_t rootSignatureHash,
         ++result.examined;
         if (!input || HashBytes(payload.data(), payload.size(), 0) != checksum) {
             ++result.corrupt;
+            rejectSeed();
             continue;
         }
         if (!keepRecords) continue;
@@ -2477,24 +2525,41 @@ PsoCacheScan ScanPsoCache(const std::string& path, uint64_t rootSignatureHash,
         std::string error;
         if (!ReadPsoPayload(payload.data(), payload.size(), record)) {
             ++result.corrupt;
+            rejectSeed();
             continue;
         }
         if (record.translatorVersion != kPsoTranslatorCacheVersion ||
             record.dxcVersion != kPsoDxcCacheVersion || record.rootSignatureHash != rootSignatureHash) {
             ++result.stale;
+            rejectSeed();
             continue;
         }
         if (!ValidatePsoDescription(record, error)) {
             ++result.corrupt;
+            rejectSeed();
             continue;
         }
         auto existing = recordIndex.find(record.key);
         if (existing == recordIndex.end()) {
             recordIndex.emplace(record.key, result.records.size());
             result.records.push_back(std::move(record));
+            result.recordPayloads.push_back(std::move(payload));
+        } else if (result.recordPayloads[existing->second] == payload) {
+            ++result.duplicates;
         } else {
-            result.records[existing->second] = std::move(record);
+            ++result.conflicts;
+            if (strictSeed) {
+                rejectSeed();
+            } else {
+                // User caches remain best-effort: retain the last valid record.
+                result.records[existing->second] = std::move(record);
+                result.recordPayloads[existing->second] = std::move(payload);
+            }
         }
+    }
+    if (result.rejected) {
+        result.records.clear();
+        result.recordPayloads.clear();
     }
     return result;
 }
@@ -2542,10 +2607,14 @@ void PipelineCache::StartWorker(Microsoft::WRL::ComPtr<ID3D12Device> device,
     device_ = device;
     rootSignature_ = rootSignature;
     psoCachePath_ = ResolvePsoCachePath();
+    psoSeedPath_ = ResolvePsoSeedPath();
+    psoSeedOnly_ = SamePsoCachePath(psoCachePath_, psoSeedPath_);
     const char* prewarmEnv = std::getenv("MCLA_NO_PSO_PREWARM");
     const char* persistEnv = std::getenv("MCLA_NO_PSO_PERSIST");
+    const char* seedEnv = std::getenv("MCLA_NO_PSO_SEED");
     const bool prewarmDisabled = prewarmEnv && prewarmEnv[0] == '1';
-    const bool persistDisabled = persistEnv && persistEnv[0] == '1';
+    const bool seedDisabled = seedEnv && seedEnv[0] == '1';
+    const bool persistDisabled = (persistEnv && persistEnv[0] == '1') || psoSeedOnly_;
     const char* coldFallbackEnv = std::getenv("MCLA_NO_PSO_COLD_TEST_REFUSAL");
     const char* nonGeomFallbackEnv = std::getenv("MCLA_PSO_NONGEOM_FALLBACK");
     const char* rawHashEnv = std::getenv("MCLA_NO_PSO_STABLE_KEY_HASH");
@@ -2560,6 +2629,13 @@ void PipelineCache::StartWorker(Microsoft::WRL::ComPtr<ID3D12Device> device,
                           (nonGeomFallbackEnv && nonGeomFallbackEnv[0] == '1')
                       ? 1 : 0,
                   nonGeomFallbackEnv && nonGeomFallbackEnv[0] == '1' ? 1 : 0);
+    MCLA_LOG_INFO("PSO-SEED-CONFIG #0 enabled={} path={} seedOnly={} userPersistence={} positiveControl=1",
+                  seedDisabled ? 0 : 1, psoSeedPath_, psoSeedOnly_ ? 1 : 0,
+                  persistDisabled ? 0 : 1);
+    if (psoSeedOnly_)
+        MCLA_LOG_WARN("PSO-SEED-PATH-ALIAS #0 user={} seed={} -- normalized paths match; "
+                      "seed is read-only and user persistence is disabled",
+                      psoCachePath_, psoSeedPath_);
     MCLA_LOG_INFO("PSO-PERSIST-SAVE #0 disabled={} path={} positiveControl=1 "
                   "-- description appends are worker-only", persistDisabled ? 1 : 0,
                   psoCachePath_);
@@ -2574,17 +2650,20 @@ void PipelineCache::StartWorker(Microsoft::WRL::ComPtr<ID3D12Device> device,
     }
 
     if (prewarmDisabled) {
-        MCLA_LOG_INFO("PSO-PREWARM #0 disabled=1 path={} records=0 created=0 failed=0 "
-                      "stale=0 corrupt=0 positiveControl=1", psoCachePath_);
+        PsoCacheScan userScan;
         if (!persistDisabled && rootSignatureHashValid_) {
-            const PsoCacheScan scan = ScanPsoCache(psoCachePath_, rootSignatureHash_, true);
-            psoCacheValidBytes_ = scan.validBytes;
-            g_psoCacheCounters.prewarmCorrupt.fetch_add(scan.corrupt, std::memory_order_relaxed);
+            userScan = ScanPsoCache(psoCachePath_, rootSignatureHash_, true);
+            psoCacheValidBytes_ = userScan.validBytes;
+            g_psoCacheCounters.prewarmCorrupt.fetch_add(userScan.corrupt, std::memory_order_relaxed);
             std::lock_guard<std::mutex> lock(persistMutex_);
-            for (const auto& rec : scan.records) {
+            for (const auto& rec : userScan.records) {
                 persistedKeys_.insert(rec.key);
             }
         }
+        MCLA_LOG_INFO("PSO-PREWARM #0 disabled=1 path={} seedPath={} records=0 examined={} created=0 failed=0 "
+                      "stale={} corrupt={} seed=0 user={} merged=0 conflicts={} rejected=0 duplicates={} positiveControl=1",
+                      psoCachePath_, psoSeedPath_, userScan.examined, userScan.stale, userScan.corrupt,
+                      userScan.records.size(), userScan.conflicts, userScan.duplicates);
     } else {
         PrewarmPsoCache(device, rootSignature);
     }
@@ -2600,16 +2679,73 @@ void PipelineCache::PrewarmPsoCache(Microsoft::WRL::ComPtr<ID3D12Device> device,
                                     Microsoft::WRL::ComPtr<ID3D12RootSignature> rootSignature) {
     if (!device || !rootSignature || !rootSignatureHashValid_) {
         g_psoCacheCounters.prewarmFailed.fetch_add(1, std::memory_order_relaxed);
-        MCLA_LOG_WARN("PSO-PREWARM #0 disabled=0 path={} records=0 created=0 failed=1 "
-                      "stale=0 corrupt=0 reason=device/root-signature/hash unavailable",
-                      psoCachePath_);
+        MCLA_LOG_WARN("PSO-PREWARM #0 disabled=0 path={} seedPath={} records=0 created=0 failed=1 "
+                      "stale=0 corrupt=0 seed=0 user=0 merged=0 conflicts=0 rejected=0 duplicates=0 "
+                      "reason=device/root-signature/hash unavailable",
+                      psoCachePath_, psoSeedPath_);
         return;
     }
-    PsoCacheScan scan = ScanPsoCache(psoCachePath_, rootSignatureHash_, true);
-    psoCacheValidBytes_ = scan.validBytes;
-    g_psoCacheCounters.prewarmExamined.fetch_add(scan.examined, std::memory_order_relaxed);
-    g_psoCacheCounters.prewarmStale.fetch_add(scan.stale, std::memory_order_relaxed);
-    g_psoCacheCounters.prewarmCorrupt.fetch_add(scan.corrupt, std::memory_order_relaxed);
+    PsoCacheScan userScan;
+    if (!psoSeedOnly_)
+        userScan = ScanPsoCache(psoCachePath_, rootSignatureHash_, true);
+    const char* seedEnv = std::getenv("MCLA_NO_PSO_SEED");
+    const bool seedDisabled = seedEnv && seedEnv[0] == '1';
+    PsoCacheScan seedScan;
+    if (!seedDisabled)
+        seedScan = ScanPsoCache(psoSeedPath_, rootSignatureHash_, true, true);
+    psoCacheValidBytes_ = userScan.validBytes;
+    g_psoCacheCounters.prewarmExamined.fetch_add(userScan.examined + seedScan.examined, std::memory_order_relaxed);
+    g_psoCacheCounters.prewarmStale.fetch_add(userScan.stale + seedScan.stale, std::memory_order_relaxed);
+    g_psoCacheCounters.prewarmCorrupt.fetch_add(userScan.corrupt + seedScan.corrupt, std::memory_order_relaxed);
+    const size_t seedRecordCount = seedScan.rejected ? 0 : seedScan.records.size();
+    const size_t userRecordCount = userScan.records.size();
+    {
+        std::lock_guard<std::mutex> lock(persistMutex_);
+        for (const auto& record : userScan.records) persistedKeys_.insert(record.key);
+        for (size_t i = 0; i < seedRecordCount; ++i) seedKeys_.insert(seedScan.records[i].key);
+    }
+    MCLA_LOG_INFO("PSO-SEED-SCAN #0 enabled={} path={} records={} examined={} stale={} corrupt={} conflicts={} rejected={}",
+                  seedDisabled ? 0 : 1, psoSeedPath_, seedRecordCount, seedScan.examined,
+                  seedScan.stale, seedScan.corrupt, seedScan.conflicts, seedScan.rejected ? 1 : 0);
+    if (seedScan.rejected)
+        MCLA_LOG_WARN("PSO-SEED-REJECTED #0 path={} examined={} stale={} corrupt={} conflicts={} "
+                      "-- whole seed ignored; startup continues without it",
+                      psoSeedPath_, seedScan.examined, seedScan.stale, seedScan.corrupt, seedScan.conflicts);
+
+    PsoCacheScan scan;
+    scan.records.reserve(seedRecordCount + userRecordCount);
+    scan.recordPayloads.reserve(seedRecordCount + userRecordCount);
+    scan.examined = userScan.examined + seedScan.examined;
+    std::vector<uint8_t> seedOrigin;
+    seedOrigin.reserve(seedRecordCount + userRecordCount);
+    std::unordered_map<PipelineKey, size_t, PipelineKeyHash> mergedIndex;
+    mergedIndex.reserve(seedRecordCount + userRecordCount);
+    auto appendMerged = [&](PsoDescription& record, std::vector<uint8_t>& payload, bool fromSeed) {
+        mergedIndex.emplace(record.key, scan.records.size());
+        scan.records.push_back(std::move(record));
+        scan.recordPayloads.push_back(std::move(payload));
+        seedOrigin.push_back(fromSeed ? 1u : 0u);
+    };
+    for (size_t i = 0; i < seedRecordCount; ++i)
+        appendMerged(seedScan.records[i], seedScan.recordPayloads[i], true);
+    uint64_t crossDuplicates = 0;
+    uint64_t crossConflicts = 0;
+    for (size_t i = 0; i < userRecordCount; ++i) {
+        auto existing = mergedIndex.find(userScan.records[i].key);
+        if (existing == mergedIndex.end()) {
+            appendMerged(userScan.records[i], userScan.recordPayloads[i], false);
+        } else if (scan.recordPayloads[existing->second] == userScan.recordPayloads[i]) {
+            ++crossDuplicates;
+        } else {
+            ++crossConflicts;
+            if (ShouldLogPsoCensus(crossConflicts))
+                MCLA_LOG_WARN("PSO-SEED-CONFLICT #{} key={:016X} winner=seed -- valid user duplicate discarded",
+                              crossConflicts, HashPipelineKey(userScan.records[i].key));
+        }
+    }
+    scan.duplicates = userScan.duplicates + seedScan.duplicates + crossDuplicates;
+    scan.conflicts = userScan.conflicts + seedScan.conflicts + crossConflicts;
+
     bool geometrySupported = geometryStageSupported_;
     if (!geometrySupported) {
         const D3D_FEATURE_LEVEL requested = D3D_FEATURE_LEVEL_11_0;
@@ -2708,7 +2844,7 @@ void PipelineCache::PrewarmPsoCache(Microsoft::WRL::ComPtr<ID3D12Device> device,
                 }
             }
             samplerMasks_[record.key] = smpMask;
-            prewarmedKeys_.insert(record.key);
+            prewarmSources_[record.key] = seedOrigin[i] ? PrewarmSource::kSeed : PrewarmSource::kUser;
         }
         {
             std::lock_guard<std::mutex> lock(statsMutex_);
@@ -2727,18 +2863,13 @@ void PipelineCache::PrewarmPsoCache(Microsoft::WRL::ComPtr<ID3D12Device> device,
         }
     }
 
-    {
-        std::lock_guard<std::mutex> lock(persistMutex_);
-        for (const auto& record : scan.records) {
-            persistedKeys_.insert(record.key);
-        }
-    }
-
-    MCLA_LOG_INFO("PSO-PREWARM #0 disabled=0 path={} records={} examined={} created={} failed={} "
-                  "stale={} corrupt={} threads={} positiveControl=1", psoCachePath_, scan.records.size(),
-                  scan.examined, g_psoCacheCounters.prewarmCreated.load(),
-                  g_psoCacheCounters.prewarmFailed.load(), g_psoCacheCounters.prewarmStale.load(),
-                  g_psoCacheCounters.prewarmCorrupt.load(), actualThreads);
+    MCLA_LOG_INFO("PSO-PREWARM #0 disabled=0 path={} seedPath={} records={} examined={} created={} failed={} "
+                  "stale={} corrupt={} threads={} seed={} user={} merged={} conflicts={} rejected={} duplicates={} positiveControl=1",
+                  psoCachePath_, psoSeedPath_, scan.records.size(), scan.examined,
+                  g_psoCacheCounters.prewarmCreated.load(), g_psoCacheCounters.prewarmFailed.load(),
+                  g_psoCacheCounters.prewarmStale.load(), g_psoCacheCounters.prewarmCorrupt.load(), actualThreads,
+                  seedRecordCount, userRecordCount, scan.records.size(), scan.conflicts,
+                  seedScan.rejected ? 1u : 0u, scan.duplicates);
 }
 
 bool PipelineCache::AppendPsoDescription(
@@ -2753,12 +2884,13 @@ bool PipelineCache::AppendPsoDescription(
         uint64_t rootSignatureHash) {
     const uint64_t attempt = g_psoCacheCounters.persistAttempts.fetch_add(1, std::memory_order_relaxed) + 1;
     const char* env = std::getenv("MCLA_NO_PSO_PERSIST");
-    if (env && env[0] == '1') {
+    if ((env && env[0] == '1') || psoSeedOnly_) {
         if (ShouldLogPsoCensus(attempt))
-            MCLA_LOG_INFO("PSO-PERSIST-SAVE #{} disabled=1 key={:016X} saved={} failed={}",
+            MCLA_LOG_INFO("PSO-PERSIST-SAVE #{} disabled=1 key={:016X} saved={} failed={} reason={}",
                           attempt, HashPipelineKey(task.key),
                           g_psoCacheCounters.persistSaved.load(),
-                          g_psoCacheCounters.persistFailed.load());
+                          g_psoCacheCounters.persistFailed.load(),
+                          psoSeedOnly_ ? "user-path-aliases-seed" : "environment");
         return false;
     }
 
@@ -2768,6 +2900,15 @@ bool PipelineCache::AppendPsoDescription(
     }();
 
     std::lock_guard<std::mutex> lock(persistMutex_);
+
+    if (seedKeys_.find(task.key) != seedKeys_.end()) {
+        const uint64_t skipped = g_psoCacheCounters.persistSkippedDedup.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (ShouldLogPsoCensus(skipped))
+            MCLA_LOG_INFO("PSO-PERSIST-SEED-KEY-SKIP #{} key={:016X} skipped={} saved={} -- seed keys never enter the user file",
+                          skipped, HashPipelineKey(task.key), skipped,
+                          g_psoCacheCounters.persistSaved.load());
+        return true;
+    }
 
     if (!s_noPersistDedup && persistedKeys_.find(task.key) != persistedKeys_.end()) {
         const uint64_t skipped = g_psoCacheCounters.persistSkippedDedup.fetch_add(1, std::memory_order_relaxed) + 1;
@@ -4644,13 +4785,15 @@ Microsoft::WRL::ComPtr<ID3D12PipelineState> PipelineCache::GetOrCompile(
                         (key.state.geometryStage == kGeomStageRectangleList);
                 }
                 if (outMapHit) *outMapHit = true;
-                if (prewarmedKeys_.count(key)) {
+                const auto prewarm = prewarmSources_.find(key);
+                if (prewarm != prewarmSources_.end()) {
                     const uint64_t n = g_psoCacheCounters.prewarmHits.fetch_add(
                         1, std::memory_order_relaxed) + 1;
                     if (ShouldLogPsoCensus(n)) {
-                        MCLA_LOG_INFO("PC-PSO-PREWARM-HIT #{} key={:016X} totalHits={} "
+                        MCLA_LOG_INFO("PC-PSO-PREWARM-HIT #{} key={:016X} source={} totalHits={} "
                                       "prewarmFailed={} persistFailed={} -- no psoWait",
-                                      n, HashPipelineKey(key), n,
+                                      n, HashPipelineKey(key),
+                                      prewarm->second == PrewarmSource::kSeed ? "seed" : "user", n,
                                       g_psoCacheCounters.prewarmFailed.load(),
                                       g_psoCacheCounters.persistFailed.load());
                     }
@@ -4976,7 +5119,7 @@ void PipelineCache::Insert(const PipelineKey& key, Microsoft::WRL::ComPtr<ID3D12
         generation_.fetch_add(1, std::memory_order_release);
         cbvBindings_.erase(oldest);
         samplerMasks_.erase(oldest);
-        prewarmedKeys_.erase(oldest);
+        prewarmSources_.erase(oldest);
         order_.erase(order_.begin());
         {
             std::lock_guard<std::mutex> qlock(queueMutex_);
@@ -4996,7 +5139,7 @@ void PipelineCache::Clear() {
     generation_.fetch_add(1, std::memory_order_release);
     cbvBindings_.clear();
     samplerMasks_.clear();
-    prewarmedKeys_.clear();
+    prewarmSources_.clear();
     order_.clear();
     {
         std::lock_guard<std::mutex> qlock(queueMutex_);
