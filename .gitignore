@@ -1,0 +1,149 @@
+# Build output
+/build/
+/build_pathb/
+/pathb/
+/build-smoke/
+/build-standalone/
+
+# Derived / regenerable
+# NOTE: /docs/ was ignored here until 2026-09-20. It is NOT regenerable — it is the
+# cross-session handoff trail, and it has already been lost once to `git clean -xdf`.
+# Every doc had to be `git add -f`'d individually. Do not re-ignore it.
+/game_data/
+/mcla extracted cache/
+/.research/
+/_archive/
+
+# Binaries / downloaded
+/SDL3.zip
+/SDL3_extract/
+# NOTE: /tools/ was ignored here until 2026-09-20 (it once held downloaded binaries).
+# It now holds source: the phase-gate validators, the RE scripts that back the
+# raw-byte rule, and tools/xenonrecomp_local.patch — the only preserved copy of the
+# JTS-TAILCALL recompiler patch. Ignoring it hid 16 files from `git status` entirely.
+# Do not re-ignore it; ignore specific binary subpaths instead if one ever appears.
+rexglue-sdk/
+*.exe
+*.dll
+
+# Logs / dumps / crash artifacts
+*.log
+*.dmp
+*.tracy
+crash_dump.txt
+crash_log_early.txt
+boot_stderr*.log
+boot_stdout*.log
+boot_test_capture.png
+/logs/
+
+# Build artifacts
+*.obj
+*.d
+*.pid
+*.err
+ninja_out.txt
+ninja_err.txt
+build_s74.txt
+build_log.txt
+build_err.txt
+build_out.txt
+cache/
+
+# Generated / regenerable source
+generated/
+generated/default/mcla_recomp.*.cpp
+generated/default/func_lookup.clixml
+
+# SDL3 binaries
+third_party/SDL3/SDL3-3.2.6/lib/
+third_party/SDL3/lib/
+
+# Archives
+*.tar.gz
+*.tgz
+*.zip
+*.gz
+
+# AI tooling (local only)
+.opencode/
+# Machine-local agent skill copies are excluded in .git/info/exclude.
+.clinerules/
+.mcp.json
+# NOTE: /.qoder/ is deliberately NOT ignored - it holds AGENTS-facing project config
+# (.qoder/settings.json = project MCP servers, .qoder/skills/ = the five workflow skills)
+# that must survive a clone. Only per-machine overrides stay local.
+/.qoder/settings.local.json
+
+# Local tooling / caches
+.cache/
+.freebuff/
+.vscode/
+
+# Local config
+/opencode.json
+/config/opencode.json
+/config/config.json
+
+# OS / editor
+Thumbs.db
+.DS_Store
+
+# Python bytecode from tools/*.py (the audit scripts import each other)
+__pycache__/
+*.pyc
+
+
+# MSVC link byproducts (regenerable in build/; root copies are strays) — added 2026-10-01 audit
+*.pdb
+*.ilk
+rea-mcp.cmd
+
+
+# Non-build project files (excluded per owner: build requirements only)
+/docs/
+/MEMORY.md
+/CODE_OPTIMIZATION_PLAN.md
+/AGENTS.md
+/opencode.json
+/.qoder/
+
+# Scratch dumps, game ISO extract, and regenerable tool artifacts
+d3d12_frame_*.bmp
+texdump_*.bin
+texdump_*.png
+vb_raw_*.bin
+waveletNoiseTile.bin
+toc_leaves.csv
+_scratch_root/
+tmp_ida/
+scratch_ida/
+probe_*.py
+/Midnight Club - Los Angeles - Complete Edition (USA, Europe)/
+tools/renderdoc/
+tools/installer/payload/
+tools/installer/_wix/
+tools/installer/*.msi
+tools/installer/*.wixpdb
+tools/translator_probe/obj/
+
+# Local artifact dumps and scratch (added 2026-11-26; not build requirements)
+/build-clang/
+/dxil_cache/
+/off/
+/scratch/
+/scratch_*.dxil
+/brain_diff.patch
+
+# Non-build artifacts (added 2026-11-26): local only, never pushed
+/owner_reports/
+/shaders/
+/0x821378B8/
+/audlo_toc.bin
+/pc-mcla-recomp-icon-*.png
+/tools/e2e/
+/tools/installer/
+/tools/translator_probe/dump_fixed/
+
+# Generated validator output: local only
+/tools/validators/texture_quad_shaders_gen.h

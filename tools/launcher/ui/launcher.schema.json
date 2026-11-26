@@ -1,0 +1,1981 @@
+{
+  "$schema": "mcla-launcher-schema-v1",
+  "window": {
+    "width": 650,
+    "height": 446,
+    "resizable": false,
+    "transparent": true,
+    "decorations": false,
+    "alwaysOnTop": false
+  },
+  "storageKey": "mcla_toml_config_v1",
+  "tabs": [
+    {
+      "id": "main",
+      "title": "LAUNCHER",
+      "icon": "play",
+      "visible": true,
+      "isHome": true,
+      "items": [
+        {
+          "id": "play",
+          "type": "action",
+          "visible": true,
+          "label": "PLAY",
+          "sub": "LAUNCH MCLA.EXE (MCLA-RECOMP)",
+          "action": "launchGame"
+        },
+        {
+          "id": "nav_display",
+          "type": "nav",
+          "visible": true,
+          "label": "DISPLAY & VIDEO",
+          "targetTab": "display"
+        },
+        {
+          "id": "nav_graphics",
+          "type": "nav",
+          "visible": true,
+          "label": "GRAPHICS & SHADOWS",
+          "targetTab": "graphics"
+        },
+        {
+          "id": "nav_controls",
+          "type": "nav",
+          "visible": true,
+          "label": "CONTROLS & KEYMAP",
+          "targetTab": "controls"
+        },
+        {
+          "id": "nav_tuning",
+          "type": "nav",
+          "visible": true,
+          "label": "TUNING & PERF",
+          "targetTab": "tuning"
+        },
+        {
+          "id": "nav_more",
+          "type": "nav",
+          "visible": true,
+          "label": "MORE & TOOLS",
+          "targetTab": "files"
+        },
+        {
+          "id": "exit",
+          "type": "action",
+          "visible": true,
+          "label": "EXIT LAUNCHER",
+          "action": "exitLauncher"
+        }
+      ]
+    },
+    {
+      "id": "display",
+      "title": "DISPLAY",
+      "icon": "display",
+      "visible": true,
+      "subHeaderLeft": "< MCLA.TOML // DISPLAY >",
+      "subHeaderRight": "D3D12",
+      "options": [
+        {
+          "key": "display_mode",
+          "label": "DISPLAY MODE",
+          "type": "cycle",
+          "visible": true,
+          "values": [
+            "BORDERLESS FULLSCREEN",
+            "WINDOWED",
+            "EXCLUSIVE FULLSCREEN"
+          ],
+          "default": "BORDERLESS FULLSCREEN",
+          "tomlSection": "display",
+          "valueMap": {
+            "BORDERLESS FULLSCREEN": "borderless_fullscreen",
+            "WINDOWED": "windowed",
+            "EXCLUSIVE FULLSCREEN": "fullscreen"
+          }
+        },
+        {
+          "key": "renderer_mode",
+          "label": "RENDERER",
+          "type": "cycle",
+          "visible": true,
+          "values": [
+            "native",
+            "legacy",
+            "capture"
+          ],
+          "default": "native",
+          "tomlSection": "graphics",
+          "valueMap": {
+            "native": "native",
+            "legacy": "legacy",
+            "capture": "capture"
+          }
+        },
+        {
+          "key": "resolution_preset",
+          "label": "WINDOW RESOLUTION",
+          "type": "cycle",
+          "visible": true,
+          "values": [
+            "1280x720 (720P)",
+            "1920x1080 (1080P)",
+            "2560x1440 (1440P)",
+            "3840x2160 (4K)"
+          ],
+          "default": "2560x1440 (1440P)",
+          "tomlSection": "_env",
+          "valueMap": {
+            "1280x720 (720P)": "1280x720",
+            "1920x1080 (1080P)": "1920x1080",
+            "2560x1440 (1440P)": "2560x1440",
+            "3840x2160 (4K)": "3840x2160"
+          }
+        },
+        {
+          "key": "resolution_scale",
+          "label": "RENDER SCALE",
+          "type": "cycle",
+          "visible": true,
+          "values": [
+            "1x (720P)",
+            "2x (1440P)",
+            "3x (4K)"
+          ],
+          "default": "2x (1440P)",
+          "valueMap": {
+            "1x (720P)": 1,
+            "2x (1440P)": 2,
+            "3x (4K)": 3
+          },
+          "tomlSection": "display"
+        },
+        {
+          "key": "mcla_fps",
+          "label": "FPS LIMIT",
+          "type": "cycle",
+          "visible": true,
+          "values": [
+            "30",
+            "60",
+            "120",
+            "UNCAPPED",
+            "STOCK"
+          ],
+          "default": "60",
+          "tomlSection": "game",
+          "valueMap": {
+            "30": "30",
+            "60": "60",
+            "120": "120",
+            "UNCAPPED": "uncapped",
+            "STOCK": "0"
+          }
+        },
+        {
+          "key": "fullscreen",
+          "label": "FULLSCREEN",
+          "type": "cycle",
+          "visible": true,
+          "values": [
+            "ON",
+            "OFF"
+          ],
+          "default": "ON",
+          "tomlSection": "display",
+          "valueMap": {
+            "ON": true,
+            "OFF": false
+          }
+        },
+        {
+          "key": "MCLA_SMALL_FS_SWAP",
+          "label": "720P BACKBUFFER",
+          "type": "cycle",
+          "visible": true,
+          "values": [
+            "ON",
+            "OFF"
+          ],
+          "default": "OFF",
+          "valueMap": {
+            "ON": 1,
+            "OFF": 0
+          },
+          "tomlSection": "_env"
+        },
+        {
+          "key": "vsync",
+          "label": "V-SYNC",
+          "type": "cycle",
+          "visible": true,
+          "values": [
+            "ON",
+            "OFF"
+          ],
+          "default": "OFF",
+          "valueMap": {
+            "ON": true,
+            "OFF": false
+          },
+          "tomlSection": "display"
+        },
+        {
+          "key": "mcla_aspect_ratio",
+          "label": "ASPECT RATIO",
+          "type": "cycle",
+          "visible": true,
+          "values": [
+            "auto",
+            "16:9",
+            "16:10",
+            "43:18"
+          ],
+          "default": "auto",
+          "tomlSection": "display",
+          "valueMap": {
+            "auto": "auto",
+            "16:9": "16:9",
+            "16:10": "16:10",
+            "43:18": "43:18"
+          }
+        },
+        {
+          "key": "mcla_display_gamma",
+          "label": "DISPLAY GAMMA",
+          "type": "cycle",
+          "visible": true,
+          "values": [
+            "tv",
+            "pc"
+          ],
+          "default": "tv",
+          "tomlSection": "display",
+          "valueMap": {
+            "tv": "tv",
+            "pc": "pc"
+          }
+        },
+        {
+          "key": "mcla_motion_blur",
+          "label": "MOTION BLUR",
+          "type": "cycle",
+          "visible": true,
+          "values": [
+            "ON",
+            "OFF"
+          ],
+          "default": "ON",
+          "tomlSection": "display",
+          "valueMap": {
+            "ON": true,
+            "OFF": false
+          }
+        },
+        {
+          "key": "mcla_depth_of_field",
+          "label": "DEPTH OF FIELD",
+          "type": "cycle",
+          "visible": true,
+          "values": [
+            "ON",
+            "OFF"
+          ],
+          "default": "ON",
+          "tomlSection": "display",
+          "valueMap": {
+            "ON": true,
+            "OFF": false
+          }
+        },
+        {
+          "key": "mcla_hide_cursor",
+          "label": "HIDE CURSOR",
+          "type": "cycle",
+          "visible": true,
+          "values": [
+            "ON",
+            "OFF"
+          ],
+          "default": "ON",
+          "tomlSection": "controls",
+          "valueMap": {
+            "ON": true,
+            "OFF": false
+          }
+        },
+        {
+          "key": "mcla_d3d12_msaa_line_guard",
+          "label": "MSAA LINE GUARD",
+          "type": "cycle",
+          "visible": false,
+          "values": [
+            "AUTO",
+            "OFF",
+            "ON"
+          ],
+          "default": "AUTO",
+          "tomlSection": "graphics",
+          "valueMap": {
+            "AUTO": -1,
+            "OFF": 0,
+            "ON": 1
+          }
+        }
+      ]
+    },
+    {
+      "id": "graphics",
+      "title": "GRAPHICS",
+      "icon": "graphics",
+      "visible": true,
+      "subHeaderLeft": "< MCLA.TOML // GRAPHICS >",
+      "subHeaderRight": "SHADOWS / ADVANCED",
+      "options": [
+        {
+          "key": "mcla_lod_scale",
+          "label": "LOD SCALE",
+          "type": "slider",
+          "visible": true,
+          "default": 1.0,
+          "tomlSection": "graphics",
+          "min": 0.25,
+          "max": 2.0,
+          "step": 0.05
+        },
+        {
+          "key": "mcla_flow_lod",
+          "label": "FLOW LOD",
+          "type": "slider",
+          "visible": false,
+          "default": 1.0,
+          "tomlSection": "graphics",
+          "min": 0.25,
+          "max": 2.0,
+          "step": 0.05
+        },
+        {
+          "key": "MCLA_DEV_NORACESHADOWS",
+          "label": "DISABLE RACE SHADOWS",
+          "type": "cycle",
+          "visible": false,
+          "values": [
+            "ON",
+            "OFF"
+          ],
+          "default": "ON",
+          "valueMap": {
+            "ON": true,
+            "OFF": false
+          },
+          "tomlSection": "_env"
+        },
+        {
+          "key": "MCLA_DEV_FASTVEHSHADOWS",
+          "label": "FAST CAR SHADOWS",
+          "type": "cycle",
+          "visible": false,
+          "values": [
+            "ON",
+            "OFF"
+          ],
+          "default": "OFF",
+          "valueMap": {
+            "ON": true,
+            "OFF": false
+          },
+          "tomlSection": "_env"
+        },
+        {
+          "key": "mcla_shadows",
+          "label": "SHADOWS (RESTART)",
+          "type": "cycle",
+          "visible": true,
+          "values": [
+            "ON",
+            "OFF"
+          ],
+          "default": "ON",
+          "tomlSection": "renderer",
+          "valueMap": {
+            "ON": true,
+            "OFF": false
+          }
+        },
+        {
+          "key": "mcla_ambient_occlusion",
+          "label": "AMBIENT OCCLUSION (RESTART)",
+          "type": "cycle",
+          "visible": true,
+          "values": [
+            "ON",
+            "OFF"
+          ],
+          "default": "ON",
+          "tomlSection": "renderer",
+          "valueMap": {
+            "ON": true,
+            "OFF": false
+          }
+        },
+        {
+          "key": "mcla_race_shadows",
+          "label": "RACE SHADOWS (cvar)",
+          "type": "cycle",
+          "visible": true,
+          "values": [
+            "ON",
+            "OFF"
+          ],
+          "default": "ON",
+          "tomlSection": "renderer",
+          "valueMap": {
+            "ON": true,
+            "OFF": false
+          }
+        },
+        {
+          "key": "mcla_fast_car_shadows",
+          "label": "FAST CAR SHADOWS (cvar)",
+          "type": "cycle",
+          "visible": true,
+          "values": [
+            "ON",
+            "OFF"
+          ],
+          "default": "OFF",
+          "tomlSection": "renderer",
+          "valueMap": {
+            "ON": true,
+            "OFF": false
+          }
+        },
+        {
+          "key": "mcla_foliage_impostors",
+          "label": "FOLIAGE IMPOSTORS",
+          "type": "cycle",
+          "visible": true,
+          "values": [
+            "ON",
+            "OFF"
+          ],
+          "default": "ON",
+          "tomlSection": "renderer",
+          "valueMap": {
+            "ON": true,
+            "OFF": false
+          }
+        },
+        {
+          "key": "mcla_fullscreen_blur",
+          "label": "FULLSCREEN BLUR",
+          "type": "cycle",
+          "visible": true,
+          "values": [
+            "ON",
+            "OFF"
+          ],
+          "default": "ON",
+          "tomlSection": "renderer",
+          "valueMap": {
+            "ON": true,
+            "OFF": false
+          }
+        },
+        {
+          "key": "MCLA_NO_GAMMA_LUT",
+          "label": "DISPLAY GAMMA LUT",
+          "type": "cycle",
+          "visible": true,
+          "values": [
+            "ON",
+            "OFF"
+          ],
+          "default": "ON",
+          "valueMap": {
+            "ON": 0,
+            "OFF": 1
+          },
+          "tomlSection": "_env"
+        },
+        {
+          "key": "MCLA_NO_RESOLVED_MIPS",
+          "label": "RESOLVED TEXTURE MIPS",
+          "type": "cycle",
+          "visible": true,
+          "values": [
+            "ON",
+            "OFF"
+          ],
+          "default": "ON",
+          "valueMap": {
+            "ON": 0,
+            "OFF": 1
+          },
+          "tomlSection": "_env"
+        },
+        {
+          "key": "MCLA_NO_CPUEXPAND_MIPS",
+          "label": "CPU TEXTURE MIPS",
+          "type": "cycle",
+          "visible": true,
+          "values": [
+            "ON",
+            "OFF"
+          ],
+          "default": "ON",
+          "valueMap": {
+            "ON": 0,
+            "OFF": 1
+          },
+          "tomlSection": "_env"
+        },
+        {
+          "key": "MCLA_NO_OCCLUSION_QUERY",
+          "label": "HARDWARE OCCLUSION CULLING",
+          "type": "cycle",
+          "visible": true,
+          "values": [
+            "ON",
+            "OFF"
+          ],
+          "default": "ON",
+          "valueMap": {
+            "ON": 0,
+            "OFF": 1
+          },
+          "tomlSection": "_env"
+        },
+        {
+          "key": "mcla_settings_menu",
+          "label": "IN-GAME SETTINGS MENU",
+          "type": "cycle",
+          "visible": true,
+          "values": [
+            "ON",
+            "OFF"
+          ],
+          "default": "ON",
+          "tomlSection": "ui",
+          "valueMap": {
+            "ON": true,
+            "OFF": false
+          }
+        }
+      ]
+    },
+    {
+      "id": "controls",
+      "title": "CONTROLS",
+      "icon": "controls",
+      "visible": true,
+      "subHeaderLeft": "< KEYMAP // EACH KEY = ONE GAMEPAD BUTTON >",
+      "subHeaderRight": "GUEST DECIDES BY SCREEN",
+      "options": [
+        {
+          "key": "mcla_button_prompts",
+          "label": "BUTTON PROMPTS",
+          "type": "cycle",
+          "visible": true,
+          "values": [
+            "auto",
+            "xbox",
+            "ps"
+          ],
+          "default": "auto",
+          "tomlSection": "input",
+          "valueMap": {
+            "auto": "auto",
+            "xbox": "xbox",
+            "ps": "ps",
+            "pc": "pc"
+          }
+        },
+        {
+          "key": "MCLA_BTN_PROMPTS_FIX",
+          "label": "BUTTON PROMPT OVERRIDE",
+          "type": "cycle",
+          "visible": false,
+          "values": [
+            "ON",
+            "OFF"
+          ],
+          "default": "OFF",
+          "valueMap": {
+            "ON": 1,
+            "OFF": 0
+          },
+          "tomlSection": "_env"
+        },
+        {
+          "key": "MCLA_BTN_PROMPTS_PS",
+          "label": "PLAYSTATION GLYPHS (OVERRIDE)",
+          "type": "cycle",
+          "visible": false,
+          "values": [
+            "ON",
+            "OFF"
+          ],
+          "default": "OFF",
+          "valueMap": {
+            "ON": 1,
+            "OFF": 0
+          },
+          "tomlSection": "_env"
+        },
+        {
+          "key": "mcla_vibration",
+          "label": "VIBRATION",
+          "type": "cycle",
+          "visible": true,
+          "values": [
+            "ON",
+            "OFF"
+          ],
+          "default": "ON",
+          "tomlSection": "input",
+          "valueMap": {
+            "ON": true,
+            "OFF": false
+          }
+        },
+        {
+          "key": "mcla_left_stick_deadzone",
+          "label": "LEFT DEADZONE",
+          "type": "slider",
+          "visible": true,
+          "default": 24.0,
+          "tomlSection": "input",
+          "min": 0,
+          "max": 30,
+          "step": 1
+        },
+        {
+          "key": "mcla_right_stick_deadzone",
+          "label": "RIGHT DEADZONE",
+          "type": "slider",
+          "visible": true,
+          "default": 24.0,
+          "tomlSection": "input",
+          "min": 0,
+          "max": 30,
+          "step": 1
+        },
+        {
+          "key": "mcla_script_pad_latch_ms",
+          "label": "PAD LATCH (ms)",
+          "type": "slider",
+          "visible": true,
+          "default": 100,
+          "tomlSection": "input",
+          "min": 0,
+          "max": 500,
+          "step": 10
+        },
+        {
+          "key": "mcla_key_throttle",
+          "label": "RT - RIGHT TRIGGER",
+          "type": "cycle",
+          "values": [
+            "W",
+            "A",
+            "S",
+            "D",
+            "Up",
+            "Down",
+            "Left",
+            "Right",
+            "Return",
+            "Escape",
+            "Space",
+            "Tab",
+            "Q",
+            "E",
+            "C",
+            "V",
+            "B",
+            "F",
+            "1",
+            "2",
+            "I",
+            "J",
+            "K",
+            "L",
+            "U",
+            "O",
+            "LShift",
+            "LCtrl"
+          ],
+          "default": "W",
+          "tomlSection": "input",
+          "visible": true
+        },
+        {
+          "key": "mcla_key_brake",
+          "label": "LT - LEFT TRIGGER",
+          "type": "cycle",
+          "values": [
+            "S",
+            "W",
+            "A",
+            "D",
+            "Up",
+            "Down",
+            "Left",
+            "Right",
+            "Return",
+            "Escape",
+            "Space",
+            "Tab",
+            "Q",
+            "E",
+            "C",
+            "V",
+            "B",
+            "F",
+            "1",
+            "2",
+            "I",
+            "J",
+            "K",
+            "L",
+            "U",
+            "O",
+            "LShift",
+            "LCtrl"
+          ],
+          "default": "S",
+          "tomlSection": "input",
+          "visible": true
+        },
+        {
+          "key": "mcla_key_steer_left",
+          "label": "LEFT STICK LEFT",
+          "type": "cycle",
+          "values": [
+            "A",
+            "W",
+            "S",
+            "D",
+            "Up",
+            "Down",
+            "Left",
+            "Right",
+            "Return",
+            "Escape",
+            "Space",
+            "Tab",
+            "Q",
+            "E",
+            "C",
+            "V",
+            "B",
+            "F",
+            "1",
+            "2",
+            "I",
+            "J",
+            "K",
+            "L",
+            "U",
+            "O",
+            "LShift",
+            "LCtrl"
+          ],
+          "default": "A",
+          "tomlSection": "input",
+          "visible": true
+        },
+        {
+          "key": "mcla_key_steer_right",
+          "label": "LEFT STICK RIGHT",
+          "type": "cycle",
+          "values": [
+            "D",
+            "W",
+            "A",
+            "S",
+            "Up",
+            "Down",
+            "Left",
+            "Right",
+            "Return",
+            "Escape",
+            "Space",
+            "Tab",
+            "Q",
+            "E",
+            "C",
+            "V",
+            "B",
+            "F",
+            "1",
+            "2",
+            "I",
+            "J",
+            "K",
+            "L",
+            "U",
+            "O",
+            "LShift",
+            "LCtrl"
+          ],
+          "default": "D",
+          "tomlSection": "input",
+          "visible": true
+        },
+        {
+          "key": "mcla_key_x",
+          "label": "X - WEST BUTTON",
+          "type": "cycle",
+          "values": [
+            "C",
+            "W",
+            "A",
+            "S",
+            "D",
+            "Up",
+            "Down",
+            "Left",
+            "Right",
+            "Return",
+            "Escape",
+            "Space",
+            "Tab",
+            "Q",
+            "E",
+            "V",
+            "B",
+            "F",
+            "1",
+            "2",
+            "I",
+            "J",
+            "K",
+            "L",
+            "U",
+            "O",
+            "LShift",
+            "LCtrl"
+          ],
+          "default": "C",
+          "tomlSection": "input",
+          "visible": true
+        },
+        {
+          "key": "mcla_key_right_shoulder",
+          "label": "RB - RIGHT SHOULDER",
+          "type": "cycle",
+          "values": [
+            "E",
+            "W",
+            "A",
+            "S",
+            "D",
+            "Up",
+            "Down",
+            "Left",
+            "Right",
+            "Return",
+            "Escape",
+            "Space",
+            "Tab",
+            "Q",
+            "C",
+            "V",
+            "B",
+            "F",
+            "1",
+            "2",
+            "I",
+            "J",
+            "K",
+            "L",
+            "U",
+            "O",
+            "LShift",
+            "LCtrl"
+          ],
+          "default": "E",
+          "tomlSection": "input",
+          "visible": true
+        },
+        {
+          "key": "mcla_key_left_thumb",
+          "label": "LS - LEFT STICK CLICK",
+          "type": "cycle",
+          "values": [
+            "1",
+            "W",
+            "A",
+            "S",
+            "D",
+            "Up",
+            "Down",
+            "Left",
+            "Right",
+            "Return",
+            "Escape",
+            "Space",
+            "Tab",
+            "Q",
+            "E",
+            "C",
+            "V",
+            "B",
+            "F",
+            "2",
+            "I",
+            "J",
+            "K",
+            "L",
+            "U",
+            "O",
+            "LShift",
+            "LCtrl"
+          ],
+          "default": "1",
+          "tomlSection": "input",
+          "visible": true
+        },
+        {
+          "key": "mcla_key_dpad_up",
+          "label": "D-PAD UP",
+          "type": "cycle",
+          "values": [
+            "Up",
+            "W",
+            "A",
+            "S",
+            "D",
+            "Down",
+            "Left",
+            "Right",
+            "Return",
+            "Escape",
+            "Space",
+            "Tab",
+            "Q",
+            "E",
+            "C",
+            "V",
+            "B",
+            "F",
+            "1",
+            "2",
+            "I",
+            "J",
+            "K",
+            "L",
+            "U",
+            "O",
+            "LShift",
+            "LCtrl"
+          ],
+          "default": "Up",
+          "tomlSection": "input",
+          "visible": true
+        },
+        {
+          "key": "mcla_key_dpad_down",
+          "label": "D-PAD DOWN",
+          "type": "cycle",
+          "values": [
+            "Down",
+            "W",
+            "A",
+            "S",
+            "D",
+            "Up",
+            "Left",
+            "Right",
+            "Return",
+            "Escape",
+            "Space",
+            "Tab",
+            "Q",
+            "E",
+            "C",
+            "V",
+            "B",
+            "F",
+            "1",
+            "2",
+            "I",
+            "J",
+            "K",
+            "L",
+            "U",
+            "O",
+            "LShift",
+            "LCtrl"
+          ],
+          "default": "Down",
+          "tomlSection": "input",
+          "visible": true
+        },
+        {
+          "key": "mcla_key_dpad_left",
+          "label": "D-PAD LEFT",
+          "type": "cycle",
+          "values": [
+            "Left",
+            "W",
+            "A",
+            "S",
+            "D",
+            "Up",
+            "Down",
+            "Right",
+            "Return",
+            "Escape",
+            "Space",
+            "Tab",
+            "Q",
+            "E",
+            "C",
+            "V",
+            "B",
+            "F",
+            "1",
+            "2",
+            "I",
+            "J",
+            "K",
+            "L",
+            "U",
+            "O",
+            "LShift",
+            "LCtrl"
+          ],
+          "default": "Left",
+          "tomlSection": "input",
+          "visible": true
+        },
+        {
+          "key": "mcla_key_dpad_right",
+          "label": "D-PAD RIGHT",
+          "type": "cycle",
+          "values": [
+            "Right",
+            "W",
+            "A",
+            "S",
+            "D",
+            "Up",
+            "Down",
+            "Left",
+            "Return",
+            "Escape",
+            "Space",
+            "Tab",
+            "Q",
+            "E",
+            "C",
+            "V",
+            "B",
+            "F",
+            "1",
+            "2",
+            "I",
+            "J",
+            "K",
+            "L",
+            "U",
+            "O",
+            "LShift",
+            "LCtrl"
+          ],
+          "default": "Right",
+          "tomlSection": "input",
+          "visible": true
+        },
+        {
+          "key": "mcla_key_a",
+          "label": "A - SOUTH BUTTON",
+          "type": "cycle",
+          "values": [
+            "Return",
+            "W",
+            "A",
+            "S",
+            "D",
+            "Up",
+            "Down",
+            "Left",
+            "Right",
+            "Escape",
+            "Space",
+            "Tab",
+            "Q",
+            "E",
+            "C",
+            "V",
+            "B",
+            "F",
+            "1",
+            "2",
+            "I",
+            "J",
+            "K",
+            "L",
+            "U",
+            "O",
+            "LShift",
+            "LCtrl"
+          ],
+          "default": "Return",
+          "tomlSection": "input",
+          "visible": true
+        },
+        {
+          "key": "mcla_key_b",
+          "label": "B - EAST BUTTON",
+          "type": "cycle",
+          "values": [
+            "Escape",
+            "W",
+            "A",
+            "S",
+            "D",
+            "Up",
+            "Down",
+            "Left",
+            "Right",
+            "Return",
+            "Space",
+            "Tab",
+            "Q",
+            "E",
+            "C",
+            "V",
+            "B",
+            "F",
+            "1",
+            "2",
+            "I",
+            "J",
+            "K",
+            "L",
+            "U",
+            "O",
+            "LShift",
+            "LCtrl"
+          ],
+          "default": "Escape",
+          "tomlSection": "input",
+          "visible": true
+        },
+        {
+          "key": "mcla_key_start",
+          "label": "START BUTTON",
+          "type": "cycle",
+          "values": [
+            "Tab",
+            "W",
+            "A",
+            "S",
+            "D",
+            "Up",
+            "Down",
+            "Left",
+            "Right",
+            "Return",
+            "Escape",
+            "Space",
+            "Q",
+            "E",
+            "C",
+            "V",
+            "B",
+            "F",
+            "1",
+            "2",
+            "I",
+            "J",
+            "K",
+            "L",
+            "U",
+            "O",
+            "LShift",
+            "LCtrl"
+          ],
+          "default": "Tab",
+          "tomlSection": "input",
+          "visible": true
+        },
+        {
+          "key": "mcla_key_back",
+          "label": "BACK BUTTON",
+          "type": "cycle",
+          "values": [
+            "B",
+            "W",
+            "A",
+            "S",
+            "D",
+            "Up",
+            "Down",
+            "Left",
+            "Right",
+            "Return",
+            "Escape",
+            "Space",
+            "Tab",
+            "Q",
+            "E",
+            "C",
+            "V",
+            "F",
+            "1",
+            "2",
+            "I",
+            "J",
+            "K",
+            "L",
+            "U",
+            "O",
+            "LShift",
+            "LCtrl"
+          ],
+          "default": "B",
+          "tomlSection": "input",
+          "visible": true
+        },
+        {
+          "key": "mcla_key_y",
+          "label": "Y - NORTH BUTTON",
+          "type": "cycle",
+          "values": [
+            "V",
+            "W",
+            "A",
+            "S",
+            "D",
+            "Up",
+            "Down",
+            "Left",
+            "Right",
+            "Return",
+            "Escape",
+            "Space",
+            "Tab",
+            "Q",
+            "E",
+            "C",
+            "B",
+            "F",
+            "1",
+            "2",
+            "I",
+            "J",
+            "K",
+            "L",
+            "U",
+            "O",
+            "LShift",
+            "LCtrl"
+          ],
+          "default": "V",
+          "tomlSection": "input",
+          "visible": true
+        },
+        {
+          "key": "mcla_key_right_thumb",
+          "label": "RS - RIGHT STICK CLICK",
+          "type": "cycle",
+          "values": [
+            "2",
+            "W",
+            "A",
+            "S",
+            "D",
+            "Up",
+            "Down",
+            "Left",
+            "Right",
+            "Return",
+            "Escape",
+            "Space",
+            "Tab",
+            "Q",
+            "E",
+            "C",
+            "V",
+            "B",
+            "F",
+            "1",
+            "I",
+            "J",
+            "K",
+            "L",
+            "U",
+            "O",
+            "LShift",
+            "LCtrl"
+          ],
+          "default": "2",
+          "tomlSection": "input",
+          "visible": true
+        },
+        {
+          "key": "mcla_key_ry_up",
+          "label": "RIGHT STICK UP",
+          "type": "cycle",
+          "values": [
+            "I",
+            "W",
+            "A",
+            "S",
+            "D",
+            "Up",
+            "Down",
+            "Left",
+            "Right",
+            "Return",
+            "Escape",
+            "Space",
+            "Tab",
+            "Q",
+            "E",
+            "C",
+            "V",
+            "B",
+            "F",
+            "1",
+            "2",
+            "J",
+            "K",
+            "L",
+            "U",
+            "O",
+            "LShift",
+            "LCtrl"
+          ],
+          "default": "I",
+          "tomlSection": "input",
+          "visible": true
+        },
+        {
+          "key": "mcla_key_ry_down",
+          "label": "RIGHT STICK DOWN",
+          "type": "cycle",
+          "values": [
+            "K",
+            "W",
+            "A",
+            "S",
+            "D",
+            "Up",
+            "Down",
+            "Left",
+            "Right",
+            "Return",
+            "Escape",
+            "Space",
+            "Tab",
+            "Q",
+            "E",
+            "C",
+            "V",
+            "B",
+            "F",
+            "1",
+            "2",
+            "I",
+            "J",
+            "L",
+            "U",
+            "O",
+            "LShift",
+            "LCtrl"
+          ],
+          "default": "K",
+          "tomlSection": "input",
+          "visible": true
+        },
+        {
+          "key": "mcla_key_rx_left",
+          "label": "RIGHT STICK LEFT",
+          "type": "cycle",
+          "values": [
+            "J",
+            "W",
+            "A",
+            "S",
+            "D",
+            "Up",
+            "Down",
+            "Left",
+            "Right",
+            "Return",
+            "Escape",
+            "Space",
+            "Tab",
+            "Q",
+            "E",
+            "C",
+            "V",
+            "B",
+            "F",
+            "1",
+            "2",
+            "I",
+            "K",
+            "L",
+            "U",
+            "O",
+            "LShift",
+            "LCtrl"
+          ],
+          "default": "J",
+          "tomlSection": "input",
+          "visible": true
+        },
+        {
+          "key": "mcla_key_rx_right",
+          "label": "RIGHT STICK RIGHT",
+          "type": "cycle",
+          "values": [
+            "L",
+            "W",
+            "A",
+            "S",
+            "D",
+            "Up",
+            "Down",
+            "Left",
+            "Right",
+            "Return",
+            "Escape",
+            "Space",
+            "Tab",
+            "Q",
+            "E",
+            "C",
+            "V",
+            "B",
+            "F",
+            "1",
+            "2",
+            "I",
+            "J",
+            "K",
+            "U",
+            "O",
+            "LShift",
+            "LCtrl"
+          ],
+          "default": "L",
+          "tomlSection": "input",
+          "visible": true
+        },
+        {
+          "key": "mcla_key_left_shoulder",
+          "label": "LB - LEFT SHOULDER",
+          "type": "cycle",
+          "values": [
+            "Q",
+            "W",
+            "A",
+            "S",
+            "D",
+            "Up",
+            "Down",
+            "Left",
+            "Right",
+            "Return",
+            "Escape",
+            "Space",
+            "Tab",
+            "E",
+            "C",
+            "V",
+            "B",
+            "F",
+            "1",
+            "2",
+            "I",
+            "J",
+            "K",
+            "L",
+            "U",
+            "O",
+            "LShift",
+            "LCtrl"
+          ],
+          "default": "Q",
+          "tomlSection": "input",
+          "visible": true
+        },
+        {
+          "key": "mcla_key_lt",
+          "label": "LT - LEFT TRIGGER (AXIS)",
+          "type": "cycle",
+          "visible": false,
+          "values": [
+            "U",
+            "W",
+            "A",
+            "S",
+            "D",
+            "Up",
+            "Down",
+            "Left",
+            "Right",
+            "Return",
+            "Escape",
+            "Space",
+            "Tab",
+            "Q",
+            "E",
+            "C",
+            "V",
+            "B",
+            "F",
+            "1",
+            "2",
+            "I",
+            "J",
+            "K",
+            "L",
+            "O",
+            "LShift",
+            "LCtrl"
+          ],
+          "default": "U",
+          "tomlSection": "input"
+        },
+        {
+          "key": "mcla_key_rt",
+          "label": "RT - RIGHT TRIGGER (AXIS)",
+          "type": "cycle",
+          "visible": false,
+          "values": [
+            "O",
+            "W",
+            "A",
+            "S",
+            "D",
+            "Up",
+            "Down",
+            "Left",
+            "Right",
+            "Return",
+            "Escape",
+            "Space",
+            "Tab",
+            "Q",
+            "E",
+            "C",
+            "V",
+            "B",
+            "F",
+            "1",
+            "2",
+            "I",
+            "J",
+            "K",
+            "L",
+            "U",
+            "LShift",
+            "LCtrl"
+          ],
+          "default": "O",
+          "tomlSection": "input"
+        },
+        {
+          "key": "mcla_keymap_log",
+          "label": "LOG KEYMAP",
+          "type": "cycle",
+          "visible": true,
+          "values": [
+            "ON",
+            "OFF"
+          ],
+          "default": "OFF",
+          "tomlSection": "input",
+          "valueMap": {
+            "ON": true,
+            "OFF": false
+          }
+        },
+        {
+          "key": "mcla_intro",
+          "label": "INTRO VIDEOS",
+          "type": "cycle",
+          "visible": true,
+          "values": [
+            "NORMAL",
+            "SKIP"
+          ],
+          "default": "NORMAL",
+          "tomlSection": "controls",
+          "valueMap": {
+            "NORMAL": "normal",
+            "SKIP": "skip"
+          }
+        }
+      ]
+    },
+    {
+      "id": "tuning",
+      "title": "TUNING",
+      "icon": "tuning",
+      "visible": true,
+      "subHeaderLeft": "< MCLA.TOML // PERF >",
+      "subHeaderRight": "PERF / AUDIO",
+      "options": [
+        {
+          "key": "mcla_dt_max",
+          "label": "DT MAX",
+          "type": "slider",
+          "visible": true,
+          "default": 0.125,
+          "tomlSection": "mcla",
+          "min": 0.01,
+          "max": 0.5,
+          "step": 0.01
+        },
+        {
+          "key": "mcla_float_clock",
+          "label": "FLOAT CLOCK",
+          "type": "cycle",
+          "visible": true,
+          "values": [
+            "ON",
+            "OFF"
+          ],
+          "default": "ON",
+          "tomlSection": "mcla",
+          "valueMap": {
+            "ON": true,
+            "OFF": false
+          }
+        },
+        {
+          "key": "mcla_pace_at_swap",
+          "label": "PACE AT SWAP",
+          "type": "cycle",
+          "visible": true,
+          "values": [
+            "ON",
+            "OFF"
+          ],
+          "default": "ON",
+          "tomlSection": "mcla",
+          "valueMap": {
+            "ON": true,
+            "OFF": false
+          }
+        },
+        {
+          "key": "mcla_swap_unlock",
+          "label": "SWAP UNLOCK",
+          "type": "cycle",
+          "visible": true,
+          "values": [
+            "ON",
+            "OFF"
+          ],
+          "default": "ON",
+          "tomlSection": "mcla",
+          "valueMap": {
+            "ON": true,
+            "OFF": false
+          }
+        },
+        {
+          "key": "mcla_physics_continuous",
+          "label": "CONTINUOUS PHYSICS",
+          "type": "cycle",
+          "visible": true,
+          "values": [
+            "ON",
+            "OFF"
+          ],
+          "default": "ON",
+          "tomlSection": "mcla",
+          "valueMap": {
+            "ON": true,
+            "OFF": false
+          }
+        },
+        {
+          "key": "mcla_checkpoint_sweep",
+          "label": "CHECKPOINT SWEEP",
+          "type": "cycle",
+          "visible": true,
+          "values": [
+            "ON",
+            "OFF"
+          ],
+          "default": "ON",
+          "tomlSection": "mcla",
+          "valueMap": {
+            "ON": true,
+            "OFF": false
+          }
+        },
+        {
+          "key": "mcla_poll_wait",
+          "label": "POLL WAIT",
+          "type": "cycle",
+          "visible": true,
+          "values": [
+            "ON",
+            "OFF"
+          ],
+          "default": "ON",
+          "tomlSection": "mcla",
+          "valueMap": {
+            "ON": true,
+            "OFF": false
+          }
+        },
+        {
+          "key": "mcla_poll_spin_us",
+          "label": "POLL SPIN (us)",
+          "type": "slider",
+          "visible": true,
+          "default": 40,
+          "tomlSection": "mcla",
+          "min": 0,
+          "max": 2000,
+          "step": 10
+        },
+        {
+          "key": "mcla_poll_tail_us",
+          "label": "POLL TAIL (us)",
+          "type": "slider",
+          "visible": true,
+          "default": 400,
+          "tomlSection": "mcla",
+          "min": 0,
+          "max": 2000,
+          "step": 10
+        },
+        {
+          "key": "mcla_pump_wake_on_demand",
+          "label": "PUMP WAKE ON DEMAND",
+          "type": "cycle",
+          "visible": true,
+          "values": [
+            "ON",
+            "OFF"
+          ],
+          "default": "ON",
+          "tomlSection": "mcla",
+          "valueMap": {
+            "ON": true,
+            "OFF": false
+          }
+        },
+        {
+          "key": "mcla_pump_wake_pause_s",
+          "label": "PUMP WAKE PAUSE (s)",
+          "type": "slider",
+          "visible": true,
+          "default": 60,
+          "tomlSection": "mcla",
+          "min": 0,
+          "max": 3600,
+          "step": 10
+        },
+        {
+          "key": "mcla_pump_sleep_max_ms",
+          "label": "PUMP SLEEP MAX (ms)",
+          "type": "slider",
+          "visible": true,
+          "default": -1,
+          "tomlSection": "mcla",
+          "min": -1,
+          "max": 500,
+          "step": 1
+        },
+        {
+          "key": "MCLA_NO_RENDER_2STAGE",
+          "label": "TWO-STAGE RENDERING",
+          "type": "cycle",
+          "visible": true,
+          "values": [
+            "ON",
+            "OFF"
+          ],
+          "default": "ON",
+          "valueMap": {
+            "ON": 0,
+            "OFF": 1
+          },
+          "tomlSection": "_env"
+        },
+        {
+          "key": "MCLA_NO_MT_BURSTS",
+          "label": "PARALLEL DRAW RECORDING",
+          "type": "cycle",
+          "visible": true,
+          "values": [
+            "ON",
+            "OFF"
+          ],
+          "default": "ON",
+          "valueMap": {
+            "ON": 0,
+            "OFF": 1
+          },
+          "tomlSection": "_env"
+        },
+        {
+          "key": "MCLA_MT_PREP",
+          "label": "MULTI-THREADED DRAW PREP",
+          "type": "cycle",
+          "visible": true,
+          "values": [
+            "ON",
+            "OFF"
+          ],
+          "default": "OFF",
+          "valueMap": {
+            "ON": 1,
+            "OFF": 0
+          },
+          "tomlSection": "_env"
+        },
+        {
+          "key": "MCLA_AUDIO_GAIN",
+          "label": "AUDIO GAIN",
+          "type": "cycle",
+          "visible": true,
+          "values": [
+            "40%",
+            "60%",
+            "80%",
+            "100%",
+            "120%",
+            "150%",
+            "200%"
+          ],
+          "default": "80%",
+          "valueMap": {
+            "40%": 0.4,
+            "60%": 0.6,
+            "80%": 0.8,
+            "100%": 1.0,
+            "120%": 1.2,
+            "150%": 1.5,
+            "200%": 2.0
+          },
+          "tomlSection": "_env"
+        },
+        {
+          "key": "MCLA_NO_ADAPTIVE_AUDIO",
+          "label": "ADAPTIVE AUDIO BUFFER",
+          "type": "cycle",
+          "visible": true,
+          "values": [
+            "ON",
+            "OFF"
+          ],
+          "default": "ON",
+          "valueMap": {
+            "ON": 0,
+            "OFF": 1
+          },
+          "tomlSection": "_env"
+        },
+        {
+          "key": "mcla_patch_groups",
+          "label": "PATCH GROUPS",
+          "type": "cycle",
+          "visible": true,
+          "values": [
+            "all",
+            "none",
+            "sdk,guest,native"
+          ],
+          "default": "all",
+          "tomlSection": "mcla"
+        }
+      ]
+    },
+    {
+      "id": "files",
+      "title": "MORE",
+      "icon": "files",
+      "visible": true,
+      "subHeaderLeft": "< MCLA-RECOMP // PROFILE / TOOLS >",
+      "subHeaderRight": "",
+      "options": [
+        {
+          "key": "mcla_profile_name",
+          "label": "PROFILE NAME",
+          "type": "text",
+          "visible": true,
+          "values": [],
+          "default": "SWA",
+          "valueMap": {},
+          "maxLength": 15,
+          "pattern": "^[ -~]{1,15}$",
+          "tomlSection": "profile"
+        },
+        {
+          "key": "MCLA_NO_SIGNIN",
+          "label": "LOCAL SIGN-IN SLOTS",
+          "type": "cycle",
+          "visible": true,
+          "values": [
+            "ALL FOUR",
+            "SLOT 0 ONLY"
+          ],
+          "default": "ALL FOUR",
+          "valueMap": {
+            "ALL FOUR": 0,
+            "SLOT 0 ONLY": 1
+          },
+          "tomlSection": "_env"
+        },
+        {
+          "key": "open_folder",
+          "label": "OPEN GAME FOLDER",
+          "type": "action",
+          "visible": true,
+          "action": "browseFiles",
+          "default": "MCLA.EXE DIR"
+        },
+        {
+          "key": "build_logs",
+          "label": "BUILD LOGS",
+          "type": "action",
+          "visible": true,
+          "action": "openLogs",
+          "default": "RUN.LOG"
+        },
+        {
+          "key": "prepare_shaders",
+          "label": "PREPARE SHADERS",
+          "type": "action",
+          "visible": false,
+          "action": "prepareShaders",
+          "default": "RUN PACK"
+        },
+        {
+          "key": "rebuild_game",
+          "label": "REBUILD FROM ISO",
+          "type": "action",
+          "visible": false,
+          "action": "rebuildGame",
+          "default": "XBOX 360 DISC"
+        },
+        {
+          "key": "cli_options",
+          "label": "MORE MCLA.EXE OPTS",
+          "type": "action",
+          "visible": false,
+          "action": "editCliFlags",
+          "default": "--MCLA_FPS=60"
+        }
+      ]
+    }
+  ]
+}

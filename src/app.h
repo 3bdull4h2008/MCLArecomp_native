@@ -1,0 +1,139 @@
+#pragma once
+
+#include <SDL3/SDL.h>
+#include <string>
+#include <memory>
+#include <functional>
+#include <filesystem>
+#include <optional>
+#include <cstdint>
+
+#include "d3d12_backend.h"
+#include "renderer_mode.h"
+#include "guest_memory.h"
+#include "cvar.h"
+#include "ppc_config.h"
+#include "generated/ppc_xenon/ppc_context.h"
+
+namespace mcla {
+
+// XenonRecomp-compatible PPCContext (see generated/ppc_xenon/ppc_context.h).
+// The recompiled ABI defines the global ::PPCContext; these aliases keep the
+// existing hook consumers (mcla::PPCContext / mcla::native::PPCContext)
+// compiling unchanged.
+using PPCContext = ::PPCContext;
+
+namespace native {
+using PPCContext = ::PPCContext;
+}
+
+class App {
+public:
+    App(const char* name = "MCLA");
+    ~App();
+
+    bool Initialize();
+    void Run();
+    void Shutdown();
+
+    // Window management
+    SDL_Window* GetWindow() const { return m_window; }
+    HWND GetHwnd() const { return m_hwnd; }
+    uint32_t GetWidth() const { return m_width; }
+    uint32_t GetHeight() const { return m_height; }
+    bool IsMinimized() const { return m_isMinimized; }
+
+    // D3D12 backend access
+    native::D3D12Backend* GetD3D12Backend() { return native::GetD3D12Backend(); }
+
+    // Graphics settings access
+    const native::GraphicsSettings& GetGraphicsSettings() const;
+    void SetGraphicsSettings(const native::GraphicsSettings& s);
+
+    // Guest memory access
+    native::GuestMemoryView& GetGuestMemoryView() { return m_guestMemoryView; }
+
+    // Function dispatcher for PPC hooks
+    class FunctionDispatcher;
+    FunctionDispatcher* GetFunctionDispatcher() { return m_dispatcher.get(); }
+
+    // PPC context base address
+    uint8_t* GetPPCBase() const { return m_ppcBase; }
+    void SetPPCBase(uint8_t* base) { m_ppcBase = base; }
+
+    // Game data paths
+    const std::filesystem::path& GetGameDataRoot() const { return m_gameDataRoot; }
+    const std::filesystem::path& GetCacheRoot() const { return m_cacheRoot; }
+    // Wave 3 (§1.1): the single config path both App and wave3_menu save to.
+    // Returned by value because it is a composition, not a stored member.
+    std::filesystem::path GetConfigPath() const { return m_cacheRoot / "mcla.toml"; }
+
+    // Frame callback
+    using FrameCallback = std::function<void()>;
+    void SetFrameCallback(FrameCallback cb) { m_frameCallback = std::move(cb); }
+
+private:
+    bool InitSDL();
+    bool InitPaths();
+    bool CreateSDLWindow();
+    bool InitD3D12();
+    void MainLoop();
+    void HandleEvents();
+    void OnResize(uint32_t width, uint32_t height);
+
+    std::string m_name;
+    SDL_Window* m_window = nullptr;
+    HWND m_hwnd = nullptr;
+    uint32_t m_width = 1280;
+    uint32_t m_height = 720;
+    bool m_isMinimized = false;
+    bool m_running = false;
+
+    // Wave 3 (§2.4): SDL cursor auto-hide state. SDL owns cursor visibility and
+    // is main-thread-affine, so these two fields are touched only by
+    // HandleEvents()/MainLoop() on that thread.
+    uint64_t m_lastMouseMs = 0;
+    bool m_cursorHidden = false;
+
+    std::filesystem::path m_gameDataRoot;
+    std::filesystem::path m_cacheRoot;
+
+    native::GuestMemoryView m_guestMemoryView;
+    std::unique_ptr<FunctionDispatcher> m_dispatcher;
+    uint8_t* m_ppcBase = nullptr;
+    uint32_t m_bootEntry = 0;
+
+    FrameCallback m_frameCallback;
+};
+
+// Function dispatcher for PPC hook management
+class App::FunctionDispatcher {
+public:
+    using PPCFunc = void(*)(PPCContext&, uint8_t*);
+
+    FunctionDispatcher() = default;
+    ~FunctionDispatcher() = default;
+
+    PPCFunc GetFunction(uint32_t addr) const;
+    void SetFunction(uint32_t addr, PPCFunc func);
+    uint32_t AllocateThunk(PPCFunc func, uint32_t originalAddr);
+
+private:
+    struct ThunkEntry {
+        PPCFunc func;
+        uint32_t originalAddr;
+    };
+    std::unordered_map<uint32_t, PPCFunc> m_functions;
+    std::unordered_map<uint32_t, ThunkEntry> m_thunks;
+    // Every thunk address comes from kernel::AllocateSyntheticGuestThunk
+    // (F-952); the old m_nextThunkAddr = 0x83000000 counter is retired because
+    // that VA has no dispatch-table row.
+    mutable std::mutex m_mutex;
+};
+
+// Global app instance accessor
+App* GetApp();
+
+} // namespace mcla
+
+#include "native_renderer.h"

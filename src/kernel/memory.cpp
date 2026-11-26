@@ -1,0 +1,1214 @@
+#include <stdafx.h>
+#include "memory.h"
+#include "heap.h"
+#include <intrin.h>  // F-374b mirror: _ReturnAddress() for caller_rva (as in guest_memory.cpp)
+#include <atomic>
+#include <mutex>
+#include <vector>
+#include <algorithm>
+#include <unordered_map>
+#include "logging.h"
+
+// --- GUEST-LOAD-REFUSED / GUEST-REFUSED-SUM ----------------------------------
+// INSTRUMENT ONLY. It records refusals; it never writes *outVal, never changes a
+// return value, and never touches a caller.
+//
+// WHY. Every GuestMemoryHeap::Read* below refuses by `return false` WITHOUT
+// writing *outVal, and callers that drop the bool turn that into a silent 0
+// (src/gpu_cp.cpp:2096 and :2816 are `(void)...ReadU32BE(...)`). A refused read
+// is then indistinguishable from a guest word that really is 0. This is the
+// discriminator for the two competing causes of the current boot's only
+// C0000005 (guest 0x825FB348; host generated/ppc_xenon/ppc_recomp.121.cpp:25113
+// PPC_CALL_INDIRECT_FUNC(ctr.u32) reached with ctr==0):
+//   #1 the guest's *(obj+12) really is 0  -> GUEST-REFUSED-SUM total=0
+//   #2 the host fabricated that 0         -> GUEST-REFUSED-SUM total>0
+//
+// FLOOD CONTROL. These reads sit in the host hot path (gpu_cp.cpp:4078 and :2821
+// call ReadU32BE per loop element), so one persistently out-of-range pointer can
+// refuse thousands of times per frame. F-054: a marker that fires 2,000,000
+// times poisons the log. So the first 16 refusals print, then every 4096th, and
+// GUEST-REFUSED-SUM prints on that SAME cadence carrying the true `total` and the
+// number of rows deliberately dropped (`dropped`). That is the F-379/F-631
+// cap-shape rule: a short burst stays complete, a long one stays visible, and
+// total/dropped stop a reader mistaking the sample for the whole (F-630).
+// lo_va/hi_va bound the refused addresses, so "is the va inside the crashing
+// object's vtable chain" is answerable from the log without a re-run.
+// Because both markers are emission-only, ABSENCE of both across a full soak is
+// itself the measurement: total == 0.
+//
+// `why` is the check that refused: range = !IsValid(), av = the __try guard
+// caught an access violation, nullout = null out-pointer.
+
+namespace {
+
+enum RefusedSite {
+    kRefU8 = 0, kRefU16, kRefU32, kRefU64, kRefF32, kRefBytes, kRefSiteCount
+};
+
+constexpr uint64_t kRefPrintFirst = 16;
+constexpr uint64_t kRefPrintEvery = 4096;
+
+std::atomic<uint64_t> g_refusedTotal{0};  // every refusal, printed or not
+std::atomic<uint64_t> g_refusedRows{0};   // rows actually printed
+std::atomic<uint64_t> g_refusedBySite[kRefSiteCount]{};
+std::atomic<uint32_t> g_refusedLo{0};
+std::atomic<uint32_t> g_refusedHi{0};
+std::atomic<bool> g_refusedAny{false};
+
+// Captured inside the SEH filter, formatted OUTSIDE the handler: allocating for
+// fmt/spdlog while an access violation is being handled can itself fault.
+// A filter expression must be a constant expression, so this is a named
+// function (it cannot be written as an inline-parameter call) and is invoked as
+// __except (GuestLoadAvFilter(GetExceptionInformation(), &fault), EXCEPTION_EXECUTE_HANDLER).
+struct GuestLoadFault {
+    unsigned long code = 0;
+    unsigned long long addr = 0;
+};
+
+int GuestLoadAvFilter(EXCEPTION_POINTERS* ep, void* ctx) {
+    auto* f = static_cast<GuestLoadFault*>(ctx);
+    if (ep && ep->ExceptionRecord) {
+        f->code = ep->ExceptionRecord->ExceptionCode;
+        // Information[1] is the faulting DATA address; [0] is the access type.
+        if (ep->ExceptionRecord->NumberParameters >= 2)
+            f->addr = ep->ExceptionRecord->ExceptionInformation[1];
+    }
+    return EXCEPTION_EXECUTE_HANDLER;
+}
+
+void LogGuestLoadRefused(const char* fn, uint32_t va, size_t size, const char* why, int site,
+                         unsigned long av_code, unsigned long long av_addr) {
+    uint32_t cur = g_refusedLo.load(std::memory_order_relaxed);
+    while (va < cur && !g_refusedLo.compare_exchange_weak(cur, va, std::memory_order_relaxed)) {}
+    cur = g_refusedHi.load(std::memory_order_relaxed);
+    while (va > cur && !g_refusedHi.compare_exchange_weak(cur, va, std::memory_order_relaxed)) {}
+    g_refusedAny.store(true, std::memory_order_relaxed);
+
+    const uint64_t n = g_refusedTotal.fetch_add(1, std::memory_order_relaxed) + 1;
+    g_refusedBySite[site].fetch_add(1, std::memory_order_relaxed);
+    if (n > kRefPrintFirst && (n % kRefPrintEvery) != 0)
+        return;  // sampled out; the sum line below carries the true total
+
+    const uint64_t rows = g_refusedRows.fetch_add(1, std::memory_order_relaxed) + 1;
+    const uint64_t total = g_refusedTotal.load(std::memory_order_relaxed);
+    const uint32_t lo = g_refusedAny.load(std::memory_order_relaxed)
+                            ? g_refusedLo.load(std::memory_order_relaxed) : 0;
+    const uint32_t hi = g_refusedHi.load(std::memory_order_relaxed);
+    // Mirror ReportGuestViewU32Refused (src/guest_memory.cpp): caller_rva pinpoints
+    // the host frame (here the Read* wrapper, one frame shallower than the guest
+    // caller -- fn= above names the site), view_base/view_size name the live window.
+    // Instrument-only; IsValid guard unchanged (<0x1000 stays).
+    const uintptr_t mbase = reinterpret_cast<uintptr_t>(GetModuleHandleA(nullptr));
+    const uintptr_t cabs = reinterpret_cast<uintptr_t>(_ReturnAddress());
+    const uint64_t caller_rva = (mbase && cabs > mbase) ? (cabs - mbase) : cabs;
+    const void* viewBase = mcla::kernel::GuestMemoryHeap::Instance().Base();
+    const uint64_t viewSize = mcla::kernel::GuestMemoryHeap::Instance().Size();
+    MCLA_LOG_ERROR(
+        "GUEST-LOAD-REFUSED va={:08X} size={} why={} fn={} n={} av_code=0x{:X} av_addr=0x{:X} "
+        "view_base=0x{:X} view_size=0x{:X} caller_rva={:#x} tid={} - "
+        "checked read REFUSED, *outVal NOT written: a caller that drops the bool sees a SILENT 0",
+        va, size, why, fn, n, av_code, av_addr,
+        reinterpret_cast<uintptr_t>(viewBase), viewSize, caller_rva, GetCurrentThreadId());
+    MCLA_LOG_ERROR(
+        "GUEST-REFUSED-SUM total={} rows={} dropped={} fn={} why={} va={:08X} lo_va={:08X} "
+        "hi_va={:08X} by_site=[u8={} u16={} u32={} u64={} f32={} bytes={}] "
+        "view_base=0x{:X} view_size=0x{:X} caller_rva={:#x} tid={}",
+        (unsigned long long)total, (unsigned long long)rows,
+        (unsigned long long)(total - rows), fn, why, va, lo, hi,
+        (unsigned long long)g_refusedBySite[kRefU8].load(std::memory_order_relaxed),
+        (unsigned long long)g_refusedBySite[kRefU16].load(std::memory_order_relaxed),
+        (unsigned long long)g_refusedBySite[kRefU32].load(std::memory_order_relaxed),
+        (unsigned long long)g_refusedBySite[kRefU64].load(std::memory_order_relaxed),
+        (unsigned long long)g_refusedBySite[kRefF32].load(std::memory_order_relaxed),
+        (unsigned long long)g_refusedBySite[kRefBytes].load(std::memory_order_relaxed),
+        reinterpret_cast<uintptr_t>(viewBase), viewSize, caller_rva, GetCurrentThreadId());
+}
+
+#ifdef _WIN32
+static bool WriteWatchDisabledByEnv() {
+    static const bool off = [] {
+        const char* e = std::getenv("MCLA_NO_WRITE_WATCH");
+        return e && e[0] == '1';
+    }();
+    return off;
+}
+#endif
+
+}  // namespace
+
+std::atomic<bool> mcla::kernel::g_writeWatchActive{false};
+alignas(64) std::atomic<uint32_t> mcla::kernel::g_guestPageEpoch[mcla::kernel::kGuestPageCount]{};
+
+namespace {
+std::mutex s_writeWatchMutex;
+uint8_t* s_writeWatchBase = nullptr;
+uint64_t s_writeWatchSize = 0;
+bool s_writeWatchInitialized = false;
+UINT s_writeWatchInitRc = 0;
+DWORD s_writeWatchInitGran = 0;
+}  // namespace
+
+void mcla::kernel::InitGuestWriteWatch(uint8_t* base, uint64_t size)
+{
+#ifdef _WIN32
+    std::lock_guard<std::mutex> lock(s_writeWatchMutex);
+    if (s_writeWatchInitialized)
+        return;
+    s_writeWatchInitialized = true;
+    if (!base || size <= kNullGuardBytes || WriteWatchDisabledByEnv())
+    {
+        g_writeWatchActive.store(false, std::memory_order_release);
+        return;
+    }
+    constexpr ULONG_PTR kScratchCap = 65536;
+    std::vector<void*> scratch(kScratchCap);
+    DWORD granularity = 0;
+    for (;;)
+    {
+        ULONG_PTR count = kScratchCap;
+        const UINT rc = GetWriteWatch(
+            WRITE_WATCH_FLAG_RESET,
+            base + kNullGuardBytes,
+            static_cast<SIZE_T>(size - kNullGuardBytes),
+            scratch.data(),
+            &count,
+            &granularity);
+        s_writeWatchInitRc = rc;
+        s_writeWatchInitGran = granularity;
+        if (rc != 0 || granularity != kGuestPageSize)
+        {
+            g_writeWatchActive.store(false, std::memory_order_release);
+            return;
+        }
+        if (count < kScratchCap)
+            break;
+    }
+    s_writeWatchBase = base;
+    s_writeWatchSize = size;
+    g_writeWatchActive.store(true, std::memory_order_release);
+#else
+    (void)base;
+    (void)size;
+    g_writeWatchActive.store(false, std::memory_order_release);
+#endif
+}
+
+void mcla::kernel::HarvestDirtyGuestPages()
+{
+#ifdef _WIN32
+    static std::atomic<bool> s_loggedInit{false};
+    if (!s_loggedInit.exchange(true, std::memory_order_relaxed))
+    {
+        if (g_writeWatchActive.load(std::memory_order_acquire))
+        {
+            MCLA_LOG_INFO("R1-WRITEWATCH active: base={:p} size=0x{:X} gran={}B",
+                          static_cast<const void*>(s_writeWatchBase),
+                          s_writeWatchSize, s_writeWatchInitGran);
+        }
+        else
+        {
+            MCLA_LOG_WARN("R1-WRITEWATCH disabled: envOff={} rc={} gran={}",
+                          WriteWatchDisabledByEnv() ? 1 : 0,
+                          s_writeWatchInitRc, s_writeWatchInitGran);
+        }
+    }
+    if (!g_writeWatchActive.load(std::memory_order_acquire))
+        return;
+    std::lock_guard<std::mutex> lock(s_writeWatchMutex);
+    if (!g_writeWatchActive.load(std::memory_order_relaxed) || !s_writeWatchBase ||
+        s_writeWatchSize <= kNullGuardBytes)
+        return;
+
+    constexpr ULONG_PTR kScratchCap = 65536;
+    static std::vector<void*> s_scratch(kScratchCap);
+    const uintptr_t baseAddr = reinterpret_cast<uintptr_t>(s_writeWatchBase);
+    for (;;)
+    {
+        ULONG_PTR count = kScratchCap;
+        DWORD granularity = 0;
+        const UINT rc = GetWriteWatch(
+            WRITE_WATCH_FLAG_RESET,
+            s_writeWatchBase + kNullGuardBytes,
+            static_cast<SIZE_T>(s_writeWatchSize - kNullGuardBytes),
+            s_scratch.data(),
+            &count,
+            &granularity);
+        if (rc != 0 || granularity != kGuestPageSize)
+        {
+            MCLA_LOG_WARN("R1-WRITEWATCH harvest failed (rc={} gran={}); falling back to HashGuestRangeSeh",
+                          rc, granularity);
+            g_writeWatchActive.store(false, std::memory_order_release);
+            return;
+        }
+        for (ULONG_PTR i = 0; i < count; ++i)
+        {
+            const uintptr_t addr = reinterpret_cast<uintptr_t>(s_scratch[i]);
+            if (addr < baseAddr)
+                continue;
+            const uint64_t off = static_cast<uint64_t>(addr - baseAddr);
+            const uint32_t pageIdx = static_cast<uint32_t>(off >> kGuestPageShift);
+            if (pageIdx < kGuestPageCount)
+            {
+                g_guestPageEpoch[pageIdx].fetch_add(1u, std::memory_order_release);
+            }
+        }
+        if (count < kScratchCap)
+            break;
+    }
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+#endif
+}
+
+mcla::kernel::Memory::Memory()
+{
+#ifdef _WIN32
+    // First check if memory is already reserved or committed at the target address
+    MEMORY_BASIC_INFORMATION mbi;
+    if (VirtualQuery((void*)0x100000000ull, &mbi, sizeof(mbi)) == sizeof(mbi) && 
+        (mbi.State == MEM_RESERVE || mbi.State == MEM_COMMIT))
+    {
+        base = (uint8_t*)0x100000000ull;
+    }
+    else
+    {
+        const DWORD wwFlags = WriteWatchDisabledByEnv() ? 0u : MEM_WRITE_WATCH;
+        base = (uint8_t*)VirtualAlloc((void*)0x100000000ull, PPC_MEMORY_SIZE, MEM_COMMIT | MEM_RESERVE | wwFlags, PAGE_READWRITE);
+
+        if (base == nullptr)
+            base = (uint8_t*)VirtualAlloc(nullptr, PPC_MEMORY_SIZE, MEM_COMMIT | MEM_RESERVE | wwFlags, PAGE_READWRITE);
+
+        if (base == nullptr && wwFlags != 0u)
+        {
+            base = (uint8_t*)VirtualAlloc((void*)0x100000000ull, PPC_MEMORY_SIZE, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+            if (base == nullptr)
+                base = (uint8_t*)VirtualAlloc(nullptr, PPC_MEMORY_SIZE, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+        }
+    }
+
+    if (base == nullptr)
+        return;
+
+    DWORD oldProtect;
+    VirtualProtect(base, mcla::kernel::kNullGuardBytes, PAGE_NOACCESS, &oldProtect);
+    mcla::kernel::InitGuestWriteWatch(base, PPC_MEMORY_SIZE);
+#else
+    // MAP_FIXED_NOREPLACE below *is* the "already mapped there?" check: no
+    // /proc/self/maps parse needed. The two fallbacks omit it and may relocate.
+    base = (uint8_t*)mmap((void*)0x100000000ull, PPC_MEMORY_SIZE, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE | MAP_FIXED_NOREPLACE, -1, 0);
+
+    if (base == (uint8_t*)MAP_FAILED)
+        base = (uint8_t*)mmap((void*)0x100000000ull, PPC_MEMORY_SIZE, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0);
+
+    if (base == (uint8_t*)MAP_FAILED)
+        base = (uint8_t*)mmap(NULL, PPC_MEMORY_SIZE, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0);
+
+    if (base == nullptr)
+        return;
+
+    mprotect(base, mcla::kernel::kNullGuardBytes, PROT_NONE);
+#endif
+
+    // Record the window size: IsInMemoryRange and boot_host's full-4GiB reuse
+    // test (boot_host.cpp:560) read it. Memory::Translate only asserts on it.
+    size = PPC_MEMORY_SIZE;
+
+    for (size_t i = 0; PPCFuncMappings[i].guest != 0; i++)
+    {
+        if (PPCFuncMappings[i].host != nullptr)
+            InsertFunction(PPCFuncMappings[i].guest, PPCFuncMappings[i].host);
+    }
+}
+
+void* MmGetHostAddress(uint32_t ptr)
+{
+    return mcla::kernel::g_memory.Translate(ptr);
+}
+
+uint32_t mcla::kernel::AllocateSyntheticGuestThunk(PPCFunc* host, const char* tag)
+{
+    if (host == nullptr)
+        return 0;
+
+    static std::mutex s_mutex;
+    static uint32_t s_cursor = static_cast<uint32_t>(PPC_CODE_BASE + PPC_CODE_SIZE);
+    static std::atomic<uint32_t> s_allocated{0};
+
+    std::lock_guard<std::mutex> lock(s_mutex);
+    while (s_cursor > static_cast<uint32_t>(PPC_CODE_BASE))
+    {
+        s_cursor -= 4;
+        if (g_memory.FindFunction(s_cursor) != nullptr)
+            continue;  // a recompiled function owns this table row
+        g_memory.InsertFunction(s_cursor, host);
+        const uint32_t n = s_allocated.fetch_add(1, std::memory_order_relaxed) + 1;
+        MCLA_LOG_WARN("THUNK-ALLOC #{} va={:08X} tag={} - synthetic guest VA inside "
+                      "[{:08X},{:08X})",
+                      n, s_cursor, tag != nullptr ? tag : "?",
+                      static_cast<uint32_t>(PPC_CODE_BASE),
+                      static_cast<uint32_t>(PPC_CODE_BASE + PPC_CODE_SIZE));
+        return s_cursor;
+    }
+
+    MCLA_LOG_ERROR("THUNK-ALLOC FAILED tag={} - no free function-table row in "
+                   "[{:08X},{:08X})",
+                   tag != nullptr ? tag : "?", static_cast<uint32_t>(PPC_CODE_BASE),
+                   static_cast<uint32_t>(PPC_CODE_BASE + PPC_CODE_SIZE));
+    return 0;
+}
+
+// Checked, endian-explicit read/write helpers for GuestMemoryHeap
+bool mcla::kernel::GuestMemoryHeap::ReadU8(uint32_t guestAddr, uint8_t* outVal) const
+{
+    // No __try here (and none in ReadU16BE): a bad pointer AVs instead of
+    // refusing, so `why=av` can never originate from these two -- a silent zero
+    // is impossible from ReadU8/ReadU16BE.
+    if (!IsValid(guestAddr, sizeof(uint8_t)))
+    {
+        LogGuestLoadRefused("ReadU8", guestAddr, sizeof(uint8_t), "range", kRefU8, 0, 0);
+        return false;
+    }
+    if (!outVal)
+    {
+        LogGuestLoadRefused("ReadU8", guestAddr, sizeof(uint8_t), "nullout", kRefU8, 0, 0);
+        return false;
+    }
+    *outVal = *reinterpret_cast<const uint8_t*>(Translate(guestAddr));
+    return true;
+}
+
+bool mcla::kernel::GuestMemoryHeap::ReadU16BE(uint32_t guestAddr, uint16_t* outVal) const
+{
+    if (!IsValid(guestAddr, sizeof(uint16_t)))
+    {
+        LogGuestLoadRefused("ReadU16BE", guestAddr, sizeof(uint16_t), "range", kRefU16, 0, 0);
+        return false;
+    }
+    if (!outVal)
+    {
+        LogGuestLoadRefused("ReadU16BE", guestAddr, sizeof(uint16_t), "nullout", kRefU16, 0, 0);
+        return false;
+    }
+    const uint16_t beVal = *reinterpret_cast<const uint16_t*>(Translate(guestAddr));
+    *outVal = Swap16(beVal);
+    return true;
+}
+
+bool mcla::kernel::GuestMemoryHeap::ReadU32BE(uint32_t guestAddr, uint32_t* outVal) const
+{
+    if (!IsValid(guestAddr, sizeof(uint32_t)))
+    {
+        LogGuestLoadRefused("ReadU32BE", guestAddr, sizeof(uint32_t), "range", kRefU32, 0, 0);
+        return false;
+    }
+    if (!outVal)
+    {
+        LogGuestLoadRefused("ReadU32BE", guestAddr, sizeof(uint32_t), "nullout", kRefU32, 0, 0);
+        return false;
+    }
+    const uint8_t* ptr = static_cast<const uint8_t*>(Translate(guestAddr));
+    bool ok = false;
+    GuestLoadFault fault;  // filled by the filter, formatted outside the handler
+    __try
+    {
+        const uint32_t beVal = *reinterpret_cast<const uint32_t*>(ptr);
+        *outVal = Swap32(beVal);
+        ok = true;
+    }
+    __except (GuestLoadAvFilter(GetExceptionInformation(), &fault), EXCEPTION_EXECUTE_HANDLER)
+    {
+        // The filter already recorded the code and the faulting address; nothing
+        // is formatted while the exception is being handled.
+    }
+    if (!ok)
+    {
+        LogGuestLoadRefused("ReadU32BE", guestAddr, sizeof(uint32_t), "av", kRefU32,
+                            fault.code, fault.addr);
+    }
+    return ok;
+}
+
+bool mcla::kernel::GuestMemoryHeap::ReadU64BE(uint32_t guestAddr, uint64_t* outVal) const
+{
+    if (!IsValid(guestAddr, sizeof(uint64_t)))
+    {
+        LogGuestLoadRefused("ReadU64BE", guestAddr, sizeof(uint64_t), "range", kRefU64, 0, 0);
+        return false;
+    }
+    if (!outVal)
+    {
+        LogGuestLoadRefused("ReadU64BE", guestAddr, sizeof(uint64_t), "nullout", kRefU64, 0, 0);
+        return false;
+    }
+    const uint8_t* ptr = static_cast<const uint8_t*>(Translate(guestAddr));
+    bool ok = false;
+    GuestLoadFault fault;
+    __try
+    {
+        const uint64_t beVal = *reinterpret_cast<const uint64_t*>(ptr);
+        *outVal = Swap64(beVal);
+        ok = true;
+    }
+    __except (GuestLoadAvFilter(GetExceptionInformation(), &fault), EXCEPTION_EXECUTE_HANDLER)
+    {
+    }
+    if (!ok)
+    {
+        LogGuestLoadRefused("ReadU64BE", guestAddr, sizeof(uint64_t), "av", kRefU64,
+                            fault.code, fault.addr);
+    }
+    return ok;
+}
+
+bool mcla::kernel::GuestMemoryHeap::ReadF32BE(uint32_t guestAddr, float* outVal) const
+{
+    // Instrumented too: if this guard refuses, the inner ReadU32BE is never
+    // reached, so without its own line the event would be invisible. The two
+    // paths are mutually exclusive, so `total` still counts each refused load
+    // exactly once.
+    if (!IsValid(guestAddr, sizeof(float)))
+    {
+        LogGuestLoadRefused("ReadF32BE", guestAddr, sizeof(float), "range", kRefF32, 0, 0);
+        return false;
+    }
+    if (!outVal)
+    {
+        LogGuestLoadRefused("ReadF32BE", guestAddr, sizeof(float), "nullout", kRefF32, 0, 0);
+        return false;
+    }
+    uint32_t beVal;
+    if (!ReadU32BE(guestAddr, &beVal))
+        return false;  // already reported by ReadU32BE with why=av
+    *outVal = *reinterpret_cast<const float*>(&beVal);
+    return true;
+}
+
+bool mcla::kernel::GuestMemoryHeap::ReadBytes(uint32_t guestAddr, void* outBuffer, uint32_t size) const
+{
+    if (!IsValid(guestAddr, size))
+    {
+        LogGuestLoadRefused("ReadBytes", guestAddr, size, "range", kRefBytes, 0, 0);
+        return false;
+    }
+    if (!outBuffer)
+    {
+        LogGuestLoadRefused("ReadBytes", guestAddr, size, "nullout", kRefBytes, 0, 0);
+        return false;
+    }
+    const uint8_t* src = static_cast<const uint8_t*>(Translate(guestAddr));
+    bool ok = false;
+    GuestLoadFault fault;
+    __try
+    {
+        memcpy(outBuffer, src, size);
+        ok = true;
+    }
+    __except (GuestLoadAvFilter(GetExceptionInformation(), &fault), EXCEPTION_EXECUTE_HANDLER)
+    {
+    }
+    if (!ok)
+    {
+        LogGuestLoadRefused("ReadBytes", guestAddr, size, "av", kRefBytes,
+                            fault.code, fault.addr);
+    }
+    return ok;
+}
+
+bool mcla::kernel::GuestMemoryHeap::WriteU8(uint32_t guestAddr, uint8_t val)
+{
+    if (!IsValid(guestAddr, sizeof(uint8_t))) return false;
+    __try
+    {
+        *reinterpret_cast<uint8_t*>(Translate(guestAddr)) = val;
+        return true;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
+bool mcla::kernel::GuestMemoryHeap::WriteU16BE(uint32_t guestAddr, uint16_t val)
+{
+    if (!IsValid(guestAddr, sizeof(uint16_t))) return false;
+    __try
+    {
+        *reinterpret_cast<uint16_t*>(Translate(guestAddr)) = Swap16(val);
+        return true;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
+bool mcla::kernel::GuestMemoryHeap::WriteU32BE(uint32_t guestAddr, uint32_t val)
+{
+    if (!IsValid(guestAddr, sizeof(uint32_t))) return false;
+    __try
+    {
+        *reinterpret_cast<uint32_t*>(Translate(guestAddr)) = Swap32(val);
+        return true;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
+bool mcla::kernel::GuestMemoryHeap::WriteU64BE(uint32_t guestAddr, uint64_t val)
+{
+    if (!IsValid(guestAddr, sizeof(uint64_t))) return false;
+    __try
+    {
+        *reinterpret_cast<uint64_t*>(Translate(guestAddr)) = Swap64(val);
+        return true;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
+bool mcla::kernel::GuestMemoryHeap::WriteBytes(uint32_t guestAddr, const void* src, uint32_t size)
+{
+    if (!IsValid(guestAddr, size) || !src) return false;
+    __try
+    {
+        memcpy(Translate(guestAddr), src, size);
+        return true;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
+mcla::kernel::GuestMemoryHeap::~GuestMemoryHeap()
+{
+    Shutdown();
+}
+
+bool mcla::kernel::GuestMemoryHeap::Initialize()
+{
+    if (m_initialized)
+        return true;
+
+#ifdef _WIN32
+    // First check if memory is already reserved/committed at the target address
+    MEMORY_BASIC_INFORMATION mbi;
+    if (VirtualQuery((void*)kBaseAddress, &mbi, sizeof(mbi)) == sizeof(mbi) && 
+        (mbi.State == MEM_RESERVE || mbi.State == MEM_COMMIT))
+    {
+        m_base = (uint8_t*)kBaseAddress;
+    }
+    else
+    {
+        const DWORD wwFlags = WriteWatchDisabledByEnv() ? 0u : MEM_WRITE_WATCH;
+        m_base = (uint8_t*)VirtualAlloc((void*)kBaseAddress, kSize, MEM_COMMIT | MEM_RESERVE | wwFlags, PAGE_READWRITE);
+
+        if (m_base == nullptr)
+            m_base = (uint8_t*)VirtualAlloc(nullptr, kSize, MEM_COMMIT | MEM_RESERVE | wwFlags, PAGE_READWRITE);
+
+        if (m_base == nullptr && wwFlags != 0u)
+        {
+            m_base = (uint8_t*)VirtualAlloc((void*)kBaseAddress, kSize, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+            if (m_base == nullptr)
+                m_base = (uint8_t*)VirtualAlloc(nullptr, kSize, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+        }
+    }
+
+    if (m_base == nullptr)
+        return false;
+
+    DWORD oldProtect;
+    VirtualProtect(m_base, mcla::kernel::kNullGuardBytes, PAGE_NOACCESS, &oldProtect);
+    mcla::kernel::InitGuestWriteWatch(m_base, kSize);
+#else
+    // On Linux, check if memory is already mapped at the target address
+    m_base = (uint8_t*)mmap((void*)kBaseAddress, kSize, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE | MAP_FIXED_NOREPLACE, -1, 0);
+
+    if (m_base == (uint8_t*)MAP_FAILED)
+        m_base = (uint8_t*)mmap((void*)kBaseAddress, kSize, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0);
+
+    if (m_base == (uint8_t*)MAP_FAILED)
+        m_base = (uint8_t*)mmap(NULL, kSize, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0);
+
+    if (m_base == nullptr)
+        return false;
+
+    mprotect(m_base, mcla::kernel::kNullGuardBytes, PROT_NONE);
+#endif
+
+    m_size = kSize;
+    m_initialized = true;
+    m_owned = true;
+    return true;
+}
+
+bool mcla::kernel::GuestMemoryHeap::Adopt(uint8_t* base, uint64_t size)
+{
+    if (m_initialized)
+        return true;
+
+    if (!base || size < mcla::kernel::kNullGuardBytes)
+        return false;
+
+#ifdef _WIN32
+    DWORD oldProtect;
+    if (!VirtualProtect(base, mcla::kernel::kNullGuardBytes, PAGE_NOACCESS, &oldProtect))
+        return false;
+    mcla::kernel::InitGuestWriteWatch(base, size);
+#else
+    if (mprotect(base, mcla::kernel::kNullGuardBytes, PROT_NONE) != 0)
+        return false;
+#endif
+
+    m_base = base;
+    m_size = size;
+    m_initialized = true;
+    m_owned = false;
+    return true;
+}
+
+void mcla::kernel::GuestMemoryHeap::Shutdown()
+{
+    if (!m_initialized)
+        return;
+
+    if (m_owned && m_base)
+    {
+#ifdef _WIN32
+        VirtualFree(m_base, 0, MEM_RELEASE);
+#else
+        munmap(m_base, m_size);
+#endif
+    }
+
+    m_base = nullptr;
+    m_size = 0;
+    m_initialized = false;
+    m_owned = false;
+}
+
+void* mcla::kernel::GuestMemoryHeap::Translate(uint32_t guestAddr)
+{
+    if (!m_initialized || guestAddr >= m_size)
+        return nullptr;
+    return m_base + guestAddr;
+}
+
+const void* mcla::kernel::GuestMemoryHeap::Translate(uint32_t guestAddr) const
+{
+    if (!m_initialized || guestAddr >= m_size)
+        return nullptr;
+    return m_base + guestAddr;
+}
+
+uint32_t mcla::kernel::GuestMemoryHeap::MapVirtual(const void* hostPtr) const
+{
+    if (!m_initialized || !hostPtr)
+        return 0;
+
+    const uint8_t* base = static_cast<const uint8_t*>(hostPtr);
+    if (base < m_base || base >= m_base + m_size)
+        return 0;
+
+    return static_cast<uint32_t>(base - m_base);
+}
+
+bool mcla::kernel::GuestMemoryHeap::IsValid(uint32_t guestAddr, size_t size) const
+{
+    if (!m_initialized || guestAddr == 0 || size == 0)
+        return false;
+
+    // The first `kNullGuardBytes` of the heap are a deliberate PAGE_NOACCESS null guard (armed in
+    // Initialize and Adopt, and in the free-function window setup above -- grep the constant, the
+    // line numbers rotate), and the rest of the 4 GB is committed read/write. Without this
+    // clause a "checked" helper passes IsValid for a near-null guest pointer and
+    // then faults inside memcpy - which is what F-122 measured: 50 AVs in
+    // MemoryStreamServeRead's ReadBytes at wrapped src 0x00000C61 (#6: 0x0).
+    // F-782: the same collision recurred in code that bypassed this helper entirely -- heap.cpp's
+    // NotePhysLive swept the window with a raw `base + pos` from pos 0, and one of the five
+    // C0000005s in every boot was that sweep, not the guest.
+    if (guestAddr < mcla::kernel::kNullGuardBytes)
+        return false;
+
+    if (guestAddr >= m_size)
+        return false;
+
+    uint64_t end = static_cast<uint64_t>(guestAddr) + size;
+    if (end > m_size)
+        return false;
+
+    return true;
+}
+
+uint32_t mcla::kernel::GuestMemoryHeap::Alloc(size_t size, size_t alignment)
+{
+    if (!m_initialized)
+        return 0;
+
+    void* ptr = g_userHeap.AllocPhysical(size, alignment);
+    if (!ptr)
+        return 0;
+
+    return MapVirtual(ptr);
+}
+
+// Decompressed file bodies are the host's own copies, but they used to come from the
+// guest's physical pool: they exhausted it ~38s into boot, and the guest's own allocations
+// then failed (F-920). The range is reserved in the guest-virtual tracker on first use, so
+// NtAllocateVirtualMemory (including its top-down arm) can never hand it to the guest.
+// Starts above the RSC pseudo-virtual base 0x60000000's measured extent (0x60150000).
+// shortcut: bump-only, never reclaimed (433 MiB; a boot stages >383 MiB); stage lazily if it fills.
+namespace {
+struct HostBodyChunk {
+    uint32_t addr;
+    uint32_t size;
+};
+struct HostBodyExtent {
+    uint32_t base;
+    uint32_t end;
+};
+static std::mutex s_hostBodyMutex;
+static std::vector<HostBodyChunk> s_hostBodyFreeList;
+static std::unordered_map<uint32_t, uint32_t> s_hostBodyAllocated;
+static std::vector<HostBodyExtent> s_hostBodyExtents;
+static std::atomic<uint32_t> s_hostBodyMinVa{UINT32_MAX};
+static std::atomic<uint32_t> s_hostBodyMaxEnd{0u};
+static constexpr uint32_t kHostArenaVa = 0x62000000u;
+static constexpr uint32_t kHostArenaEnd = 0x7D000000u;
+static uint32_t s_hostBodyExtentBase = kHostArenaVa;
+static uint32_t s_hostBodyBump = kHostArenaVa;
+static uint32_t s_hostBodyEnd = kHostArenaEnd;
+
+static void RegisterHostBodyExtentLocked(uint32_t base, uint32_t end)
+{
+    for (const auto& e : s_hostBodyExtents) {
+        if (e.base == base && e.end == end)
+            return;
+    }
+    s_hostBodyExtents.push_back({base, end});
+    const uint32_t curMin = s_hostBodyMinVa.load(std::memory_order_relaxed);
+    if (base < curMin)
+        s_hostBodyMinVa.store(base, std::memory_order_release);
+    const uint32_t curMax = s_hostBodyMaxEnd.load(std::memory_order_relaxed);
+    if (end > curMax)
+        s_hostBodyMaxEnd.store(end, std::memory_order_release);
+}
+
+static const HostBodyExtent* FindHostBodyExtentLocked(uint32_t guestAddr)
+{
+    for (const auto& e : s_hostBodyExtents) {
+        if (guestAddr >= e.base && guestAddr < e.end)
+            return &e;
+    }
+    return nullptr;
+}
+
+static void InsertHostBodyFreeChunkLocked(uint32_t guestAddr, uint32_t chunkSize,
+                                          HostBodyExtent extent)
+{
+    const uint64_t chunkEnd = static_cast<uint64_t>(guestAddr) + chunkSize;
+    if (chunkSize == 0 || guestAddr < extent.base || chunkEnd > extent.end) {
+        MCLA_LOG_WARN("FreeHostBody: invalid chunk [0x{:08X}, 0x{:016X}) outside extent [0x{:08X}, 0x{:08X})",
+                      guestAddr, chunkEnd, extent.base, extent.end);
+        return;
+    }
+
+    // Binary search for insertion point in address-sorted free list
+    auto it = std::lower_bound(s_hostBodyFreeList.begin(), s_hostBodyFreeList.end(), guestAddr,
+        [](const HostBodyChunk& chunk, uint32_t val) {
+            return chunk.addr < val;
+        });
+
+    // Guard against double-free or overlapping entries in free list
+    if (it != s_hostBodyFreeList.end() && chunkEnd > it->addr) {
+        MCLA_LOG_WARN("FreeHostBody: double-free or overlap at 0x{:08X} (overlaps next free chunk 0x{:08X})",
+                      guestAddr, it->addr);
+        return;
+    }
+    if (it != s_hostBodyFreeList.begin()) {
+        auto prev = std::prev(it);
+        if (static_cast<uint64_t>(prev->addr) + prev->size > guestAddr) {
+            MCLA_LOG_WARN("FreeHostBody: double-free or overlap at 0x{:08X} (overlaps prev free chunk 0x{:08X})",
+                          guestAddr, prev->addr);
+            return;
+        }
+    }
+
+    // Coalesce only within the owning extent so unrelated or non-contiguous extents stay isolated.
+    const bool mergeLeft = (it != s_hostBodyFreeList.begin() &&
+                            std::prev(it)->addr >= extent.base &&
+                            (static_cast<uint64_t>(std::prev(it)->addr) + std::prev(it)->size == guestAddr));
+    const bool mergeRight = (it != s_hostBodyFreeList.end() &&
+                             (static_cast<uint64_t>(it->addr) + it->size <= extent.end) &&
+                             (chunkEnd == it->addr));
+
+    if (mergeLeft && mergeRight) {
+        // Complete 3-way coalescing: bridge predecessor and successor into one unified block
+        auto prev = std::prev(it);
+        prev->size += chunkSize + it->size;
+        s_hostBodyFreeList.erase(it);
+    } else if (mergeLeft) {
+        auto prev = std::prev(it);
+        prev->size += chunkSize;
+    } else if (mergeRight) {
+        it->addr = guestAddr;
+        it->size += chunkSize;
+    } else {
+        s_hostBodyFreeList.insert(it, {guestAddr, chunkSize});
+    }
+}
+} // namespace
+
+uint32_t mcla::kernel::GuestMemoryHeap::AllocHostBody(size_t size)
+{
+    if (!m_initialized || size == 0 || size > kHostArenaEnd - kHostArenaVa)
+        return 0;
+    static const bool s_reserved = [this] {
+        bool wasCommitted = false;
+        return AllocVirtualFixed(kHostArenaVa, kHostArenaEnd - kHostArenaVa, true, false, &wasCommitted);
+    }();
+    if (!s_reserved)
+        return 0;
+
+    const uint32_t need = static_cast<uint32_t>((size + 15u) & ~size_t{15});
+    std::lock_guard<std::mutex> lock(s_hostBodyMutex);
+    RegisterHostBodyExtentLocked(kHostArenaVa, kHostArenaEnd);
+
+    // 1. Search free list for best fit / first fit
+    for (size_t i = 0; i < s_hostBodyFreeList.size(); ++i) {
+        if (s_hostBodyFreeList[i].size >= need) {
+            uint32_t allocAddr = s_hostBodyFreeList[i].addr;
+            uint32_t remSize = s_hostBodyFreeList[i].size - need;
+            uint32_t allocSize = need;
+            if (remSize >= 64u) {
+                s_hostBodyFreeList[i].addr += need;
+                s_hostBodyFreeList[i].size = remSize;
+            } else {
+                allocSize = s_hostBodyFreeList[i].size;
+                s_hostBodyFreeList.erase(s_hostBodyFreeList.begin() + i);
+            }
+            s_hostBodyAllocated[allocAddr] = allocSize;
+            return allocAddr;
+        }
+    }
+
+    // 2. Bump pointer within the current extent
+    if (need > s_hostBodyEnd - s_hostBodyBump) {
+        // The fixed 432 MiB arena fills ~3 min into a boot with distinct
+        // members alone (city4.log); grow by tracked guest-virtual extents so
+        // a growth can never overlap a guest allocation.
+        constexpr uint32_t kGrow = 256u << 20;  // owner: grow generously now, trim later
+        const uint32_t grow = need > kGrow ? ((need + 0xFFFFu) & ~0xFFFFu) : kGrow;
+        uint32_t base = 0;
+        if (AllocVirtualAny(grow, false, true, false, &base)) {
+            const uint32_t tail = s_hostBodyEnd - s_hostBodyBump;
+            if (tail >= 64u) {
+                InsertHostBodyFreeChunkLocked(s_hostBodyBump, tail,
+                                              {s_hostBodyExtentBase, s_hostBodyEnd});
+            }
+            MCLA_LOG_WARN("AllocHostBody: grew arena +{} MiB at 0x{:08X}", grow >> 20, base);
+            RegisterHostBodyExtentLocked(base, base + grow);
+            s_hostBodyExtentBase = base;
+            s_hostBodyBump = base;
+            s_hostBodyEnd = base + grow;
+        }
+    }
+    if (need <= s_hostBodyEnd - s_hostBodyBump) {
+        uint32_t allocAddr = s_hostBodyBump;
+        s_hostBodyBump += need;
+        s_hostBodyAllocated[allocAddr] = need;
+        return allocAddr;
+    }
+
+    MCLA_LOG_WARN("AllocHostBody: arena exhausted (need={}, bump=0x{:08X}, freeChunks={})",
+                  need, s_hostBodyBump, s_hostBodyFreeList.size());
+    return 0;
+}
+
+void mcla::kernel::GuestMemoryHeap::FreeHostBody(uint32_t guestAddr, size_t size)
+{
+    std::lock_guard<std::mutex> lock(s_hostBodyMutex);
+    const HostBodyExtent* foundExtent = FindHostBodyExtentLocked(guestAddr);
+    if (!foundExtent)
+        return;
+    const HostBodyExtent extent = *foundExtent;
+
+    uint32_t freedSize = static_cast<uint32_t>(size);
+    auto itAlloc = s_hostBodyAllocated.find(guestAddr);
+    if (itAlloc != s_hostBodyAllocated.end()) {
+        freedSize = itAlloc->second;
+        s_hostBodyAllocated.erase(itAlloc);
+    } else if (freedSize == 0) {
+        freedSize = 4096u;
+    }
+
+    InsertHostBodyFreeChunkLocked(guestAddr, freedSize, extent);
+}
+
+void mcla::kernel::GuestMemoryHeap::Free(uint32_t guestAddr, size_t size)
+{
+    if (!m_initialized || guestAddr == 0)
+        return;
+
+    const uint32_t minVa = s_hostBodyMinVa.load(std::memory_order_acquire);
+    const uint32_t maxEnd = s_hostBodyMaxEnd.load(std::memory_order_acquire);
+    if (guestAddr >= minVa && guestAddr < maxEnd) {
+        bool isHostBody = false;
+        {
+            std::lock_guard<std::mutex> lock(s_hostBodyMutex);
+            isHostBody = (FindHostBodyExtentLocked(guestAddr) != nullptr);
+        }
+        if (isHostBody) {
+            FreeHostBody(guestAddr, size);
+            return;
+        }
+    }
+
+    void* ptr = Translate(guestAddr);
+    if (!ptr)
+        return;
+
+    g_userHeap.Free(ptr);
+}
+
+mcla::kernel::GuestMemoryHeap& mcla::kernel::GuestMemoryHeap::Instance()
+{
+    static GuestMemoryHeap instance;
+    return instance;
+}
+
+// --- Guest-virtual region tracking -------------------------------------------
+// Coarse, allocation-granular bookkeeping (not page-granular): enough to make
+// NtAllocateVirtualMemory/NtFreeVirtualMemory/NtQueryVirtualMemory honest
+// without inventing a second allocator model. The flat window remains
+// identity-mapped; only STATE is tracked.
+
+namespace {
+constexpr uint32_t kVirtPage = mcla::kernel::GuestMemoryHeap::kGuestVirtualPageSize;
+
+uint32_t RoundUpPage(uint32_t v) { return (v + kVirtPage - 1) & ~(kVirtPage - 1); }
+} // namespace
+
+bool mcla::kernel::GuestMemoryHeap::QueryVirtualRegion(uint32_t addr, VirtualRegionInfo* out) const
+{
+    if (!out)
+        return false;
+    std::lock_guard<std::mutex> lock(m_virtualMutex);
+    for (const auto& r : m_virtualRegions)
+    {
+        if (addr >= r.base && addr < r.base + r.size)
+        {
+            out->base = r.base;
+            out->allocationBase = r.base;
+            out->size = r.size;
+            out->committed = r.committed;
+            out->reserved = true;
+            return true;
+        }
+    }
+    // Untracked: report FREE within the window (page-granular slice).
+    if (addr < kGuestVirtualBase || addr >= kGuestVirtualEnd)
+        return false;
+    uint32_t nextBound = kGuestVirtualEnd;
+    for (const auto& r : m_virtualRegions)
+    {
+        if (r.base > addr)
+        {
+            nextBound = r.base;
+            break;
+        }
+    }
+    out->base = addr & ~(kVirtPage - 1);
+    out->allocationBase = 0;
+    out->size = RoundUpPage(nextBound - out->base);
+    out->committed = false;
+    out->reserved = false;
+    return true;
+}
+
+bool mcla::kernel::GuestMemoryHeap::AllocVirtualFixed(uint32_t base, uint32_t size, bool commit, bool zeroFresh, bool* outWasCommitted)
+{
+    *outWasCommitted = false;
+    if (!m_initialized || size == 0)
+        return false;
+    if (base < kGuestVirtualBase || size > kGuestVirtualEnd - base)
+        return false;
+
+    std::lock_guard<std::mutex> lock(m_virtualMutex);
+    const uint32_t end = base + size;
+
+    // 1) Exact-match re-commit / upgrade / reserve-no-op.
+    for (auto& r : m_virtualRegions)
+    {
+        if (r.base == base && r.size == size)
+        {
+            if (commit && !r.committed)
+            {
+                r.committed = true;
+                if (zeroFresh)
+                    memset(Base() + base, 0, size);
+            }
+            else if (commit && r.committed)
+            {
+                *outWasCommitted = true;
+            }
+            return true;
+        }
+    }
+
+    // 2) Contained within ONE existing region: legal reserve->commit /
+    //    sub-commit (Xenia allows page-granular commit inside reservations;
+    //    our bookkeeping is region-granular, so we upgrade the whole region
+    //    but zero only the freshly-committed sub-range).
+    const VirtualRegion* containing = nullptr;
+    for (const auto& r : m_virtualRegions)
+    {
+        if (base >= r.base && end <= r.base + r.size)
+        {
+            containing = &r;
+            break;
+        }
+    }
+    if (containing)
+    {
+        // Re-scan for the same element to get a non-const ref (search used const&).
+        for (auto& r : m_virtualRegions)
+        {
+            if (&r == containing)
+            {
+                if (commit && !r.committed)
+                {
+                    r.committed = true;
+                    if (zeroFresh)
+                        memset(Base() + base, 0, size);
+                }
+                else if (commit && r.committed)
+                {
+                    *outWasCommitted = true;
+                }
+                return true;
+            }
+        }
+    }
+
+    // 3) Otherwise the whole range must be free of any region.
+    for (const auto& r : m_virtualRegions)
+    {
+        if (r.base < end && base < r.base + r.size)
+            return false; // partial overlap = real conflict
+    }
+
+    if (commit && zeroFresh)
+        memset(Base() + base, 0, size);
+    m_virtualRegions.insert(
+        std::lower_bound(m_virtualRegions.begin(), m_virtualRegions.end(), base,
+                         [](const VirtualRegion& r, uint32_t b) { return r.base < b; }),
+        VirtualRegion{base, size, commit});
+    return true;
+}
+
+bool mcla::kernel::GuestMemoryHeap::AllocVirtualAny(uint32_t size, bool topDown, bool commit, bool zeroFresh, uint32_t* outBase)
+{
+    if (!m_initialized || size == 0 || size > kGuestVirtualEnd - kGuestVirtualBase)
+        return false;
+
+    std::lock_guard<std::mutex> lock(m_virtualMutex);
+
+    auto gapFits = [size](uint32_t lo, uint32_t hi) { return hi >= lo && hi - lo >= size; };
+
+    if (!topDown)
+    {
+        // Walk regions in order; first gap before/between/after them wins.
+        uint32_t cursor = kGuestVirtualBase;
+        for (const auto& r : m_virtualRegions)
+        {
+            if (gapFits(cursor, r.base))
+            {
+                if (commit && zeroFresh)
+                    memset(Base() + cursor, 0, size);
+                m_virtualRegions.insert(
+                    std::lower_bound(m_virtualRegions.begin(), m_virtualRegions.end(), cursor,
+                                     [](const VirtualRegion& rr, uint32_t b) { return rr.base < b; }),
+                    VirtualRegion{cursor, size, commit});
+                *outBase = cursor;
+                return true;
+            }
+            cursor = std::max(cursor, r.base + r.size);
+        }
+        if (gapFits(cursor, kGuestVirtualEnd))
+        {
+            if (commit && zeroFresh)
+                memset(Base() + cursor, 0, size);
+            m_virtualRegions.emplace_back(VirtualRegion{cursor, size, commit}); // append at end
+            *outBase = cursor;
+            return true;
+        }
+        return false;
+    }
+
+    // Top-down: last gap near the window end.
+    uint32_t hi = kGuestVirtualEnd;
+    for (auto it = m_virtualRegions.rbegin(); it != m_virtualRegions.rend(); ++it)
+    {
+        if (gapFits(it->base + it->size, hi))
+        {
+            uint32_t base = hi - size;
+            if (commit && zeroFresh)
+                memset(Base() + base, 0, size);
+            m_virtualRegions.insert(
+                std::lower_bound(m_virtualRegions.begin(), m_virtualRegions.end(), base,
+                                 [](const VirtualRegion& r, uint32_t b) { return r.base < b; }),
+                VirtualRegion{base, size, commit});
+            *outBase = base;
+            return true;
+        }
+        hi = std::min(hi, it->base);
+    }
+    if (gapFits(kGuestVirtualBase, hi))
+    {
+        uint32_t base = hi - size;
+        if (commit && zeroFresh)
+            memset(Base() + base, 0, size);
+        m_virtualRegions.insert(m_virtualRegions.begin(), VirtualRegion{base, size, commit});
+        *outBase = base;
+        return true;
+    }
+    return false;
+}
+
+bool mcla::kernel::GuestMemoryHeap::DecommitVirtual(uint32_t base, uint32_t size, uint32_t* outSize)
+{
+    std::lock_guard<std::mutex> lock(m_virtualMutex);
+    for (auto& r : m_virtualRegions)
+    {
+        if (base >= r.base && base < r.base + r.size)
+        {
+            // MCLA_TEMP_MEMSEM_DECOMMIT=1: a decommit of a sub-range must not flip the WHOLE reservation to uncommitted
+            // (Xenia tracks pages; MmQueryAddressProtect/NtQueryVM read this flag). Zero the range now so a later
+            // re-commit still sees fresh pages (the commit path only zeroes when the region flag was clear).
+            static const bool s_dc = [] { const char* e = std::getenv("MCLA_TEMP_MEMSEM_DECOMMIT"); return !(e && e[0] == '0'); }();
+            if (s_dc && size != 0)
+            {
+                const uint32_t pg = base >= 0x40000000u ? 0x10000u : 0x1000u;
+                const uint64_t sz = (static_cast<uint64_t>(size) + pg - 1) & ~static_cast<uint64_t>(pg - 1);
+                if (base != r.base || sz < r.size)
+                {
+                    const uint64_t n = std::min<uint64_t>(sz, r.base + r.size - base);
+                    memset(Base() + base, 0, static_cast<size_t>(n));
+                    *outSize = static_cast<uint32_t>(sz);
+                    return true;
+                }
+            }
+            r.committed = false;
+            *outSize = r.size;
+            return true;
+        }
+    }
+    return false;
+}
+
+bool mcla::kernel::GuestMemoryHeap::ReleaseVirtual(uint32_t base, uint32_t* outSize)
+{
+    std::lock_guard<std::mutex> lock(m_virtualMutex);
+    for (auto it = m_virtualRegions.begin(); it != m_virtualRegions.end(); ++it)
+    {
+        if (it->base == base)
+        {
+            *outSize = it->size;
+            m_virtualRegions.erase(it);
+            return true;
+        }
+    }
+    return false;
+}
+
+mcla::kernel::Memory mcla::kernel::g_memory;
+Heap g_userHeap;

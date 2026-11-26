@@ -1,0 +1,29 @@
+MCLA-PC Release Icon Set -- License
+====================================
+
+The images in this directory (mcla-release.ico and the 16/32/48/64/128/256
+PNG sources) are ORIGINAL artwork created for the MCLA-PC emulator project
+in 2026 by project contributors.
+
+Artwork description: a midnight-navy rounded tile, a bold white letter "M",
+and a gold accent bar. The 16 px frame was drawn natively (not downscaled)
+so the mark reads clean at taskbar size.
+
+What is NOT in this set:
+  - No Rockstar Games or Take-Two Interactive logos, mascots, wordmarks,
+    or trade dress.
+  - No textures, screenshots, or other assets lifted from any retail game.
+  - The letter "M" is a single-character generic motif, not a reproduction
+    of the retail "Midnight Club" logo.
+
+Rights:
+  - Free to ship, copy, and resize with the MCLA-PC emulator release,
+    including inside the compiled mcla.exe icon resource.
+  - The set is not affiliated with, sponsored, or endorsed by Rockstar
+    Games or Take-Two Interactive. "Midnight Club" and related marks belong
+    to their respective owners; name usage in the release manifest is
+    descriptive only and makes no claim of affiliation.
+
+This text is also embedded as a "License" tEXt chunk in every PNG source
+(see src/icon/make_icons.py). An ICO container has no text channel, so
+this file is the canonical license for the .ico itself.
